@@ -1124,6 +1124,71 @@ case_22_check_includes_blocking_claim_paths() {
   expect_contains "$out_check" "\"expires_at_ms\""
 }
 
+case_28_multiple_blocking_claims_per_agent() {
+  bold "Case 28: Multiple Blocking Claims Per Agent"
+  local repo; repo="$(mk_repo)"
+  trap '[[ -n "${repo:-}" ]] && rm -rf "$repo"' RETURN
+
+  local out_a_dir out_a_file out_check
+  out_a_dir="$(run_cli "$repo" "A" claim --path src/ --ttl 15m)"
+  out_a_file="$(run_cli "$repo" "A" claim --path src/app.txt --ttl 15m)"
+  out_check="$(run_cli "$repo" "B" check --path src/app.txt)"
+
+  expect_contains "$out_check" "\"decision\""
+  expect_contains "$out_check" "\"warn\""
+  expect_contains "$out_check" "\"blocking_agents\""
+  expect_matches "$out_check" "\"blocking_agents\"[[:space:]]*:[[:space:]]*\\[[^]]*\"A\""
+
+  # Coordination usefulness: expose all overlapping claim paths per blocker (not just one).
+  expect_contains "$out_check" "\"blocking_claims\""
+  expect_contains "$out_check" "\"agent_id\":\"A\""
+  expect_contains "$out_check" "\"path\":\"src\""
+  expect_contains "$out_check" "\"path\":\"src/app.txt\""
+}
+
+case_26_nonblocking_agent_fyi_active_claim() {
+  bold "Case 26: Non-Blocking Agent FYI (Active Claim)"
+  local repo; repo="$(mk_repo)"
+  trap '[[ -n "${repo:-}" ]] && rm -rf "$repo"' RETURN
+
+  local out_a out_c out_check
+  out_a="$(run_cli "$repo" "A" claim --path src/app.txt --ttl 15m)"
+  out_c="$(run_cli "$repo" "C" claim --path src/other.txt --ttl 15m)"
+  out_check="$(run_cli "$repo" "B" check --path src/app.txt)"
+
+  expect_contains "$out_check" "\"decision\""
+  expect_contains "$out_check" "\"warn\""
+  expect_contains "$out_check" "\"blocking_agents\""
+  expect_matches "$out_check" "\"blocking_agents\"[[:space:]]*:[[:space:]]*\\[[^]]*\"A\""
+  expect_contains "$out_check" "\"action_plan_by_agent\""
+
+  # Non-blocking active claims should still show up as a FYI step (coordination usefulness).
+  expect_contains "$out_check" "--agent-id C"
+  expect_contains "$out_check" "FYI I am working on src/other.txt; not touching src/app.txt."
+  # But we should not ask C to release an unrelated claim.
+  expect_not_contains "$out_check" "--agent-id C release --path"
+}
+
+case_27_check_ignores_expired_nonblocking_claim() {
+  bold "Case 27: Check Ignores Expired Non-Blocking Claims"
+  local repo; repo="$(mk_repo)"
+  trap '[[ -n "${repo:-}" ]] && rm -rf "$repo"' RETURN
+
+  local out_a out_c out_check
+  out_a="$(run_cli "$repo" "A" claim --path src/app.txt --ttl 15m)"
+  out_c="$(run_cli "$repo" "C" claim --path src/other.txt --ttl 1s)"
+  sleep 2
+  out_check="$(run_cli "$repo" "B" check --path src/app.txt)"
+
+  expect_contains "$out_check" "\"decision\""
+  expect_contains "$out_check" "\"warn\""
+  expect_matches "$out_check" "\"blocking_agents\"[[:space:]]*:[[:space:]]*\\[[^]]*\"A\""
+
+  # Coordination usefulness: don't surface stale FYI steps for expired, non-blocking claims.
+  expect_not_contains "$out_check" "--agent-id C"
+  expect_not_contains "$out_check" "src/other.txt"
+}
+
 main() {
   ensure_bin
   mk_out_dir
@@ -1173,10 +1238,13 @@ main() {
     case_11_discovery_provenance
     case_12_discovery_provenance_digest
     case_13_agents_status_plan
-    case_19_clear_status_plan
-    case_14_claims_path_prefix_filter
-    case_22_check_includes_blocking_claim_paths
-  )
+	    case_19_clear_status_plan
+	    case_14_claims_path_prefix_filter
+	    case_22_check_includes_blocking_claim_paths
+	    case_28_multiple_blocking_claims_per_agent
+	    case_26_nonblocking_agent_fyi_active_claim
+	    case_27_check_ignores_expired_nonblocking_claim
+	  )
 
   local overall_failed=0 t
   for ((t = 1; t <= trials; t++)); do

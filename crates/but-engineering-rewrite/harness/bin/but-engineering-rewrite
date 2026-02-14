@@ -625,7 +625,9 @@ for b in blockers:
         "SELECT path, expires_at_s FROM claims WHERE agent_id = ? AND expires_at_s > ? ORDER BY expires_at_s DESC",
         (b, now_s),
     ).fetchall()
-    best = None  # (path, exp_s)
+
+    # Keep all overlapping claim paths (dedup by path, keep max expiry).
+    by_path = {}
     for p, exp_s in rows:
         if not isinstance(p, str) or not p:
             continue
@@ -635,17 +637,15 @@ for b in blockers:
             exp_i = int(exp_s)
         except Exception:
             exp_i = 0
-        cand = (p, exp_i)
-        if best is None:
-            best = cand
-            continue
-        # Prefer the most specific (longest path), then latest expiry.
-        if len(cand[0]) > len(best[0]) or (len(cand[0]) == len(best[0]) and cand[1] > best[1]):
-            best = cand
-    if best is None:
+        if p not in by_path or exp_i > by_path[p]:
+            by_path[p] = exp_i
+
+    if not by_path:
         continue
-    p, exp_i = best
-    out.append({"agent_id": b, "path": p, "expires_at_ms": exp_i * 1000})
+
+    ordered = sorted(by_path.items(), key=lambda kv: (-len(kv[0]), -kv[1], kv[0]))
+    for p, exp_i in ordered[:10]:
+        out.append({"agent_id": b, "path": p, "expires_at_ms": exp_i * 1000})
 
 conn.close()
 print(json.dumps(out, separators=(",",":")))
@@ -725,7 +725,8 @@ for a in agents:
         p = row[0]
         out[a] = [f"but-engineering-rewrite --agent-id {a} post \"@{requester}: FYI I am working on {p}; not touching {target_path}.\""]
     else:
-        out[a] = [f"but-engineering-rewrite --agent-id {a} post \"@{requester}: I have no active claims; I will not touch {target_path}.\""]
+        # Avoid coordination noise: do not emit per-agent steps for agents with no active claims.
+        pass
 
 conn.close()
 print(json.dumps(out, separators=(",",":")))

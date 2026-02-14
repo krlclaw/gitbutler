@@ -2,6 +2,19 @@
 
 ## 2026-02-14
 
+- Added harness Case 28 to keep `check` conflict output actionable when a blocker holds multiple overlapping claims (directory + file): `crates/but-engineering-rewrite/harness/run.sh`, `crates/but-engineering-rewrite/harness/cases/28-multiple-blocking-claims-per-agent.md`.
+- Updated the stub CLI `blocking_claims` emission to include all overlapping claim paths per blocking agent (deduped), not just a single "best" path: `crates/but-engineering-rewrite/harness/bin/but-engineering-rewrite`.
+- Mirrored the `blocking_claims` surface in the Rust CLI so behavior stays aligned when Rust tooling is available: `crates/but-engineering-rewrite/src/main.rs`.
+
+- Fixed a brittle harness assertion in Case 26 (contraction mismatch) so it matches the stub output text: `crates/but-engineering-rewrite/harness/run.sh`.
+- Added harness Case 27 to lock in a coordination-quality behavior: `check` should not emit FYI steps for agents with no active claims (reduces stale/noise in `action_plan_by_agent`): `crates/but-engineering-rewrite/harness/run.sh`, `crates/but-engineering-rewrite/harness/cases/27-check-ignores-expired-nonblocking-claims.md`.
+- Updated the stub CLI to skip emitting per-agent `action_plan_by_agent` entries for agents without active claims (still includes blockers and non-blocking agents with active claims): `crates/but-engineering-rewrite/harness/bin/but-engineering-rewrite`.
+
+- Added harness Case 26 to ensure `check` remains coordination-useful even for non-blocking agents: it should include a FYI step for agents with active claims on other paths (helps teams avoid duplicate work without forcing releases).
+- The case asserts we do not suggest unrelated cleanup (non-blocking agents should not be told to `release` their non-overlapping claim).
+- No CLI changes were needed; the existing `action_plan_by_agent` behavior already covered this branch.
+- Files: `crates/but-engineering-rewrite/harness/run.sh`, `crates/but-engineering-rewrite/harness/cases/26-nonblocking-agent-fyi-active-claim.md`.
+
 - Added harness Case 25 to cover the common workflow of checking a directory (`check --path src/`) when another agent holds a file claim inside it (reverse prefix overlap): `crates/but-engineering-rewrite/harness/run.sh`, `crates/but-engineering-rewrite/harness/cases/25-path-prefix-overlap-directory-check.md`.
 - Asserted the conflict output stays actionable by including the specific blocking file claim in `blocking_claims` (not just the blocking agent id).
 - No CLI changes were required for this iteration; existing overlap detection and `blocking_claims` output already covered the scenario.

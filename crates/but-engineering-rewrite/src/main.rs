@@ -181,6 +181,36 @@ fn run() -> Result<(), ()> {
             let kept_blockers: HashSet<String> = blocking_agents.iter().cloned().collect();
             blocking_claim_path_by_agent.retain(|k, _| kept_blockers.contains(k));
 
+            // Expose all overlapping claim paths per blocker for actionable coordination.
+            // This is intentionally redundant with `blocking_agents`: consumers can show both.
+            let mut blocking_claims: Vec<Value> = Vec::new();
+            if !blocking_agents.is_empty() {
+                let mut stmt_blocking = conn
+                    .prepare(
+                        "SELECT path, expires_at_ms FROM claims \
+                         WHERE agent_id = ?1 AND expires_at_ms > ?2 \
+                           AND (path = ?3 OR ?3 LIKE path || '/%' OR path LIKE ?3 || '/%') \
+                         ORDER BY LENGTH(path) DESC, expires_at_ms DESC, path ASC \
+                         LIMIT 20",
+                    )
+                    .map_err(|_| ())?;
+                for blocker in &blocking_agents {
+                    let rows = stmt_blocking
+                        .query_map(params![blocker, now_ms, path], |row| {
+                            Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+                        })
+                        .map_err(|_| ())?;
+                    for r in rows {
+                        let (p, expires_at_ms) = r.map_err(|_| ())?;
+                        blocking_claims.push(json!({
+                            "agent_id": blocker,
+                            "path": p,
+                            "expires_at_ms": expires_at_ms,
+                        }));
+                    }
+                }
+            }
+
             let (decision, reason_code) = if !blocking_agents.is_empty() {
                 if strict {
                     ("deny", "claimed_by_other")
@@ -276,6 +306,7 @@ fn run() -> Result<(), ()> {
                 "decision": decision,
                 "reason_code": reason_code,
                 "blocking_agents": blocking_agents,
+                "blocking_claims": blocking_claims,
                 "action_plan": action_plan,
                 "action_plan_by_agent": Value::Object(action_plan_by_agent),
                 "dependency_hints": dependency_hints,
