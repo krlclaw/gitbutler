@@ -329,6 +329,88 @@ case_05h_dependency_hint_api_tag_gate() {
   expect_not_contains "$out_check" "\"provider_agent_id\":\"A\""
 }
 
+case_05i_three_agent_triangle_dependency_chain() {
+  bold "Case 05i: 3-Agent Triangle + Dependency Hints (Noise Control)"
+  local repo; repo="$(mk_repo)"
+  trap '[[ -n "${repo:-}" ]] && rm -rf "$repo"' RETURN
+
+  local out_post out_a_claim out_b_claim out_c_claim
+  local out_b_warn out_b_deny out_a_warn out_c_warn
+  local count_warn count_deny
+
+  # Dependency chain:
+  # - A declares an API surface (provider) and posts a second declaration for the same scope (dedupe).
+  # - B intends to consume it (same scope, overlapping token) => should get exactly one hint for provider A.
+  # - C uses the same token name in a different scope => should not influence B (scope filter), and C must not receive hints.
+  out_post="$(run_cli "$repo" "A" post --type declaration --json '{"scope":"component:sync","tags":["component/api","provider"],"surface":["SyncService::push","SyncService::pull"],"note":"First declaration"}')"
+  out_post="$(run_cli "$repo" "A" post --type declaration --json '{"scope":"component:sync","tags":["component/api","provider"],"surface":["SyncService::push"],"note":"Second declaration (should dedupe)"}')"
+  out_post="$(run_cli "$repo" "B" post --type intent --json '{"scope":"component:sync","tags":["consumer"],"surface":["SyncService::push"],"note":"Consume push"}')"
+  out_post="$(run_cli "$repo" "C" post --type intent --json '{"scope":"component:auth","tags":["consumer"],"surface":["SyncService::push"],"note":"Same token name, different scope"}')"
+  out_post="$(run_cli "$repo" "C" post --type declaration --json '{"scope":"component:auth","tags":["component/api","provider"],"surface":["SyncService::push"],"note":"Overlapping token, different scope; must not hint sync consumers"}')"
+
+  # Triangle claim conflict: A/B/C all hold overlapping claims over src/app.txt (dir vs file).
+  out_a_claim="$(run_cli "$repo" "A" claim --path src/app.txt --ttl 15m)"
+  out_b_claim="$(run_cli "$repo" "B" claim --path src/ --ttl 15m)"
+  out_c_claim="$(run_cli "$repo" "C" claim --path src/app.txt --ttl 15m)"
+
+  # Advisory vs strict for B.
+  out_b_warn="$(run_cli "$repo" "B" check --path src/app.txt)"
+  out_b_deny="$(run_cli "$repo" "B" check --path src/app.txt --strict)"
+
+  expect_contains "$out_b_warn" "\"decision\""
+  expect_contains "$out_b_warn" "\"warn\""
+  expect_contains "$out_b_warn" "\"blocking_agents\""
+  expect_contains "$out_b_warn" "\"A\""
+  expect_contains "$out_b_warn" "\"C\""
+  expect_contains "$out_b_warn" "\"action_plan\""
+  expect_contains "$out_b_warn" "@A"
+  expect_contains "$out_b_warn" "@C"
+
+  expect_contains "$out_b_deny" "\"decision\""
+  expect_contains "$out_b_deny" "\"deny\""
+  expect_contains "$out_b_deny" "\"blocking_agents\""
+  expect_contains "$out_b_deny" "\"A\""
+  expect_contains "$out_b_deny" "\"C\""
+
+  # Dependency hint for B: must include provider A exactly once (dedupe per provider+scope),
+  # and must not include provider C (different scope, despite overlapping token).
+  expect_contains "$out_b_warn" "\"dependency_hints\""
+  expect_contains "$out_b_warn" "\"provider_agent_id\":\"A\""
+  expect_contains "$out_b_warn" "SyncService::push"
+  expect_not_contains "$out_b_warn" "\"provider_agent_id\":\"C\""
+  count_warn="$(printf "%s" "$out_b_warn" | grep -oF "\"provider_agent_id\":\"A\"" | wc -l | tr -d '[:space:]')"
+  if [[ "$count_warn" != "1" ]]; then
+    printf '%s\n' "---- output ----" "$out_b_warn" "----------------" >&2
+    fail "expected exactly one dependency hint for provider A in advisory check; got $count_warn"
+  fi
+
+  expect_contains "$out_b_deny" "\"dependency_hints\""
+  expect_contains "$out_b_deny" "\"provider_agent_id\":\"A\""
+  expect_not_contains "$out_b_deny" "\"provider_agent_id\":\"C\""
+  count_deny="$(printf "%s" "$out_b_deny" | grep -oF "\"provider_agent_id\":\"A\"" | wc -l | tr -d '[:space:]')"
+  if [[ "$count_deny" != "1" ]]; then
+    printf '%s\n' "---- output ----" "$out_b_deny" "----------------" >&2
+    fail "expected exactly one dependency hint for provider A in strict check; got $count_deny"
+  fi
+
+  # Triangle proof: A and C also see conflicts (advisory by default).
+  out_a_warn="$(run_cli "$repo" "A" check --path src/app.txt)"
+  out_c_warn="$(run_cli "$repo" "C" check --path src/app.txt)"
+  expect_contains "$out_a_warn" "\"decision\""
+  expect_contains "$out_a_warn" "\"warn\""
+  expect_contains "$out_a_warn" "\"B\""
+  expect_contains "$out_a_warn" "\"C\""
+  expect_contains "$out_c_warn" "\"decision\""
+  expect_contains "$out_c_warn" "\"warn\""
+  expect_contains "$out_c_warn" "\"A\""
+  expect_contains "$out_c_warn" "\"B\""
+
+  # C must NOT receive a dependency hint (scope differs from A's sync declaration).
+  expect_contains "$out_c_warn" "\"dependency_hints\""
+  expect_matches "$out_c_warn" "\"dependency_hints\"[[:space:]]*:[[:space:]]*\\[[[:space:]]*\\]"
+  expect_not_contains "$out_c_warn" "\"provider_agent_id\":\"A\""
+}
+
 case_05b_check_action_plan() {
   bold "Case 05b: Check Action Plan (Includes Blocking Agent)"
   local repo; repo="$(mk_repo)"
@@ -669,6 +751,7 @@ main() {
   case_05d_dependency_hint_scope_filter || failed=1
   case_05e_dependency_hint_dedupe || failed=1
   case_05h_dependency_hint_api_tag_gate || failed=1
+  case_05i_three_agent_triangle_dependency_chain || failed=1
   case_05b_check_action_plan || failed=1
   case_05c_dedup_blocking_agents || failed=1
   case_15_multi_blocker_action_plan || failed=1

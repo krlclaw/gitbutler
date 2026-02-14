@@ -118,6 +118,9 @@
 ### (a) What Changed
 - Added harness Case 05d to make dependency hints less noisy by requiring intent/declaration scope match (prevents cross-component token collisions): `crates/but-engineering-rewrite/harness/run.sh`, `crates/but-engineering-rewrite/harness/cases/05d-dependency-hint-scope-filter.md`.
 - Updated both the Rust CLI and the harness stub to filter dependency hints by `scope` equality in addition to surface token overlap + `api` tag: `crates/but-engineering-rewrite/src/main.rs`, `crates/but-engineering-rewrite/harness/bin/but-engineering-rewrite`.
+- Added a new 3-agent harness case that combines: (1) triangle claim conflicts (advisory vs `--strict`), (2) a provider/consumer dependency chain (B depends on A's API declaration), (3) a third agent with overlapping tokens but different scope that must not receive dependency hints, and (4) hint dedupe/noise control: `crates/but-engineering-rewrite/harness/run.sh`, `crates/but-engineering-rewrite/harness/cases/05i-three-agent-triangle-deps.md`.
+- Confirmed `check` continues to emit `dependency_hints` even when blocked (warn/deny), so dependency coordination remains visible alongside claim-based coordination: `crates/but-engineering-rewrite/harness/run.sh`.
+- Extended harness coverage to assert dependency-hint scope filtering prevents cross-component token collisions even when another agent posts an API-tagged declaration for the colliding token: `crates/but-engineering-rewrite/harness/run.sh`.
 
 ### (b) What Was Hard
 - The hint heuristic is intentionally lightweight and “stringly”; adding scope filtering is cheap, but it also exposes that we should define whether scope matching is exact, hierarchical, or tag-based long-term.
