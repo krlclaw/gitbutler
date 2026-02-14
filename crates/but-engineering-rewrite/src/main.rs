@@ -11,6 +11,7 @@
 
 use std::path::PathBuf;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::{collections::HashSet};
 
 use rusqlite::{params, Connection, OptionalExtension};
 use serde_json::json;
@@ -20,12 +21,17 @@ use serde_json::Value;
 enum Cmd {
     Claim { path: String, ttl: Duration },
     Release { path: String },
+    Claims { path_prefix: Option<String> },
     Check { path: String, strict: bool },
     Post { message: String },
     PostTyped { kind: String, json: String },
     Read { kind: Option<String> },
-    Brief { kind: Option<String> },
-    Digest { kind: Option<String> },
+    Brief { kind: Option<String>, all: bool },
+    Digest { kind: Option<String>, all: bool },
+    Status { value: Option<String> },
+    Plan { value: Option<String> },
+    Agents,
+    Done { summary: String },
     EvalUserPromptSubmit,
 }
 
@@ -50,6 +56,7 @@ fn run() -> Result<(), ()> {
 
     let conn = Connection::open(db_path).map_err(|_| ())?;
     init_db(&conn)?;
+    touch_agent(&conn, &agent_id)?;
 
     match cmd {
         Cmd::Claim { path, ttl } => {
@@ -57,6 +64,14 @@ fn run() -> Result<(), ()> {
             let now_ms = now_unix_ms()?;
             let ttl_ms: i64 = ttl.as_millis().try_into().map_err(|_| ())?;
             let expires_at_ms = now_ms.saturating_add(ttl_ms);
+            // Treat repeated claims by the same agent for the same path as "renewal"
+            // rather than creating multiple rows (keeps `claims` and conflict output
+            // low-noise and matches the "lease refresh" intent).
+            conn.execute(
+                "DELETE FROM claims WHERE path = ?1 AND agent_id = ?2",
+                params![path, agent_id],
+            )
+            .map_err(|_| ())?;
             conn.execute(
                 "INSERT INTO claims(path, agent_id, expires_at_ms) VALUES (?1, ?2, ?3)",
                 params![path, agent_id, expires_at_ms],
@@ -73,6 +88,61 @@ fn run() -> Result<(), ()> {
             .map_err(|_| ())?;
             print_json(r#"{"ok":true}"#);
         }
+        Cmd::Claims { path_prefix } => {
+            let now_ms = now_unix_ms()?;
+            let mut stmt = if let Some(prefix) = &path_prefix {
+                conn.prepare(
+                    "SELECT path, agent_id, expires_at_ms FROM claims \
+                     WHERE expires_at_ms > ?1 \
+                       AND (path = ?2 OR ?2 LIKE path || '/%' OR path LIKE ?2 || '/%') \
+                     ORDER BY expires_at_ms ASC, path ASC",
+                )
+                .map_err(|_| ())?
+            } else {
+                conn.prepare(
+                    "SELECT path, agent_id, expires_at_ms FROM claims \
+                     WHERE expires_at_ms > ?1 \
+                     ORDER BY expires_at_ms ASC, path ASC",
+                )
+                .map_err(|_| ())?
+            };
+
+            let rows = if let Some(prefix) = &path_prefix {
+                stmt.query_map(params![now_ms, prefix], |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, i64>(2)?,
+                    ))
+                })
+                .map_err(|_| ())?
+            } else {
+                stmt.query_map(params![now_ms], |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, i64>(2)?,
+                    ))
+                })
+                .map_err(|_| ())?
+            };
+
+            let mut claims: Vec<Value> = Vec::new();
+            for r in rows {
+                let (path, agent_id, expires_at_ms) = r.map_err(|_| ())?;
+                claims.push(json!({
+                    "path": path,
+                    "agent_id": agent_id,
+                    "expires_at_ms": expires_at_ms,
+                }));
+            }
+
+            let out = json!({
+                "ok": true,
+                "claims": claims,
+            });
+            print_json(&out.to_string());
+        }
         Cmd::Check { path, strict } => {
             let path = normalize_claim_path(&path);
             let now_ms = now_unix_ms()?;
@@ -85,10 +155,15 @@ fn run() -> Result<(), ()> {
                      LIMIT 5",
                 )
                 .map_err(|_| ())?;
-            let blocking_agents = stmt
+            let blocking_agents_raw = stmt
                 .query_map(params![path, agent_id, now_ms], |row| row.get::<_, String>(0))
                 .map_err(|_| ())?
                 .filter_map(|r| r.ok())
+                .collect::<Vec<_>>();
+            let mut seen = HashSet::<String>::new();
+            let blocking_agents = blocking_agents_raw
+                .into_iter()
+                .filter(|a| seen.insert(a.clone()))
                 .collect::<Vec<_>>();
 
             let (decision, reason_code) = if !blocking_agents.is_empty() {
@@ -103,15 +178,19 @@ fn run() -> Result<(), ()> {
 
             // Minimal, scriptable action plan: a few commands that wrappers can show or run.
             // Keep it intentionally stringly-typed for now to keep the CLI tiny.
-            let action_plan: Vec<String> = if let Some(blocker) = blocking_agents.get(0) {
-                vec![
-                    format!("but-engineering-rewrite --agent-id {agent_id} read"),
-                    format!("but-engineering-rewrite --agent-id {agent_id} post \"@{blocker}: I'm about to edit {path}. Are you working on it?\""),
-                    format!(
-                        "but-engineering-rewrite --agent-id {agent_id} check --path {path}{}",
-                        if strict { " --strict" } else { "" }
-                    ),
-                ]
+            let action_plan: Vec<String> = if !blocking_agents.is_empty() {
+                let mut plan = Vec::<String>::new();
+                plan.push(format!("but-engineering-rewrite --agent-id {agent_id} read"));
+                for blocker in &blocking_agents {
+                    plan.push(format!(
+                        "but-engineering-rewrite --agent-id {agent_id} post \"@{blocker}: I'm about to edit {path}. Are you working on it?\""
+                    ));
+                }
+                plan.push(format!(
+                    "but-engineering-rewrite --agent-id {agent_id} check --path {path}{}",
+                    if strict { " --strict" } else { "" }
+                ));
+                plan
             } else {
                 vec![format!("but-engineering-rewrite --agent-id {agent_id} check --path {path}")]
             };
@@ -160,7 +239,9 @@ fn run() -> Result<(), ()> {
             print_json(r#"{"ok":true}"#);
         }
         Cmd::Read { kind } => {
-            let kind = kind.unwrap_or_else(|| "all".to_owned());
+            // Default `read` to the shared channel transcript: it's the most common
+            // operation and keeps the CLI ergonomic (no need to remember `--type message`).
+            let kind = kind.unwrap_or_else(|| "message".to_owned());
             if kind == "discovery" || kind == "all" {
                 let mut discoveries: Vec<Value> = Vec::new();
                 let mut next_steps: Vec<Value> = Vec::new();
@@ -250,10 +331,10 @@ fn run() -> Result<(), ()> {
                 print_json(&out.to_string());
             }
         }
-        Cmd::Brief { kind } => {
+        Cmd::Brief { kind, all } => {
             let kind = kind.unwrap_or_else(|| "discovery".to_owned());
 
-            let (discoveries, next_steps) = load_discoveries_and_next_steps(&conn, &kind)?;
+            let (discoveries, next_steps) = load_discoveries_and_next_steps(&conn, &kind, all)?;
 
             let out = json!({
                 "ok": true,
@@ -264,9 +345,9 @@ fn run() -> Result<(), ()> {
             });
             print_json(&out.to_string());
         }
-        Cmd::Digest { kind } => {
+        Cmd::Digest { kind, all } => {
             let kind = kind.unwrap_or_else(|| "discovery".to_owned());
-            let (discoveries, next_steps) = load_discoveries_and_next_steps(&conn, &kind)?;
+            let (discoveries, next_steps) = load_discoveries_and_next_steps(&conn, &kind, all)?;
 
             // Digest: keep the discovery list intentionally smaller than brief.
             let discoveries = discoveries
@@ -290,6 +371,97 @@ fn run() -> Result<(), ()> {
                 "kind": kind,
                 "discoveries": discoveries,
                 "next_steps": next_steps,
+            });
+            print_json(&out.to_string());
+        }
+        Cmd::Status { value } => {
+            let now_ms = now_unix_ms()?;
+            ensure_agent_row(&conn, &agent_id, now_ms)?;
+            conn.execute(
+                "UPDATE agent_state SET status = ?2, updated_at_ms = ?3 WHERE agent_id = ?1",
+                params![agent_id, value, now_ms],
+            )
+            .map_err(|_| ())?;
+            print_json(r#"{"ok":true}"#);
+        }
+        Cmd::Plan { value } => {
+            let now_ms = now_unix_ms()?;
+            ensure_agent_row(&conn, &agent_id, now_ms)?;
+            conn.execute(
+                "UPDATE agent_state SET plan = ?2, updated_at_ms = ?3 WHERE agent_id = ?1",
+                params![agent_id, value, now_ms],
+            )
+            .map_err(|_| ())?;
+            print_json(r#"{"ok":true}"#);
+        }
+        Cmd::Agents => {
+            let mut stmt = conn
+                .prepare(
+                    "SELECT agent_id, status, plan, updated_at_ms FROM agent_state ORDER BY agent_id ASC",
+                )
+                .map_err(|_| ())?;
+            let rows = stmt
+                .query_map([], |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, Option<String>>(1)?,
+                        row.get::<_, Option<String>>(2)?,
+                        row.get::<_, i64>(3)?,
+                    ))
+                })
+                .map_err(|_| ())?;
+
+            let mut agents: Vec<Value> = Vec::new();
+            for r in rows {
+                let (agent_id, status, plan, updated_at_ms) = r.map_err(|_| ())?;
+                agents.push(json!({
+                    "agent_id": agent_id,
+                    "status": status,
+                    "plan": plan,
+                    "updated_at_ms": updated_at_ms,
+                }));
+            }
+
+            let out = json!({
+                "ok": true,
+                "agents": agents,
+            });
+            print_json(&out.to_string());
+        }
+        Cmd::Done { summary } => {
+            let now_ms = now_unix_ms()?;
+
+            // Release all leases for this agent.
+            let released: i64 = conn
+                .query_row(
+                    "SELECT COUNT(1) FROM claims WHERE agent_id = ?1",
+                    params![agent_id],
+                    |row| row.get(0),
+                )
+                .map_err(|_| ())?;
+            conn.execute("DELETE FROM claims WHERE agent_id = ?1", params![agent_id])
+                .map_err(|_| ())?;
+
+            // Clear ephemeral agent metadata.
+            ensure_agent_row(&conn, &agent_id, now_ms)?;
+            conn.execute(
+                "UPDATE agent_state SET status = NULL, plan = NULL, updated_at_ms = ?2 WHERE agent_id = ?1",
+                params![agent_id, now_ms],
+            )
+            .map_err(|_| ())?;
+
+            // Post a completion summary to the shared channel so others can see the work wrapped up.
+            let body_json = json!({ "text": format!("DONE: {summary}") }).to_string();
+            conn.execute(
+                "INSERT INTO messages(created_at_ms, agent_id, kind, body_json) VALUES (?1, ?2, 'message', ?3)",
+                params![now_ms, agent_id, body_json],
+            )
+            .map_err(|_| ())?;
+
+            let out = json!({
+                "ok": true,
+                "released_claims": released,
+                "cleared": ["status", "plan"],
             });
             print_json(&out.to_string());
         }
@@ -326,7 +498,11 @@ fn normalize_claim_path(s: &str) -> String {
     out
 }
 
-fn load_discoveries_and_next_steps(conn: &Connection, kind: &str) -> Result<(Vec<Value>, Vec<Value>), ()> {
+fn load_discoveries_and_next_steps(
+    conn: &Connection,
+    kind: &str,
+    all: bool,
+) -> Result<(Vec<Value>, Vec<Value>), ()> {
     let mut discoveries: Vec<Value> = Vec::new();
     let mut next_steps: Vec<Value> = Vec::new();
 
@@ -352,7 +528,7 @@ fn load_discoveries_and_next_steps(conn: &Connection, kind: &str) -> Result<(Vec
 
             // High-signal gate: only propagate discoveries explicitly marked as high-signal.
             // This keeps the default channel "quiet" and matches the "share only valuable findings" intent.
-            if !is_high_signal_discovery(&obj) {
+            if !all && !is_high_signal_discovery(&obj) {
                 continue;
             }
 
@@ -486,6 +662,9 @@ fn dependency_hints_for_check(conn: &Connection, agent_id: &str) -> Result<Vec<V
         .map_err(|_| ())?;
 
     let mut hints: Vec<Value> = Vec::new();
+    // Dedupe: the same provider may post multiple declarations for the same scope while iterating.
+    // Keep only the newest hint per (provider_agent_id, scope) to avoid noisy repeats.
+    let mut seen_provider_scope: HashSet<(String, String)> = HashSet::new();
     for r in rows {
         let (provider_agent_id, decl_json) = r.map_err(|_| ())?;
         let decl_v: Value = serde_json::from_str(&decl_json).map_err(|_| ())?;
@@ -509,7 +688,9 @@ fn dependency_hints_for_check(conn: &Connection, agent_id: &str) -> Result<Vec<V
             .map(|a| a.iter().filter_map(|v| v.as_str().map(|s| s.to_owned())).collect())
             .unwrap_or_default();
 
-        let is_api_decl = tags.iter().any(|t| t.to_ascii_lowercase().contains("api"));
+        // Avoid substring false positives (e.g. "capistrano" contains "api").
+        // Treat a tag as API-ish only if it contains an "api" segment.
+        let is_api_decl = tags.iter().any(|t| tag_has_api_segment(t));
         if !is_api_decl {
             continue;
         }
@@ -530,6 +711,10 @@ fn dependency_hints_for_check(conn: &Connection, agent_id: &str) -> Result<Vec<V
             }
         }
         if overlap.is_empty() {
+            continue;
+        }
+
+        if !seen_provider_scope.insert((provider_agent_id.clone(), scope.clone())) {
             continue;
         }
 
@@ -559,6 +744,11 @@ fn dependency_hints_for_check(conn: &Connection, agent_id: &str) -> Result<Vec<V
     Ok(hints)
 }
 
+fn tag_has_api_segment(tag: &str) -> bool {
+    tag.split(|c: char| !c.is_ascii_alphanumeric())
+        .any(|seg| seg.eq_ignore_ascii_case("api"))
+}
+
 fn init_db(conn: &Connection) -> Result<(), ()> {
     conn.execute_batch(
         "CREATE TABLE IF NOT EXISTS claims (\
@@ -568,6 +758,12 @@ fn init_db(conn: &Connection) -> Result<(), ()> {
          );\
          CREATE INDEX IF NOT EXISTS idx_claims_path_expires \
             ON claims(path, expires_at_ms);\
+         CREATE TABLE IF NOT EXISTS agent_state (\
+            agent_id TEXT PRIMARY KEY,\
+            status TEXT,\
+            plan TEXT,\
+            updated_at_ms INTEGER NOT NULL\
+         );\
          CREATE TABLE IF NOT EXISTS messages (\
             id INTEGER PRIMARY KEY AUTOINCREMENT,\
             created_at_ms INTEGER NOT NULL,\
@@ -578,6 +774,22 @@ fn init_db(conn: &Connection) -> Result<(), ()> {
         ",
     )
     .map_err(|_| ())?;
+    Ok(())
+}
+
+fn ensure_agent_row(conn: &Connection, agent_id: &str, now_ms: i64) -> Result<(), ()> {
+    conn.execute(
+        "INSERT INTO agent_state(agent_id, status, plan, updated_at_ms) VALUES (?1, NULL, NULL, ?2) \
+         ON CONFLICT(agent_id) DO UPDATE SET updated_at_ms = excluded.updated_at_ms",
+        params![agent_id, now_ms],
+    )
+    .map_err(|_| ())?;
+    Ok(())
+}
+
+fn touch_agent(conn: &Connection, agent_id: &str) -> Result<(), ()> {
+    let now_ms = now_unix_ms()?;
+    ensure_agent_row(conn, agent_id, now_ms)?;
     Ok(())
 }
 
@@ -610,7 +822,19 @@ where
                 let v = args.next().ok_or(())?.to_string_lossy().into_owned();
                 agent_id = Some(v);
             }
-            "claim" | "release" | "check" | "post" | "read" | "brief" | "digest" | "eval" => {
+            "claim"
+            | "release"
+            | "claims"
+            | "check"
+            | "post"
+            | "read"
+            | "brief"
+            | "digest"
+            | "status"
+            | "plan"
+            | "agents"
+            | "done"
+            | "eval" => {
                 sub = Some(a)
             }
             _ => return Err(()),
@@ -628,6 +852,11 @@ where
         "release" => {
             let path = parse_release_args(&rest)?;
             Cmd::Release { path }
+        }
+        "claims" => {
+            let path_prefix = parse_claims_args(&rest)?;
+            let path_prefix = path_prefix.map(|p| normalize_claim_path(&p));
+            Cmd::Claims { path_prefix }
         }
         "check" => {
             let (path, strict) = parse_check_args(&rest)?;
@@ -652,12 +881,34 @@ where
             Cmd::Read { kind }
         }
         "brief" => {
-            let kind = parse_read_args(&rest)?;
-            Cmd::Brief { kind }
+            let (kind, all) = parse_brief_digest_args(&rest)?;
+            Cmd::Brief { kind, all }
         }
         "digest" => {
-            let kind = parse_read_args(&rest)?;
-            Cmd::Digest { kind }
+            let (kind, all) = parse_brief_digest_args(&rest)?;
+            Cmd::Digest { kind, all }
+        }
+        "status" => {
+            let value = parse_free_text_or_clear(&rest)?;
+            Cmd::Status { value }
+        }
+        "plan" => {
+            let value = parse_free_text_or_clear(&rest)?;
+            Cmd::Plan { value }
+        }
+        "agents" => {
+            if !rest.is_empty() {
+                return Err(());
+            }
+            Cmd::Agents
+        }
+        "done" => {
+            if rest.is_empty() {
+                return Err(());
+            }
+            Cmd::Done {
+                summary: rest.join(" "),
+            }
         }
         "eval" => {
             if rest.len() != 1 || rest[0] != "user-prompt-submit" {
@@ -669,6 +920,33 @@ where
     };
 
     Ok((agent_id, cmd))
+}
+
+fn parse_free_text_or_clear(args: &[String]) -> Result<Option<String>, ()> {
+    if args.is_empty() {
+        return Err(());
+    }
+    if args.len() == 1 && args[0] == "--clear" {
+        return Ok(None);
+    }
+    if args.iter().any(|a| a == "--clear") {
+        return Err(());
+    }
+    Ok(Some(args.join(" ")))
+}
+
+fn parse_claims_args(args: &[String]) -> Result<Option<String>, ()> {
+    if args.is_empty() {
+        return Ok(None);
+    }
+    if args.len() == 2 && args[0] == "--path-prefix" {
+        let v = args[1].trim();
+        if v.is_empty() {
+            return Err(());
+        }
+        return Ok(Some(v.to_owned()));
+    }
+    Err(())
 }
 
 fn parse_claim_args(args: &[String]) -> Result<(String, Duration), ()> {
@@ -766,6 +1044,29 @@ fn parse_read_args(args: &[String]) -> Result<Option<String>, ()> {
         i += 1;
     }
     Ok(kind)
+}
+
+fn parse_brief_digest_args(args: &[String]) -> Result<(Option<String>, bool), ()> {
+    if args.is_empty() {
+        return Ok((None, false));
+    }
+    let mut kind: Option<String> = None;
+    let mut all = false;
+    let mut i = 0usize;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--type" => {
+                i += 1;
+                kind = Some(args.get(i).ok_or(())?.clone());
+            }
+            "--all" => {
+                all = true;
+            }
+            _ => return Err(()),
+        }
+        i += 1;
+    }
+    Ok((kind, all))
 }
 
 fn parse_duration(s: &str) -> Result<Duration, ()> {

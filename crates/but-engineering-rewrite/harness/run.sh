@@ -140,6 +140,23 @@ case_02_lease_expiry() {
   expect_contains "$out_b_check" "no_conflict"
 }
 
+case_18_expired_claims_filtered_from_listing() {
+  bold "Case 18: Claims Listing (Filters Expired)"
+  local repo; repo="$(mk_repo)"
+  trap '[[ -n "${repo:-}" ]] && rm -rf "$repo"' RETURN
+
+  local out_a out_claims
+  out_a="$(run_cli "$repo" "A" claim --path src/app.txt --ttl 1s)"
+  sleep 2
+  out_claims="$(run_cli "$repo" "B" claims)"
+
+  # Expired claims should not pollute coordination views.
+  expect_contains "$out_claims" "\"ok\":true"
+  expect_contains "$out_claims" "\"claims\""
+  expect_not_contains "$out_claims" "\"path\":\"src/app.txt\""
+  expect_not_contains "$out_claims" "\"agent_id\":\"A\""
+}
+
 case_03_habit_formation() {
   bold "Case 03: Habit Formation"
   local repo; repo="$(mk_repo)"
@@ -190,6 +207,33 @@ case_04_high_signal_discovery() {
   expect_not_contains "$out_digest" "ERW_CASE04_LOW_UNIQUE"
 }
 
+case_17_brief_all_escape_hatch() {
+  bold "Case 17: Brief --all (Escape Hatch)"
+  local repo; repo="$(mk_repo)"
+  trap '[[ -n "${repo:-}" ]] && rm -rf "$repo"' RETURN
+
+  local out_post out_brief_default out_brief_all
+
+  # Post a low-signal discovery (normally filtered out of brief/digest).
+  out_post="$(run_cli "$repo" "A" post --type discovery --json '{"signal":"low","title":"ERW Case 17: low signal","evidence":[{"kind":"file","path":"src/app.txt","note":"still should be inspectable"}],"suggested_action":{"kind":"run","cmd":"echo ERW_CASE17_LOW_UNIQUE","note":"should only surface with --all"}}')"
+  # And a high-signal discovery (always visible).
+  out_post="$(run_cli "$repo" "A" post --type discovery --json '{"signal":"high","title":"ERW Case 17: high signal","evidence":[{"kind":"cmd","cmd":"git status --porcelain","note":"prove next_steps still works"}],"suggested_action":{"kind":"run","cmd":"echo ERW_CASE17_HIGH_UNIQUE","note":"still visible without --all"}}')"
+
+  out_brief_default="$(run_cli "$repo" "B" brief --type discovery)"
+  out_brief_all="$(run_cli "$repo" "B" brief --type discovery --all)"
+
+  expect_contains "$out_brief_default" "\"mode\":\"brief\""
+  expect_not_contains "$out_brief_default" "ERW_CASE17_LOW_UNIQUE"
+  expect_contains "$out_brief_default" "ERW_CASE17_HIGH_UNIQUE"
+
+  expect_contains "$out_brief_all" "\"mode\":\"brief\""
+  expect_contains "$out_brief_all" "ERW_CASE17_LOW_UNIQUE"
+  expect_contains "$out_brief_all" "ERW_CASE17_HIGH_UNIQUE"
+  # With --all, next_steps should be derived from the same "discoveries" set (including low-signal).
+  expect_matches "$out_brief_all" "\"next_steps\"[[:space:]]*:[[:space:]]*\\[[^]]*ERW_CASE17_LOW_UNIQUE"
+  expect_matches "$out_brief_all" "\"next_steps\"[[:space:]]*:[[:space:]]*\\[[^]]*ERW_CASE17_HIGH_UNIQUE"
+}
+
 case_05_dependency_hint() {
   bold "Case 05: Dependency Hint (Provider/Consumer API)"
   local repo; repo="$(mk_repo)"
@@ -237,6 +281,54 @@ case_05d_dependency_hint_scope_filter() {
   expect_not_contains "$out_check" "\"provider_agent_id\":\"A\""
 }
 
+case_05e_dependency_hint_dedupe() {
+  bold "Case 05e: Dependency Hint (Dedupe Per Provider)"
+  local repo; repo="$(mk_repo)"
+  trap '[[ -n "${repo:-}" ]] && rm -rf "$repo"' RETURN
+
+  local out_post out_check count
+
+  # Agent A posts repeated declarations for the same scope (renewal/iteration).
+  out_post="$(run_cli "$repo" "A" post --type declaration --json '{"scope":"component:sync","tags":["component/api","provider"],"surface":["SyncService::push","SyncService::pull"],"note":"First declaration"}')"
+  out_post="$(run_cli "$repo" "A" post --type declaration --json '{"scope":"component:sync","tags":["component/api","provider"],"surface":["SyncService::push"],"note":"Second declaration (renewal)"}')"
+
+  out_post="$(run_cli "$repo" "B" post --type intent --json '{"scope":"component:sync","tags":["consumer"],"surface":["SyncService::push"],"note":"Consume push"}')"
+  out_check="$(run_cli "$repo" "B" check --path src/app.txt)"
+
+  expect_contains "$out_check" "\"decision\""
+  expect_contains "$out_check" "\"allow\""
+  expect_contains "$out_check" "\"dependency_hints\""
+  expect_contains "$out_check" "\"provider_agent_id\":\"A\""
+
+  # Must be exactly one provider hint for A (dedupe per provider+scope).
+  count="$(printf "%s" "$out_check" | grep -oF "\"provider_agent_id\":\"A\"" | wc -l | tr -d '[:space:]')"
+  if [[ "$count" != "1" ]]; then
+    printf '%s\n' "---- output ----" "$out_check" "----------------" >&2
+    fail "expected exactly one dependency hint for provider A; got $count"
+  fi
+}
+
+case_05h_dependency_hint_api_tag_gate() {
+  bold "Case 05h: Dependency Hint (API Tag Gate: avoid substring false positives)"
+  local repo; repo="$(mk_repo)"
+  trap '[[ -n "${repo:-}" ]] && rm -rf "$repo"' RETURN
+
+  local out_post out_check
+
+  # "capistrano" contains the substring "api" but is NOT an API tag. We should not
+  # emit dependency hints based on substring matches; tags should match on segments.
+  out_post="$(run_cli "$repo" "A" post --type declaration --json '{"scope":"component:sync","tags":["capistrano","provider"],"surface":["SyncService::push"],"note":"tag contains api substring; should not be treated as API decl"}')"
+  out_post="$(run_cli "$repo" "B" post --type intent --json '{"scope":"component:sync","tags":["consumer"],"surface":["SyncService::push"],"note":"overlap exists but provider is not API-tagged"}')"
+
+  out_check="$(run_cli "$repo" "B" check --path src/app.txt)"
+
+  expect_contains "$out_check" "\"decision\""
+  expect_contains "$out_check" "\"allow\""
+  expect_contains "$out_check" "\"dependency_hints\""
+  expect_matches "$out_check" "\"dependency_hints\"[[:space:]]*:[[:space:]]*\\[[[:space:]]*\\]"
+  expect_not_contains "$out_check" "\"provider_agent_id\":\"A\""
+}
+
 case_05b_check_action_plan() {
   bold "Case 05b: Check Action Plan (Includes Blocking Agent)"
   local repo; repo="$(mk_repo)"
@@ -273,6 +365,93 @@ case_05c_dedup_blocking_agents() {
   # Must be exactly one "A" (not ["A","A",...]).
   expect_matches "$out_b" "\"blocking_agents\"[[:space:]]*:[[:space:]]*\\[[[:space:]]*\"A\"[[:space:]]*\\]"
   expect_not_contains "$out_b" "\"A\",\"A\""
+}
+
+case_15_multi_blocker_action_plan() {
+  bold "Case 15: Multi-Blocker Check (Action Plan Mentions Each)"
+  local repo; repo="$(mk_repo)"
+  trap '[[ -n "${repo:-}" ]] && rm -rf "$repo"' RETURN
+
+  local out_a out_c out_b
+
+  # Same agent can have multiple overlapping claims (e.g. directory + file),
+  # and multiple different agents can block a single check. The check output
+  # must stay low-noise (dedup) and still be directly actionable.
+  out_a="$(run_cli "$repo" "A" claim --path src/ --ttl 15m)"
+  out_c="$(run_cli "$repo" "C" claim --path src/app.txt --ttl 15m)"
+  out_b="$(run_cli "$repo" "B" check --path src/app.txt)"
+
+  expect_contains "$out_b" "\"decision\""
+  expect_contains "$out_b" "\"warn\""
+  expect_contains "$out_b" "\"blocking_agents\""
+  expect_contains "$out_b" "\"A\""
+  expect_contains "$out_b" "\"C\""
+  expect_contains "$out_b" "\"action_plan\""
+  expect_contains "$out_b" "@A"
+  expect_contains "$out_b" "@C"
+  expect_not_contains "$out_b" "\"A\",\"A\""
+  expect_not_contains "$out_b" "\"C\",\"C\""
+}
+
+case_05f_claim_renewal_dedupe() {
+  bold "Case 05f: Claim Renewal (No Duplicate Claims Rows)"
+  local repo; repo="$(mk_repo)"
+  trap '[[ -n "${repo:-}" ]] && rm -rf "$repo"' RETURN
+
+  local out_a1 out_a2 out_claims count
+  out_a1="$(run_cli "$repo" "A" claim --path src/app.txt --ttl 15m)"
+  out_a2="$(run_cli "$repo" "A" claim --path src/app.txt --ttl 15m)"
+  out_claims="$(run_cli "$repo" "B" claims)"
+
+  expect_contains "$out_a1" "\"ok\":true"
+  expect_contains "$out_a2" "\"ok\":true"
+  expect_contains "$out_claims" "\"ok\":true"
+  expect_contains "$out_claims" "\"claims\""
+  expect_contains "$out_claims" "\"agent_id\":\"A\""
+  expect_contains "$out_claims" "\"path\":\"src/app.txt\""
+
+  # Must be exactly one row for the renewed claim (not duplicated inserts).
+  count="$(printf "%s" "$out_claims" | grep -oF "\"path\":\"src/app.txt\"" | wc -l | tr -d '[:space:]')"
+  if [[ "$count" != "1" ]]; then
+    printf '%s\n' "---- output ----" "$out_claims" "----------------" >&2
+    fail "expected exactly one claim row for src/app.txt after renewal; got $count"
+  fi
+}
+
+case_05g_done_cleanup() {
+  bold "Case 05g: Done (Cleanup + Completion Message)"
+  local repo; repo="$(mk_repo)"
+  trap '[[ -n "${repo:-}" ]] && rm -rf "$repo"' RETURN
+
+  local out_status out_plan out_claim out_done out_check out_agents out_read
+
+  out_status="$(run_cli "$repo" "A" status ERW_CASE05G_STATUS)"
+  out_plan="$(run_cli "$repo" "A" plan ERW_CASE05G_PLAN)"
+  out_claim="$(run_cli "$repo" "A" claim --path src/app.txt --ttl 15m)"
+
+  out_done="$(run_cli "$repo" "A" done ERW_CASE05G_DONE_UNIQUE)"
+
+  # After done, claim should be released and others should not see a conflict.
+  out_check="$(run_cli "$repo" "B" check --path src/app.txt)"
+  expect_contains "$out_check" "\"decision\""
+  expect_contains "$out_check" "\"allow\""
+  expect_contains "$out_check" "no_conflict"
+
+  # And done should clear agent metadata.
+  out_agents="$(run_cli "$repo" "B" agents)"
+  expect_contains "$out_agents" "\"agent_id\":\"A\""
+  expect_not_contains "$out_agents" "ERW_CASE05G_STATUS"
+  expect_not_contains "$out_agents" "ERW_CASE05G_PLAN"
+
+  # And done should post a completion message to the shared channel.
+  out_read="$(run_cli "$repo" "B" read --type message)"
+  expect_contains "$out_read" "\"ok\""
+  expect_contains "$out_read" "\"kind\":\"message\""
+  expect_contains "$out_read" "DONE:"
+  expect_contains "$out_read" "ERW_CASE05G_DONE_UNIQUE"
+
+  expect_contains "$out_done" "\"ok\""
+  expect_contains "$out_done" "\"released_claims\""
 }
 
 case_06_read_surfaces() {
@@ -361,6 +540,120 @@ case_09_channel_messages() {
   expect_contains "$out_read" "@B"
 }
 
+case_16_read_default_transcript() {
+  bold "Case 16: Read Default (Channel Transcript)"
+  local repo; repo="$(mk_repo)"
+  trap '[[ -n "${repo:-}" ]] && rm -rf "$repo"' RETURN
+
+  local out_post out_read
+  out_post="$(run_cli "$repo" "A" post "ERW_CASE16_UNIQUE: status update for the team")"
+  out_read="$(run_cli "$repo" "B" read)"
+
+  # Default `read` should show the channel transcript (messages) so wrappers can
+  # use a single obvious command without remembering `--type message`.
+  expect_contains "$out_read" "\"ok\""
+  expect_contains "$out_read" "\"kind\":\"message\""
+  expect_contains "$out_read" "\"messages\""
+  expect_contains "$out_read" "\"agent_id\":\"A\""
+  expect_contains "$out_read" "ERW_CASE16_UNIQUE"
+}
+
+case_10_claims_list() {
+  bold "Case 10: Claims Listing (Visibility)"
+  local repo; repo="$(mk_repo)"
+  trap '[[ -n "${repo:-}" ]] && rm -rf "$repo"' RETURN
+
+  local out_a_claim out_claims
+  out_a_claim="$(run_cli "$repo" "A" claim --path src/app.txt --ttl 15m)"
+  out_claims="$(run_cli "$repo" "B" claims)"
+
+  expect_contains "$out_a_claim" "\"ok\":true"
+  expect_contains "$out_claims" "\"ok\":true"
+  expect_contains "$out_claims" "\"claims\""
+  expect_contains "$out_claims" "\"agent_id\":\"A\""
+  expect_contains "$out_claims" "\"path\":\"src/app.txt\""
+}
+
+case_11_discovery_provenance() {
+  bold "Case 11: Discovery Provenance (agent_id in brief)"
+  local repo; repo="$(mk_repo)"
+  trap '[[ -n "${repo:-}" ]] && rm -rf "$repo"' RETURN
+
+  local out_post out_brief
+  out_post="$(run_cli "$repo" "A" post --type discovery --json '{"signal":"high","title":"ERW Case 11: Provenance matters","evidence":[{"kind":"file","path":"src/app.txt","note":"used to prove agent_id attribution is preserved"}],"suggested_action":{"kind":"run","cmd":"echo ERW_CASE11_UNIQUE","note":"prove next_steps still works"}}')"
+  out_brief="$(run_cli "$repo" "B" brief --type discovery)"
+
+  # Discoveries must include provenance so teams can follow up with the right agent.
+  expect_contains "$out_brief" "\"discoveries\""
+  expect_contains "$out_brief" "\"agent_id\":\"A\""
+  expect_matches "$out_brief" "\"next_steps\"[[:space:]]*:[[:space:]]*\\[[^]]*ERW_CASE11_UNIQUE"
+}
+
+case_12_discovery_provenance_digest() {
+  bold "Case 12: Discovery Provenance (agent_id in digest)"
+  local repo; repo="$(mk_repo)"
+  trap '[[ -n "${repo:-}" ]] && rm -rf "$repo"' RETURN
+
+  local out_post out_digest
+  out_post="$(run_cli "$repo" "A" post --type discovery --json '{"signal":"high","title":"ERW Case 12: Digest provenance","evidence":[{"kind":"file","path":"src/app.txt","note":"prove agent_id attribution survives digest compaction"}],"suggested_action":{"kind":"run","cmd":"echo ERW_CASE12_UNIQUE","note":"prove next_steps still works"}}')"
+  out_digest="$(run_cli "$repo" "B" digest --type discovery)"
+
+  # Digest compacts discoveries, but must keep provenance.
+  expect_contains "$out_digest" "\"discoveries\""
+  expect_contains "$out_digest" "\"agent_id\":\"A\""
+  expect_contains "$out_digest" "\"title\""
+  expect_matches "$out_digest" "\"next_steps\"[[:space:]]*:[[:space:]]*\\[[^]]*ERW_CASE12_UNIQUE"
+}
+
+case_13_agents_status_plan() {
+  bold "Case 13: Agents + Status/Plan (Visibility)"
+  local repo; repo="$(mk_repo)"
+  trap '[[ -n "${repo:-}" ]] && rm -rf "$repo"' RETURN
+
+  local out_status_a out_plan_a out_agents out_status_b
+
+  out_status_a="$(run_cli "$repo" "A" status ERW_CASE13_STATUS_A)"
+  out_plan_a="$(run_cli "$repo" "A" plan ERW_CASE13_PLAN_A)"
+  out_agents="$(run_cli "$repo" "B" agents)"
+
+  expect_contains "$out_status_a" "\"ok\":true"
+  expect_contains "$out_plan_a" "\"ok\":true"
+  expect_contains "$out_agents" "\"ok\":true"
+  expect_contains "$out_agents" "\"agents\""
+  expect_contains "$out_agents" "\"agent_id\":\"A\""
+  expect_contains "$out_agents" "\"status\":\"ERW_CASE13_STATUS_A\""
+  expect_contains "$out_agents" "\"plan\":\"ERW_CASE13_PLAN_A\""
+
+  out_status_b="$(run_cli "$repo" "B" status ERW_CASE13_STATUS_B)"
+  out_agents="$(run_cli "$repo" "A" agents)"
+  expect_contains "$out_agents" "\"agent_id\":\"B\""
+  expect_contains "$out_agents" "\"status\":\"ERW_CASE13_STATUS_B\""
+}
+
+case_14_claims_path_prefix_filter() {
+  bold "Case 14: Claims Filter (path-prefix overlap)"
+  local repo; repo="$(mk_repo)"
+  trap '[[ -n "${repo:-}" ]] && rm -rf "$repo"' RETURN
+
+  local out_a_dir out_b_other out_c_file out_filtered
+
+  # A claims a directory (stored normalized without trailing slash).
+  out_a_dir="$(run_cli "$repo" "A" claim --path src/ --ttl 15m)"
+  # B claims an unrelated file.
+  out_b_other="$(run_cli "$repo" "B" claim --path notes.txt --ttl 15m)"
+  # C claims the specific file.
+  out_c_file="$(run_cli "$repo" "C" claim --path src/app.txt --ttl 15m)"
+
+  # Filtering should include both the file claim and the overlapping directory claim,
+  # but exclude unrelated paths.
+  out_filtered="$(run_cli "$repo" "D" claims --path-prefix src/app.txt)"
+  expect_contains "$out_filtered" "\"ok\":true"
+  expect_contains "$out_filtered" "\"claims\""
+  expect_contains "$out_filtered" "\"path\":\"src\""
+  expect_contains "$out_filtered" "\"path\":\"src/app.txt\""
+  expect_not_contains "$out_filtered" "\"path\":\"notes.txt\""
+}
+
 main() {
   ensure_bin
 
@@ -368,16 +661,29 @@ main() {
   case_01_two_agent_conflict || failed=1
   case_01b_two_agent_conflict_strict || failed=1
   case_02_lease_expiry || failed=1
+  case_18_expired_claims_filtered_from_listing || failed=1
   case_03_habit_formation || failed=1
   case_04_high_signal_discovery || failed=1
+  case_17_brief_all_escape_hatch || failed=1
   case_05_dependency_hint || failed=1
   case_05d_dependency_hint_scope_filter || failed=1
+  case_05e_dependency_hint_dedupe || failed=1
+  case_05h_dependency_hint_api_tag_gate || failed=1
   case_05b_check_action_plan || failed=1
   case_05c_dedup_blocking_agents || failed=1
+  case_15_multi_blocker_action_plan || failed=1
+  case_05f_claim_renewal_dedupe || failed=1
+  case_05g_done_cleanup || failed=1
   case_06_read_surfaces || failed=1
   case_07_release_claim || failed=1
   case_08_path_prefix_overlap || failed=1
   case_09_channel_messages || failed=1
+  case_16_read_default_transcript || failed=1
+  case_10_claims_list || failed=1
+  case_11_discovery_provenance || failed=1
+  case_12_discovery_provenance_digest || failed=1
+  case_13_agents_status_plan || failed=1
+  case_14_claims_path_prefix_filter || failed=1
 
   if [[ "$failed" -ne 0 ]]; then
     printf "\nOne or more cases failed. This is expected until the CLI is implemented.\n" >&2

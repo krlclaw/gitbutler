@@ -124,3 +124,156 @@
 
 ### (c) Next Step
 - Extend the harness to cover multiple intents/declarations per agent and require deduping hints (one per provider agent + scope), rather than emitting one hint per overlapping declaration row.
+
+## 2026-02-14 (Case 05e)
+
+### (a) What Changed
+- Added harness Case 05e to require `dependency_hints` to dedupe repeated declarations from the same provider (one hint per provider+scope): `crates/but-engineering-rewrite/harness/run.sh`, `crates/but-engineering-rewrite/harness/cases/05e-dependency-hint-dedupe.md`.
+- Updated both implementations to keep only the newest hint per `(provider_agent_id, scope)` to avoid noisy repeats during “renewal”/iteration: `crates/but-engineering-rewrite/src/main.rs`, `crates/but-engineering-rewrite/harness/bin/but-engineering-rewrite`.
+
+### (b) What Was Hard
+- Dedupe has to happen after confirming an actual overlap; otherwise a newer (non-overlapping) declaration could accidentally suppress an older overlapping one.
+
+### (c) Next Step
+- Extend the dedupe key to include a stable “surface id” namespace (not raw tokens), and consider emitting a single aggregated hint per provider with unioned overlap tokens across declarations.
+
+## 2026-02-14 (Case 10)
+
+### (a) What Changed
+- Added harness Case 10 to require basic visibility into active work via `claims` (list active leases with `path` + `agent_id`): `crates/but-engineering-rewrite/harness/run.sh`, `crates/but-engineering-rewrite/harness/cases/10-claims-list.md`.
+- Implemented minimal `claims` command in both the Rust CLI and the harness stub so the harness behaves consistently with/without Rust tooling: `crates/but-engineering-rewrite/src/main.rs`, `crates/but-engineering-rewrite/harness/bin/but-engineering-rewrite`.
+
+### (b) What Was Hard
+- Keeping output shape aligned between Rust and the stub; even “simple” list commands become two implementations because the harness can run either binary.
+
+### (c) Next Step
+- Decide whether `claims` should support filtering (by prefix/path) and whether `check` should embed claim metadata (expiry) so wrappers can avoid extra round trips.
+
+## 2026-02-14 (Case 11)
+
+### (a) What Changed
+- Ensured discovery `brief` preserves provenance by including `agent_id` on each propagated discovery (so consumers can follow up with the right agent): `crates/but-engineering-rewrite/harness/run.sh`, `crates/but-engineering-rewrite/harness/cases/11-discovery-provenance.md`.
+- Updated the harness stub implementation to attach `agent_id` (and to derive `next_steps` from the same filtered set) using Python JSON parsing instead of brittle `sed`/`awk` extraction: `crates/but-engineering-rewrite/harness/bin/but-engineering-rewrite`.
+
+### (b) What Was Hard
+- The stub previously treated discoveries as raw JSON strings and relied on regex extraction; once we needed to inject provenance, regex parsing broke on nested arrays like `evidence[]`.
+
+### (c) Next Step
+- Consider factoring “load discoveries + derive next steps” into a shared helper or script so behavior stays consistent across the Rust CLI and the stub as cases expand.
+
+## 2026-02-14 (Case 12)
+
+### (a) What Changed
+- Added harness Case 12 to require discovery provenance in `digest` output too (digest should be concise, not anonymous): `crates/but-engineering-rewrite/harness/run.sh`, `crates/but-engineering-rewrite/harness/cases/12-discovery-provenance-digest.md`.
+- The stub already emits `agent_id` in digest discoveries after the Case 11 fix, so no additional CLI surface was needed beyond adding the harness case.
+
+### (b) What Was Hard
+- Keeping the case realistic while still minimal: digest is intentionally compact, so the assertion focuses on preserving `agent_id` and `title` rather than the full discovery payload.
+
+### (c) Next Step
+- Decide whether `digest` should include a stable discovery id (row id / hash) so consumers can request full details on-demand without re-scanning.
+
+## 2026-02-14 (Case 13)
+
+### (a) What Changed
+- Added harness Case 13 to require minimal “who is doing what” visibility via `status`, `plan`, and `agents`: `crates/but-engineering-rewrite/harness/run.sh`, `crates/but-engineering-rewrite/harness/cases/13-agents-status-plan.md`.
+- Implemented `status <text...> | status --clear`, `plan <text...> | plan --clear`, and `agents` in the Rust CLI, backed by a tiny repo-scoped SQLite `agent_state` table: `crates/but-engineering-rewrite/src/main.rs`.
+- Updated the harness stub to support the same commands and share a single schema init path (claims/messages/agent_state) so the harness behaves consistently with/without Rust tooling: `crates/but-engineering-rewrite/harness/bin/but-engineering-rewrite`.
+
+### (b) What Was Hard
+- The harness can run either the Rust binary or the stub; adding even “simple” new CLI surface effectively means two implementations plus keeping the SQLite schema compatible.
+- Shell + embedded Python is easy to break with tiny formatting mistakes (indentation inside `python3 -c` blocks caused an early harness failure before the schema/init was centralized).
+
+### (c) Next Step
+- Make `agents` reflect liveness better (expire agents with no recent activity), and teach `eval user-prompt-submit` to show a compact “active agents + statuses” summary (not just claim count).
+
+## 2026-02-14 (Case 05f)
+
+### (a) What Changed
+- Added harness Case 05f to require “claim renewal” semantics: re-claiming the same `(agent_id, path)` must not create duplicate rows visible via `claims` (keeps coordination state low-noise): `crates/but-engineering-rewrite/harness/run.sh`, `crates/but-engineering-rewrite/harness/cases/05f-claim-renewal-dedupe.md`.
+- Implemented renewal-by-dedupe in both implementations by deleting the existing `(agent_id, path)` row before inserting the renewed lease: `crates/but-engineering-rewrite/src/main.rs`, `crates/but-engineering-rewrite/harness/bin/but-engineering-rewrite`.
+
+### (b) What Was Hard
+- SQLite schema migration would be “cleaner” with a unique constraint, but that’s more complexity than needed for the harness; doing a targeted delete keeps the behavior correct with minimal surface area.
+
+### (c) Next Step
+- Consider upgrading `claims` storage to a real upsert (`UNIQUE(path, agent_id)` + `ON CONFLICT DO UPDATE`) once we want stronger invariants beyond the disposable-repo harness.
+
+## 2026-02-14 (Case 18)
+
+- Added harness Case 18 to ensure `claims` is a useful coordination view by filtering out expired leases: `crates/but-engineering-rewrite/harness/run.sh`, `crates/but-engineering-rewrite/harness/cases/18-expired-claims-filtered.md`.
+- Kept the scenario focused on the operator workflow (someone runs `claims` to decide whether to proceed), rather than re-testing `check` behavior.
+- Reinforced that time-based state must not linger in "listing" surfaces, otherwise people will ping the wrong agent and avoid safe work.
+- Next: consider adding an explicit `claims --all` (include expired) for debugging, while keeping the default view clean.
+
+## 2026-02-14 (Case 05g)
+
+### (a) What Changed
+- Added harness Case 05g to require a single "I'm done" cleanup path: release all of the agent’s active claims, clear `status`/`plan`, and post a completion message to the shared channel: `crates/but-engineering-rewrite/harness/run.sh`, `crates/but-engineering-rewrite/harness/cases/05g-done-cleanup.md`.
+- Implemented a minimal `done <summary...>` command in both the Rust CLI and the stub so the harness passes regardless of Rust tool availability: `crates/but-engineering-rewrite/src/main.rs`, `crates/but-engineering-rewrite/harness/bin/but-engineering-rewrite`.
+
+### (b) What Was Hard
+- Getting a robust harness assertion for "status/plan cleared" without JSON parsing in bash; the case asserts the previous values are no longer present in `agents` output instead of matching nested structure.
+
+### (c) Next Step
+- Decide whether `done` should support `--no-post` and/or `--release --path ...` variants, and whether completion messages should be a first-class kind (e.g. `kind: done`) rather than a plain channel message.
+
+## 2026-02-14 (Case 14)
+
+### (a) What Changed
+- Added harness Case 14 to require a filtered claims view via `claims --path-prefix <path>` so wrappers can show only relevant active work for a file/subtree (including overlapping directory claims): `crates/but-engineering-rewrite/harness/run.sh`, `crates/but-engineering-rewrite/harness/cases/14-claims-filter.md`.
+- Implemented minimal `--path-prefix` support in both the Rust CLI and the harness stub using the same overlap predicate as `check` (exact match OR ancestor/descendant on segment boundaries): `crates/but-engineering-rewrite/src/main.rs`, `crates/but-engineering-rewrite/harness/bin/but-engineering-rewrite`.
+
+### (b) What Was Hard
+- Getting “filter” semantics right: naive `starts_with` misses the important directory-claim overlap case (claim `src/` should surface when filtering `src/app.txt`).
+
+### (c) Next Step
+- Add richer `check` output that references the specific claim rows (path + agent + expiry) so wrappers can render conflicts without a separate `claims` query.
+
+## 2026-02-14 (Case 15)
+
+### (a) What Changed
+- Added harness Case 15 to cover a realistic “multiple blockers” situation: two different agents can both overlap a target path (e.g. one claims `src/` while another claims `src/app.txt`). `check` must list each blocker once and produce an action plan that references each blocking agent: `crates/but-engineering-rewrite/harness/run.sh`, `crates/but-engineering-rewrite/harness/cases/15-multi-blocker-action-plan.md`.
+- Updated `check` to dedupe `blocking_agents` and to emit one “ping the blocker” step per blocking agent (instead of only the first): `crates/but-engineering-rewrite/src/main.rs`, `crates/but-engineering-rewrite/harness/bin/but-engineering-rewrite`.
+
+### (b) What Was Hard
+- The harness can run either the Rust binary or the stub; “simple” output-shape changes like multi-blocker action plans require updating both implementations to avoid flaky environment-dependent behavior.
+
+### (c) Next Step
+- Add structured `action_plan` items (kind + params) so wrappers can render/run steps safely without shell-escaping concerns.
+
+## 2026-02-14 (Case 16)
+
+### (a) What Changed
+- Added harness Case 16 to make `read` ergonomic by defaulting to the shared channel transcript (messages) when no `--type` is provided: `crates/but-engineering-rewrite/harness/run.sh`, `crates/but-engineering-rewrite/harness/cases/16-read-default-transcript.md`.
+- Updated both the Rust CLI and the harness stub so `but-engineering-rewrite --agent-id X read` returns `kind:"message"` (instead of an effectively-empty `all` kind): `crates/but-engineering-rewrite/src/main.rs`, `crates/but-engineering-rewrite/harness/bin/but-engineering-rewrite`.
+
+### (b) What Was Hard
+- The harness can run either the Rust binary or the stub; a "default behavior" change needs to be implemented twice to avoid environment-dependent failures.
+
+### (c) Next Step
+- Decide what `read --type all` should mean (single unified schema vs per-kind lists) so “see everything” doesn’t silently drop non-discovery kinds.
+
+## 2026-02-14 (Case 17)
+
+### (a) What Changed
+- Added harness Case 17 to require an explicit “escape hatch” for discovery inspection: `brief --all` must include low-signal discoveries (while the default `brief` remains high-signal-only): `crates/but-engineering-rewrite/harness/run.sh`, `crates/but-engineering-rewrite/harness/cases/17-brief-all-escape-hatch.md`.
+- Implemented minimal `--all` support for `brief`/`digest` in both implementations (Rust CLI + harness stub), and ensured `next_steps` is derived from the same filtered (or unfiltered) discovery set: `crates/but-engineering-rewrite/src/main.rs`, `crates/but-engineering-rewrite/harness/bin/but-engineering-rewrite`.
+
+### (b) What Was Hard
+- Keeping CLI behavior aligned across the Rust binary and the stub while adding a new flag (the harness may execute either).
+
+### (c) Next Step
+- Add `--min-signal <low|high>` (default `high`) so callers can choose behavior without a boolean that’s discovery-specific, and extend the same filtering semantics to `read --type discovery` (e.g. `read --min-signal high`).
+
+## 2026-02-14 (Case 05h)
+
+### (a) What Changed
+- Added harness Case 05h to prevent dependency-hint false positives caused by naive substring matching on tags (e.g. tag `capistrano` contains `api` but is not an API declaration): `crates/but-engineering-rewrite/harness/run.sh`, `crates/but-engineering-rewrite/harness/cases/05h-dependency-hint-tag-gate.md`.
+- Tightened “API-ish declaration” detection to require an `api` tag segment (split on non-alphanumeric) instead of `contains("api")`, in both implementations so the harness behaves consistently with/without Rust tooling: `crates/but-engineering-rewrite/src/main.rs`, `crates/but-engineering-rewrite/harness/bin/but-engineering-rewrite`.
+
+### (b) What Was Hard
+- The harness can execute either the Rust binary or the stub, so even a tiny heuristic fix has to land twice to avoid environment-dependent failures.
+
+### (c) Next Step
+- Define an explicit tag vocabulary (e.g. `component/api` exactly) and validate it on `post --type declaration` to keep hinting deterministic and reduce heuristic creep.

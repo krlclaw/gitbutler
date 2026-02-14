@@ -10,6 +10,8 @@ message=""
 post_type=""
 post_json=""
 read_type=""
+read_all="0"
+claims_path_prefix=""
 
 json_err() {
   # Always emit valid JSON on stdout.
@@ -54,7 +56,12 @@ while [[ $# -gt 0 ]]; do
       agent_id="$1"
       shift
       ;;
-    claim|release|check|post|read|brief|digest|eval)
+    claim|release|check|post|read|brief|digest|eval|status|plan|agents|done)
+      subcmd="$1"
+      shift
+      break
+      ;;
+    claims)
       subcmd="$1"
       shift
       break
@@ -67,6 +74,160 @@ while [[ $# -gt 0 ]]; do
 done
 
 [[ -n "$agent_id" && -n "$subcmd" ]] || { json_err "bad_args"; exit 1; }
+
+db_dir=".git/gitbutler"
+db_path="$db_dir/but-engineering-rewrite.db"
+mkdir -p "$db_dir" || { json_err; exit 1; }
+
+# Shared schema for all commands (the harness may run the stub instead of the Rust binary).
+sqlite3 "$db_path" <<'SQL' >/dev/null
+CREATE TABLE IF NOT EXISTS claims (
+  path TEXT NOT NULL,
+  agent_id TEXT NOT NULL,
+  expires_at_s INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_claims_path_expires ON claims(path, expires_at_s);
+CREATE TABLE IF NOT EXISTS agent_state (
+  agent_id TEXT PRIMARY KEY,
+  status TEXT,
+  plan TEXT,
+  updated_at_s INTEGER NOT NULL
+);
+CREATE TABLE IF NOT EXISTS messages (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  created_at_s INTEGER NOT NULL,
+  agent_id TEXT NOT NULL,
+  kind TEXT NOT NULL,
+  body_json TEXT NOT NULL
+);
+SQL
+
+# Touch agent row on any command (best-effort; keeps "active agents" realistic).
+python3 -c '
+import sqlite3, sys, time
+db_path, agent_id = sys.argv[1], sys.argv[2]
+now = int(time.time())
+conn = sqlite3.connect(db_path)
+cur = conn.cursor()
+cur.execute("""
+CREATE TABLE IF NOT EXISTS agent_state (
+  agent_id TEXT PRIMARY KEY,
+  status TEXT,
+  plan TEXT,
+  updated_at_s INTEGER NOT NULL
+)
+""")
+cur.execute(
+  "INSERT INTO agent_state(agent_id, status, plan, updated_at_s) VALUES (?, NULL, NULL, ?) "
+  "ON CONFLICT(agent_id) DO UPDATE SET updated_at_s = excluded.updated_at_s",
+  (agent_id, now),
+)
+conn.commit()
+conn.close()
+' "$db_path" "$agent_id" >/dev/null 2>&1 || true
+
+if [[ "$subcmd" == "status" || "$subcmd" == "plan" ]]; then
+  # Form:
+  # - status <text...>
+  # - status --clear
+  # Same for plan.
+  if [[ "${1:-}" == "--clear" ]]; then
+    [[ $# -eq 1 ]] || { json_err "bad_args"; exit 1; }
+    python3 -c '
+import sqlite3, sys, time
+db_path, agent_id, field = sys.argv[1], sys.argv[2], sys.argv[3]
+conn = sqlite3.connect(db_path)
+cur = conn.cursor()
+cur.execute(f"UPDATE agent_state SET {field} = NULL, updated_at_s = ? WHERE agent_id = ?", (int(time.time()), agent_id))
+conn.commit()
+conn.close()
+' "$db_path" "$agent_id" "$subcmd" || { json_err; exit 1; }
+    printf '{"ok":true}\n'
+    exit 0
+  fi
+
+  [[ $# -gt 0 ]] || { json_err "bad_args"; exit 1; }
+  value="$*"
+  python3 -c '
+import sqlite3, sys, time
+db_path, agent_id, field, value = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4]
+conn = sqlite3.connect(db_path)
+cur = conn.cursor()
+cur.execute(f"UPDATE agent_state SET {field} = ?, updated_at_s = ? WHERE agent_id = ?", (value, int(time.time()), agent_id))
+conn.commit()
+conn.close()
+' "$db_path" "$agent_id" "$subcmd" "$value" || { json_err; exit 1; }
+  printf '{"ok":true}\n'
+  exit 0
+fi
+
+if [[ "$subcmd" == "agents" ]]; then
+  [[ $# -eq 0 ]] || { json_err "bad_args"; exit 1; }
+  agents="$(
+    sqlite3 -noheader -separator $'\t' "$db_path" \
+      "SELECT agent_id, status, plan, updated_at_s FROM agent_state ORDER BY agent_id ASC;" \
+      2>/dev/null || true
+  )"
+  out="$(
+    ROWS="$agents" python3 -c '
+import json, os
+rows = os.environ.get("ROWS","")
+out=[]
+for line in rows.splitlines():
+    if "\t" not in line:
+        continue
+    parts = (line.split("\t") + ["","","",""])[:4]
+    agent_id, status, plan, upd = parts[0], parts[1], parts[2], parts[3]
+    if status == "":
+        status_v = None
+    else:
+        status_v = status
+    if plan == "":
+        plan_v = None
+    else:
+        plan_v = plan
+    try:
+        upd_i = int(upd)
+    except Exception:
+        upd_i = 0
+    out.append({"agent_id": agent_id, "status": status_v, "plan": plan_v, "updated_at_ms": upd_i * 1000})
+print(json.dumps({"ok": True, "agents": out}, separators=(",",":")))
+'
+  )"
+  printf '%s\n' "${out:-{\"ok\":true,\"agents\":[]}}"
+  exit 0
+fi
+
+if [[ "$subcmd" == "done" ]]; then
+  [[ $# -gt 0 ]] || { json_err "bad_args"; exit 1; }
+  summary="$*"
+
+  python3 -c '
+import json, sqlite3, sys, time
+db_path, agent_id, summary = sys.argv[1], sys.argv[2], sys.argv[3]
+now_s = int(time.time())
+conn = sqlite3.connect(db_path)
+cur = conn.cursor()
+
+cur.execute("SELECT COUNT(1) FROM claims WHERE agent_id = ?", (agent_id,))
+released = int(cur.fetchone()[0] or 0)
+
+cur.execute("DELETE FROM claims WHERE agent_id = ?", (agent_id,))
+cur.execute("UPDATE agent_state SET status = NULL, plan = NULL, updated_at_s = ? WHERE agent_id = ?", (now_s, agent_id))
+
+body_json = json.dumps({"text": f"DONE: {summary}"}, separators=(",",":"))
+cur.execute(
+  "INSERT INTO messages(created_at_s, agent_id, kind, body_json) VALUES (?, ?, ?, ?)",
+  (now_s, agent_id, "message", body_json),
+)
+
+conn.commit()
+conn.close()
+
+print(json.dumps({"ok": True, "released_claims": released, "cleared": ["status","plan"]}, separators=(",",":")))
+' "$db_path" "$agent_id" "$summary" || { json_err; exit 1; }
+  exit 0
+fi
 
 if [[ "$subcmd" == "post" ]]; then
   # Two forms:
@@ -82,20 +243,6 @@ if [[ "$subcmd" == "post" ]]; then
     [[ $# -gt 0 ]] || { json_err "bad_args"; exit 1; }
     post_json="$1"
 
-    db_dir=".git/gitbutler"
-    db_path="$db_dir/but-engineering-rewrite.db"
-    mkdir -p "$db_dir" || { json_err; exit 1; }
-
-    sqlite3 "$db_path" <<'SQL' >/dev/null
-CREATE TABLE IF NOT EXISTS messages (
-  id INTEGER PRIMARY KEY AUTOINCREMENT,
-  created_at_s INTEGER NOT NULL,
-  agent_id TEXT NOT NULL,
-  kind TEXT NOT NULL,
-  body_json TEXT NOT NULL
-);
-SQL
-
     now_s="$(date +%s)"
     sqlite3 "$db_path" \
       "INSERT INTO messages(created_at_s, agent_id, kind, body_json) VALUES ($now_s, $(sql_quote "$agent_id"), $(sql_quote "$post_type"), $(sql_quote "$post_json"));" \
@@ -104,25 +251,12 @@ SQL
     # Accept any remaining args as message; harness doesn't assert content.
     message="$*"
 
-    db_dir=".git/gitbutler"
-    db_path="$db_dir/but-engineering-rewrite.db"
-    mkdir -p "$db_dir" || { json_err; exit 1; }
-
     # Use python's sqlite bindings to avoid shell-quoting pitfalls.
     python3 -c '
 import json, sqlite3, sys, time
 db_path, agent_id, message = sys.argv[1], sys.argv[2], sys.argv[3]
 conn = sqlite3.connect(db_path)
 cur = conn.cursor()
-cur.execute("""
-CREATE TABLE IF NOT EXISTS messages (
-  id INTEGER PRIMARY KEY AUTOINCREMENT,
-  created_at_s INTEGER NOT NULL,
-  agent_id TEXT NOT NULL,
-  kind TEXT NOT NULL,
-  body_json TEXT NOT NULL
-)
-""")
 body_json = json.dumps({"text": message}, separators=(",",":"))
 cur.execute(
   "INSERT INTO messages(created_at_s, agent_id, kind, body_json) VALUES (?, ?, ?, ?)",
@@ -146,6 +280,10 @@ if [[ "$subcmd" == "read" || "$subcmd" == "brief" || "$subcmd" == "digest" ]]; t
         read_type="$1"
         shift
         ;;
+      --all)
+        read_all="1"
+        shift
+        ;;
       *)
         json_err "bad_args"
         exit 1
@@ -158,19 +296,10 @@ if [[ "$subcmd" == "read" || "$subcmd" == "brief" || "$subcmd" == "digest" ]]; t
     read_type="discovery"
   fi
 
-  db_dir=".git/gitbutler"
-  db_path="$db_dir/but-engineering-rewrite.db"
-  mkdir -p "$db_dir" || { json_err; exit 1; }
-
-  sqlite3 "$db_path" <<'SQL' >/dev/null
-CREATE TABLE IF NOT EXISTS messages (
-  id INTEGER PRIMARY KEY AUTOINCREMENT,
-  created_at_s INTEGER NOT NULL,
-  agent_id TEXT NOT NULL,
-  kind TEXT NOT NULL,
-  body_json TEXT NOT NULL
-);
-SQL
+  # `read` defaults to the channel transcript (messages).
+  if [[ -z "$read_type" && "$subcmd" == "read" ]]; then
+    read_type="message"
+  fi
 
   if [[ "$read_type" != "discovery" ]]; then
     # Minimal inspection surface for structured messages used by the harness.
@@ -210,62 +339,73 @@ print(json.dumps(out, separators=(",",":")))
   fi
 
   # Join rows into a JSON array of discovery objects (body_json assumed to be a JSON object).
-  discoveries="$(
+  rows="$(
     sqlite3 -noheader -separator $'\t' "$db_path" \
-      "SELECT body_json FROM messages WHERE kind = 'discovery' ORDER BY id ASC;" \
+      "SELECT agent_id, body_json FROM messages WHERE kind = 'discovery' ORDER BY id ASC;" \
       2>/dev/null || true
   )"
-  if [[ -z "$discoveries" ]]; then
-    printf '{"ok":true,"mode":"%s","kind":"discovery","discoveries":[],"next_steps":[]}\n' "$subcmd"
-    exit 0
-  fi
 
-  # High-signal gate: only propagate discoveries explicitly marked high.
-  # Keep it simple and intentionally string-based (harness posts compact JSON).
-  discoveries="$(printf "%s\n" "$discoveries" | grep -F '"signal":"high"' || true)"
-  if [[ -z "$discoveries" ]]; then
-    printf '{"ok":true,"mode":"%s","kind":"discovery","discoveries":[],"next_steps":[]}\n' "$subcmd"
-    exit 0
-  fi
+  payload="$(
+    SUBCMD="$subcmd" ROWS="$rows" ALL="$read_all" python3 -c '
+import json, os
+subcmd = os.environ.get("SUBCMD","read")
+rows = os.environ.get("ROWS","")
+all_flag = os.environ.get("ALL","0") == "1"
 
-  # Turn newline-delimited JSON objects into a JSON array.
-  disc_arr="$(printf "%s\n" "$discoveries" | awk 'BEGIN{first=1; printf "["} { if (!first) printf ","; first=0; printf "%s", $0 } END{ printf "]" }')"
+def is_high(v):
+    try:
+        s = (v.get("signal") or "").strip().lower()
+    except Exception:
+        return False
+    return s == "high"
 
-  # Minimal next_steps derived from the posted payload (best-effort JSON string extraction).
-  next_steps="[]"
-  while IFS= read -r line; do
-    [[ -n "$line" ]] || continue
-    # NOTE: Use a bracketed literal `[{]` to match `{` without regex escaping pitfalls across sed variants.
-    cmd="$(printf "%s" "$line" | sed -nE 's/.*"suggested_action"[[:space:]]*:[[:space:]]*[{][^}]*"cmd"[[:space:]]*:[[:space:]]*"([^"]+)".*/\1/p')"
-    if [[ -n "$cmd" ]]; then
-      esc_cmd="$(json_escape "$cmd")"
-      if [[ "$next_steps" == "[]" ]]; then
-        next_steps="[{\"kind\":\"run\",\"cmd\":\"$esc_cmd\"}]"
-      else
-        next_steps="${next_steps%]},"'{"kind":"run","cmd":"'"$esc_cmd"'"}]'
-      fi
-    fi
-  done <<<"$discoveries"
+discoveries = []
+next_steps = []
 
-  printf '{"ok":true,"mode":"%s","kind":"discovery","discoveries":%s,"next_steps":%s}\n' "$subcmd" "$disc_arr" "$next_steps"
+for line in rows.splitlines():
+    if "\t" not in line:
+        continue
+    agent_id, body_raw = line.split("\t", 1)
+    try:
+        body = json.loads(body_raw)
+    except Exception:
+        body = {"raw": body_raw}
+    if isinstance(body, dict):
+        body = dict(body)
+    else:
+        body = {"raw": body}
+
+    body["agent_id"] = agent_id
+
+    # Align with the Rust CLI:
+    # - read discovery: include all discoveries
+    # - brief/digest discovery: only propagate high-signal discoveries
+    if subcmd in ("brief", "digest") and (not all_flag) and not is_high(body):
+        continue
+
+    cmd = None
+    try:
+        cmd = (body.get("suggested_action") or {}).get("cmd")
+    except Exception:
+        cmd = None
+    if isinstance(cmd, str) and cmd.strip():
+        next_steps.append({"kind":"run","cmd":cmd})
+
+    if subcmd == "digest":
+        discoveries.append({"title": body.get("title"), "agent_id": agent_id})
+    else:
+        discoveries.append(body)
+
+print(json.dumps({"ok": True, "mode": subcmd, "kind": "discovery", "discoveries": discoveries, "next_steps": next_steps}, separators=(",",":")))
+'
+  )"
+
+  printf '%s\n' "${payload:-{\"ok\":true,\"mode\":\"$subcmd\",\"kind\":\"discovery\",\"discoveries\":[],\"next_steps\":[]}}"
   exit 0
 fi
 
 if [[ "$subcmd" == "eval" ]]; then
   [[ $# -eq 1 && "$1" == "user-prompt-submit" ]] || { json_err "bad_args"; exit 1; }
-
-  db_dir=".git/gitbutler"
-  db_path="$db_dir/but-engineering-rewrite.db"
-  mkdir -p "$db_dir" || { json_err; exit 1; }
-
-  sqlite3 "$db_path" <<'SQL' >/dev/null
-CREATE TABLE IF NOT EXISTS claims (
-  path TEXT NOT NULL,
-  agent_id TEXT NOT NULL,
-  expires_at_s INTEGER NOT NULL
-);
-CREATE INDEX IF NOT EXISTS idx_claims_path_expires ON claims(path, expires_at_s);
-SQL
 
   now_s="$(date +%s)"
   active_claims="$(
@@ -277,6 +417,57 @@ SQL
 
   printf "Announce what you'll do (files), read the channel, then proceed.\n"
   printf "claims: %s\n" "$active_claims"
+  exit 0
+fi
+
+if [[ "$subcmd" == "claims" ]]; then
+  if [[ $# -eq 0 ]]; then
+    claims_path_prefix=""
+  elif [[ $# -eq 2 && "${1:-}" == "--path-prefix" ]]; then
+    claims_path_prefix="${2:-}"
+    # Minimal normalization: trim leading "./" and trailing "/".
+    while [[ "$claims_path_prefix" == ./* ]]; do
+      claims_path_prefix="${claims_path_prefix#./}"
+    done
+    while [[ "$claims_path_prefix" == */ && "$claims_path_prefix" != "/" ]]; do
+      claims_path_prefix="${claims_path_prefix%/}"
+    done
+  else
+    json_err "bad_args"
+    exit 1
+  fi
+
+  now_s="$(date +%s)"
+  if [[ -n "$claims_path_prefix" ]]; then
+    q="$(sql_quote "$claims_path_prefix")"
+    where="expires_at_s > $now_s AND (path = $q OR $q LIKE path || '/%' OR path LIKE $q || '/%')"
+  else
+    where="expires_at_s > $now_s"
+  fi
+  rows="$(
+    sqlite3 -noheader -separator $'\t' "$db_path" \
+      "SELECT path, agent_id, expires_at_s FROM claims WHERE $where ORDER BY expires_at_s ASC, path ASC;" \
+      2>/dev/null || true
+  )"
+  claims="$(
+    ROWS="$rows" python3 -c '
+import json, os
+rows = os.environ.get("ROWS","")
+out=[]
+for line in rows.splitlines():
+    if "\t" not in line:
+        continue
+    path, agent_id, exp = (line.split("\t", 2) + ["",""])[:3]
+    try:
+        exp_i = int(exp)
+    except Exception:
+        exp_i = 0
+    out.append({"path": path, "agent_id": agent_id, "expires_at_ms": exp_i * 1000})
+print(json.dumps(out, separators=(",",":")))
+'
+  )"
+
+  printf '{"ok":true,"claims":%s}\n' "${claims:-[]}"
   exit 0
 fi
 
@@ -324,22 +515,6 @@ db_dir=".git/gitbutler"
 db_path="$db_dir/but-engineering-rewrite.db"
 mkdir -p "$db_dir" || { json_err; exit 1; }
 
-sqlite3 "$db_path" <<'SQL' >/dev/null
-CREATE TABLE IF NOT EXISTS claims (
-  path TEXT NOT NULL,
-  agent_id TEXT NOT NULL,
-  expires_at_s INTEGER NOT NULL
-);
-CREATE INDEX IF NOT EXISTS idx_claims_path_expires ON claims(path, expires_at_s);
-CREATE TABLE IF NOT EXISTS messages (
-  id INTEGER PRIMARY KEY AUTOINCREMENT,
-  created_at_s INTEGER NOT NULL,
-  agent_id TEXT NOT NULL,
-  kind TEXT NOT NULL,
-  body_json TEXT NOT NULL
-);
-SQL
-
 now_s="$(date +%s)"
 
 if [[ "$subcmd" == "release" ]]; then
@@ -353,6 +528,10 @@ fi
 if [[ "$subcmd" == "claim" ]]; then
   ttl_s="$(parse_ttl_secs "$ttl")" || { json_err "bad_ttl"; exit 1; }
   expires_at_s=$((now_s + ttl_s))
+  # Renewal semantics: avoid duplicate rows for the same (agent_id, path).
+  sqlite3 "$db_path" \
+    "DELETE FROM claims WHERE path = $(sql_quote "$path") AND agent_id = $(sql_quote "$agent_id");" \
+    >/dev/null || { json_err; exit 1; }
   sqlite3 "$db_path" \
     "INSERT INTO claims(path, agent_id, expires_at_s) VALUES ($(sql_quote "$path"), $(sql_quote "$agent_id"), $expires_at_s);" \
     >/dev/null || { json_err; exit 1; }
@@ -361,21 +540,23 @@ if [[ "$subcmd" == "claim" ]]; then
 fi
 
 # check
-# Include the blocking agent so check can emit machine-actionable next steps.
-blocker="$(
+# Include blocking agents so check can emit machine-actionable next steps (including multi-blocker scenarios).
+blockers_raw="$(
   sqlite3 -noheader "$db_path" \
     "SELECT agent_id FROM claims \
      WHERE agent_id <> $(sql_quote "$agent_id") \
        AND expires_at_s > $now_s \
        AND (path = $(sql_quote "$path") OR $(sql_quote "$path") LIKE path || '/%' OR path LIKE $(sql_quote "$path") || '/%') \
-     LIMIT 1;" \
+     ORDER BY expires_at_s DESC \
+     LIMIT 5;" \
     2>/dev/null || true
 )"
+blockers="$(printf "%s\n" "$blockers_raw" | awk 'NF && !seen[$0]++')"
 decision=""
 reason_code=""
 blocking_agents="[]"
 action_plan="[]"
-if [[ -n "$blocker" ]]; then
+if [[ -n "$blockers" ]]; then
   if [[ "$strict" == "1" ]]; then
     decision="deny"
   else
@@ -383,16 +564,37 @@ if [[ -n "$blocker" ]]; then
   fi
   reason_code="claimed_by_other"
 
-  esc_blocker="$(json_escape "$blocker")"
-  blocking_agents="[\"$esc_blocker\"]"
-
   read_cmd="but-engineering-rewrite --agent-id $agent_id read"
-  post_cmd="but-engineering-rewrite --agent-id $agent_id post \\\"@$blocker: I'm about to edit $path. Are you working on it?\\\""
-  retry_cmd="but-engineering-rewrite --agent-id $agent_id check --path $path"
   esc_read="$(json_escape "$read_cmd")"
-  esc_post="$(json_escape "$post_cmd")"
+
+  # Build JSON arrays (keep stdout valid JSON; avoid jq).
+  ba_items=()
+  ap_items=()
+  ba_items+=("\"$esc_read\"") # placeholder; fixed below
+  ap_items+=("\"$esc_read\"")
+
+  # blocking_agents and per-blocker "ping" steps.
+  while IFS= read -r blocker; do
+    [[ -n "$blocker" ]] || continue
+    esc_blocker="$(json_escape "$blocker")"
+    ba_items+=("\"$esc_blocker\"")
+    post_cmd="but-engineering-rewrite --agent-id $agent_id post \\\"@$blocker: I'm about to edit $path. Are you working on it?\\\""
+    esc_post="$(json_escape "$post_cmd")"
+    ap_items+=("\"$esc_post\"")
+  done <<<"$blockers"
+
+  # Remove the placeholder at ba_items[0] (bash doesn't have an easy pop-front portable across shells).
+  ba_items=("${ba_items[@]:1}")
+
+  retry_cmd="but-engineering-rewrite --agent-id $agent_id check --path $path"
+  if [[ "$strict" == "1" ]]; then
+    retry_cmd="$retry_cmd --strict"
+  fi
   esc_retry="$(json_escape "$retry_cmd")"
-  action_plan="[\"$esc_read\",\"$esc_post\",\"$esc_retry\"]"
+  ap_items+=("\"$esc_retry\"")
+
+  blocking_agents="[$(IFS=,; printf "%s" "${ba_items[*]}")]"
+  action_plan="[$(IFS=,; printf "%s" "${ap_items[*]}")]"
 else
   decision="allow"
   reason_code="no_conflict"
@@ -425,6 +627,14 @@ intent_raw = os.environ.get("INTENT_JSON","")
 decl_rows = os.environ.get("DECL_ROWS","")
 agent_id = os.environ.get("AGENT_ID","")
 hints=[]
+import re
+
+def has_api_segment(tag: str) -> bool:
+    # Avoid substring false positives like "capistrano" (contains "api").
+    # Match "api" as a segment (split on non-alnum), so "component/api" works.
+    parts = [p for p in re.split(r"[^0-9A-Za-z]+", (tag or "").lower()) if p]
+    return "api" in parts
+
 try:
     intent = json.loads(intent_raw) if intent_raw else {}
 except Exception:
@@ -432,6 +642,7 @@ except Exception:
 intent_scope = intent.get("scope")
 intent_surface = intent.get("surface") or []
 intent_surface = {t for t in intent_surface if isinstance(t,str)}
+seen = set()
 for line in decl_rows.splitlines():
     if "\t" not in line:
         continue
@@ -442,7 +653,7 @@ for line in decl_rows.splitlines():
         continue
     tags = decl.get("tags") or []
     tags = [t for t in tags if isinstance(t,str)]
-    if not any("api" in t.lower() for t in tags):
+    if not any(has_api_segment(t) for t in tags):
         continue
     scope = decl.get("scope") or "unknown"
     if intent_scope and scope != intent_scope:
@@ -452,6 +663,10 @@ for line in decl_rows.splitlines():
     overlap = [t for t in surface if t in intent_surface]
     if not overlap:
         continue
+    key = (provider_agent_id, scope)
+    if key in seen:
+        continue
+    seen.add(key)
     why = "Intent.surface intersects another agent declaration.surface on token(s): " + ", ".join(overlap) + " (declaration tagged api). Coordinate before consuming/changing it."
     tok = overlap[0]
     suggested_cmd = (
