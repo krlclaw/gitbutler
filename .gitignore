@@ -81,3 +81,6 @@ packages/ui/tests/.cache
 packages/ui/src/styles/tokens.css
 
 debug-graph-??.svg
+
+# but-engineering-rewrite harness outputs (JSONL traces, etc.)
+crates/but-engineering-rewrite/harness/out/

@@ -4,9 +4,154 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)"
 BIN="${BIN:-$ROOT/target/debug/but-engineering-rewrite}"
 STUB_BIN="$ROOT/crates/but-engineering-rewrite/harness/bin/but-engineering-rewrite"
+HARNESS_DIR="$ROOT/crates/but-engineering-rewrite/harness"
+
+# Per-run outputs.
+OUT_ROOT="$HARNESS_DIR/out"
+OUT_DIR=""
+TRACE_PATH=""
+TRACE_SEQ=0
+CURRENT_CASE=""
+CURRENT_TRIAL=0
+
+# Replay mode: compare this run's invocations against a prior trace.
+REPLAY_DIR="${HARNESS_REPLAY_DIR:-}"
+REPLAY=0
+REPLAY_IDX=0
+REPLAY_FAILED=0
+declare -a REPLAY_LINES=()
 
 bold() { printf "\033[1m%s\033[0m\n" "$*"; }
 fail() { printf "FAIL: %s\n" "$*" >&2; return 1; }
+
+now_ms() {
+  python3 -c 'import time; print(int(time.time()*1000))'
+}
+
+mk_out_dir() {
+  mkdir -p "$OUT_ROOT"
+  local ts
+  ts="$(python3 -c 'import datetime; print(datetime.datetime.utcnow().strftime("%Y%m%dT%H%M%SZ"))')"
+  OUT_DIR="$OUT_ROOT/$ts.$$"
+  mkdir -p "$OUT_DIR"
+  TRACE_PATH="$OUT_DIR/trace.jsonl"
+  : >"$TRACE_PATH"
+}
+
+json_escape() {
+  local s="$1"
+  s="${s//\\/\\\\}"
+  s="${s//\"/\\\"}"
+  s="${s//$'\n'/\\n}"
+  s="${s//$'\r'/\\r}"
+  s="${s//$'\t'/\\t}"
+  printf "%s" "$s"
+}
+
+json_array() {
+  local out="[" sep=""
+  local s
+  for s in "$@"; do
+    out+="$sep\"$(json_escape "$s")\""
+    sep=","
+  done
+  out+="]"
+  printf "%s" "$out"
+}
+
+trace_emit() {
+  local repo="$1"
+  local agent_id="$2"
+  local ec="$3"
+  local cmd="$4"
+  local args_json="$5"
+  local stdout="$6"
+  local stderr="$7"
+  local ts_ms
+  ts_ms="$(now_ms)"
+  TRACE_SEQ=$((TRACE_SEQ + 1))
+
+  printf '{' >>"$TRACE_PATH"
+  printf '"ts_ms":%s' "$ts_ms" >>"$TRACE_PATH"
+  printf ',"invocation_id":%s' "$TRACE_SEQ" >>"$TRACE_PATH"
+  printf ',"trial":%s' "${CURRENT_TRIAL:-0}" >>"$TRACE_PATH"
+  printf ',"case":"%s"' "$(json_escape "${CURRENT_CASE:-}")" >>"$TRACE_PATH"
+  printf ',"agent_id":"%s"' "$(json_escape "$agent_id")" >>"$TRACE_PATH"
+  printf ',"cwd":"%s"' "$(json_escape "$repo")" >>"$TRACE_PATH"
+  printf ',"repo":"%s"' "$(json_escape "$repo")" >>"$TRACE_PATH"
+  printf ',"cmd":"%s"' "$(json_escape "$cmd")" >>"$TRACE_PATH"
+  printf ',"args":%s' "$args_json" >>"$TRACE_PATH"
+  printf ',"exit_code":%s' "$ec" >>"$TRACE_PATH"
+  printf ',"stdout":"%s"' "$(json_escape "$stdout")" >>"$TRACE_PATH"
+  printf ',"stderr":"%s"' "$(json_escape "$stderr")" >>"$TRACE_PATH"
+  printf '}\n' >>"$TRACE_PATH"
+}
+
+replay_init() {
+  [[ -n "$REPLAY_DIR" ]] || return 0
+  if [[ ! -d "$REPLAY_DIR" ]]; then
+    fail "HARNESS_REPLAY_DIR is not a directory: $REPLAY_DIR"
+    return 1
+  fi
+  local replay_trace="$REPLAY_DIR/trace.jsonl"
+  if [[ ! -f "$replay_trace" ]]; then
+    fail "HARNESS_REPLAY_DIR missing trace.jsonl: $replay_trace"
+    return 1
+  fi
+  mapfile -t REPLAY_LINES <"$replay_trace"
+  REPLAY=1
+}
+
+replay_compare() {
+  local expected_line="$1"
+  local actual_ec="$2"
+  local actual_stdout="$3"
+
+  python3 - "$actual_ec" <<'PY' <<<"$expected_line"$'\n'"$actual_stdout"
+import json, sys
+
+actual_ec = int(sys.argv[1])
+blob = sys.stdin.read()
+try:
+    expected_line, actual_stdout = blob.split("\n", 1)
+except ValueError:
+    print("replay: internal read error", file=sys.stderr)
+    sys.exit(2)
+
+try:
+    expected = json.loads(expected_line)
+except Exception as e:
+    print(f"replay: expected trace line is not JSON: {e}", file=sys.stderr)
+    sys.exit(2)
+
+exp_ec = expected.get("exit_code", None)
+if exp_ec is None:
+    print("replay: expected trace missing exit_code", file=sys.stderr)
+    sys.exit(2)
+if int(exp_ec) != actual_ec:
+    print(f"replay: exit_code mismatch: expected {exp_ec}, got {actual_ec}", file=sys.stderr)
+    sys.exit(1)
+
+exp_stdout = expected.get("stdout", "")
+try:
+    exp_stdout_json = json.loads(exp_stdout)
+except Exception:
+    exp_stdout_json = None
+
+if isinstance(exp_stdout_json, dict):
+    try:
+        act_stdout_json = json.loads(actual_stdout)
+    except Exception as e:
+        print(f"replay: stdout expected JSON but got non-JSON: {e}", file=sys.stderr)
+        sys.exit(1)
+    for k in exp_stdout_json.keys():
+        if k not in act_stdout_json:
+            print(f"replay: stdout missing required top-level key: {k}", file=sys.stderr)
+            sys.exit(1)
+
+sys.exit(0)
+PY
+}
 
 ensure_bin() {
   local default_bin="$ROOT/target/debug/but-engineering-rewrite"
@@ -64,7 +209,47 @@ run_cli() {
   local repo="$1"
   local agent="$2"
   shift 2
-  (cd "$repo" && "$BIN" --agent-id "$agent" "$@") 2>&1 || true
+
+  local cmd="$BIN"
+  local -a args=(--agent-id "$agent" "$@")
+  local args_json; args_json="$(json_array "${args[@]}")"
+
+  local stdout_file stderr_file
+  stdout_file="$(mktemp "${TMPDIR:-/tmp}/but-erw-harness.stdout.XXXXXX")"
+  stderr_file="$(mktemp "${TMPDIR:-/tmp}/but-erw-harness.stderr.XXXXXX")"
+
+  local ec=0 stdout="" stderr=""
+  set +e
+  (cd "$repo" && "$cmd" "${args[@]}") >"$stdout_file" 2>"$stderr_file"
+  ec=$?
+  set -e
+
+  stdout="$(cat "$stdout_file" 2>/dev/null || true)"
+  stderr="$(cat "$stderr_file" 2>/dev/null || true)"
+  rm -f "$stdout_file" "$stderr_file" || true
+
+  trace_emit "$repo" "$agent" "$ec" "$cmd" "$args_json" "$stdout" "$stderr"
+
+  if [[ "$REPLAY" -eq 1 ]]; then
+    local expected="${REPLAY_LINES[$REPLAY_IDX]:-}"
+    if [[ -z "$expected" ]]; then
+      printf "FAIL: replay: missing expected trace line for invocation %s\n" "$TRACE_SEQ" >&2
+      REPLAY_FAILED=1
+    else
+      if ! replay_compare "$expected" "$ec" "$stdout"; then
+        printf "FAIL: replay mismatch at invocation %s (case=%s trial=%s agent=%s)\n" "$TRACE_SEQ" "${CURRENT_CASE:-}" "${CURRENT_TRIAL:-0}" "$agent" >&2
+        REPLAY_FAILED=1
+      fi
+    fi
+    REPLAY_IDX=$((REPLAY_IDX + 1))
+  fi
+
+  # Preserve prior harness behavior: return a single string (stdout+stderr) and never fail the harness directly.
+  if [[ -n "$stderr" ]]; then
+    printf "%s\n%s" "$stdout" "$stderr"
+  else
+    printf "%s" "$stdout"
+  fi
 }
 
 expect_contains() {
@@ -712,6 +897,32 @@ case_13_agents_status_plan() {
   expect_contains "$out_agents" "\"status\":\"ERW_CASE13_STATUS_B\""
 }
 
+case_19_clear_status_plan() {
+  bold "Case 19: Clear Status/Plan (Avoid Stale Coordination)"
+  local repo; repo="$(mk_repo)"
+  trap '[[ -n "${repo:-}" ]] && rm -rf "$repo"' RETURN
+
+  local out_status out_plan out_clear_status out_agents out_clear_plan
+
+  out_status="$(run_cli "$repo" "A" status ERW_CASE19_STATUS_A)"
+  out_plan="$(run_cli "$repo" "A" plan ERW_CASE19_PLAN_A)"
+  out_clear_status="$(run_cli "$repo" "A" status --clear)"
+  out_agents="$(run_cli "$repo" "B" agents)"
+
+  # Clearing a field should remove only that stale signal; other fields remain visible.
+  expect_contains "$out_status" "\"ok\":true"
+  expect_contains "$out_plan" "\"ok\":true"
+  expect_contains "$out_clear_status" "\"ok\":true"
+  expect_contains "$out_agents" "\"agent_id\":\"A\""
+  expect_contains "$out_agents" "\"plan\":\"ERW_CASE19_PLAN_A\""
+  expect_not_contains "$out_agents" "ERW_CASE19_STATUS_A"
+
+  out_clear_plan="$(run_cli "$repo" "A" plan --clear)"
+  out_agents="$(run_cli "$repo" "B" agents)"
+  expect_contains "$out_clear_plan" "\"ok\":true"
+  expect_not_contains "$out_agents" "ERW_CASE19_PLAN_A"
+}
+
 case_14_claims_path_prefix_filter() {
   bold "Case 14: Claims Filter (path-prefix overlap)"
   local repo; repo="$(mk_repo)"
@@ -738,37 +949,82 @@ case_14_claims_path_prefix_filter() {
 
 main() {
   ensure_bin
+  mk_out_dir
+  replay_init
 
-  local failed=0
-  case_01_two_agent_conflict || failed=1
-  case_01b_two_agent_conflict_strict || failed=1
-  case_02_lease_expiry || failed=1
-  case_18_expired_claims_filtered_from_listing || failed=1
-  case_03_habit_formation || failed=1
-  case_04_high_signal_discovery || failed=1
-  case_17_brief_all_escape_hatch || failed=1
-  case_05_dependency_hint || failed=1
-  case_05d_dependency_hint_scope_filter || failed=1
-  case_05e_dependency_hint_dedupe || failed=1
-  case_05h_dependency_hint_api_tag_gate || failed=1
-  case_05i_three_agent_triangle_dependency_chain || failed=1
-  case_05b_check_action_plan || failed=1
-  case_05c_dedup_blocking_agents || failed=1
-  case_15_multi_blocker_action_plan || failed=1
-  case_05f_claim_renewal_dedupe || failed=1
-  case_05g_done_cleanup || failed=1
-  case_06_read_surfaces || failed=1
-  case_07_release_claim || failed=1
-  case_08_path_prefix_overlap || failed=1
-  case_09_channel_messages || failed=1
-  case_16_read_default_transcript || failed=1
-  case_10_claims_list || failed=1
-  case_11_discovery_provenance || failed=1
-  case_12_discovery_provenance_digest || failed=1
-  case_13_agents_status_plan || failed=1
-  case_14_claims_path_prefix_filter || failed=1
+  bold "Harness out dir: $OUT_DIR"
+  bold "Harness trace: $TRACE_PATH"
+  if [[ "$REPLAY" -eq 1 ]]; then
+    bold "Harness replay: $REPLAY_DIR"
+  fi
 
-  if [[ "$failed" -ne 0 ]]; then
+  local trials="${HARNESS_TRIALS:-1}"
+  if ! [[ "$trials" =~ ^[0-9]+$ ]] || [[ "$trials" -lt 1 ]]; then
+    fail "HARNESS_TRIALS must be an integer >= 1 (got: ${HARNESS_TRIALS:-})"
+    exit 1
+  fi
+
+  local -a cases=(
+    case_01_two_agent_conflict
+    case_01b_two_agent_conflict_strict
+    case_02_lease_expiry
+    case_18_expired_claims_filtered_from_listing
+    case_03_habit_formation
+    case_04_high_signal_discovery
+    case_17_brief_all_escape_hatch
+    case_05_dependency_hint
+    case_05d_dependency_hint_scope_filter
+    case_05e_dependency_hint_dedupe
+    case_05h_dependency_hint_api_tag_gate
+    case_05i_three_agent_triangle_dependency_chain
+    case_05b_check_action_plan
+    case_05c_dedup_blocking_agents
+    case_15_multi_blocker_action_plan
+    case_05f_claim_renewal_dedupe
+    case_05g_done_cleanup
+    case_06_read_surfaces
+    case_07_release_claim
+    case_08_path_prefix_overlap
+    case_09_channel_messages
+    case_16_read_default_transcript
+    case_10_claims_list
+    case_11_discovery_provenance
+    case_12_discovery_provenance_digest
+    case_13_agents_status_plan
+    case_19_clear_status_plan
+    case_14_claims_path_prefix_filter
+  )
+
+  local overall_failed=0 t
+  for ((t = 1; t <= trials; t++)); do
+    CURRENT_TRIAL="$t"
+    local trial_failed=0
+    bold "Trial $t/$trials"
+    local c
+    for c in "${cases[@]}"; do
+      CURRENT_CASE="$c"
+      "$c" || trial_failed=1
+    done
+
+    if [[ "$trial_failed" -ne 0 ]]; then
+      printf "Trial %s/%s: FAIL\n" "$t" "$trials" >&2
+      overall_failed=1
+    else
+      printf "Trial %s/%s: PASS\n" "$t" "$trials"
+    fi
+  done
+
+  if [[ "$REPLAY" -eq 1 ]]; then
+    if [[ "$REPLAY_IDX" -ne "${#REPLAY_LINES[@]}" ]]; then
+      printf "FAIL: replay: expected %s invocations but consumed %s\n" "${#REPLAY_LINES[@]}" "$REPLAY_IDX" >&2
+      REPLAY_FAILED=1
+    fi
+    if [[ "$REPLAY_FAILED" -ne 0 ]]; then
+      overall_failed=1
+    fi
+  fi
+
+  if [[ "$overall_failed" -ne 0 ]]; then
     printf "\nOne or more cases failed. This is expected until the CLI is implemented.\n" >&2
     exit 1
   fi
