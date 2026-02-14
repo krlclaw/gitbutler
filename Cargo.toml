@@ -103,6 +103,8 @@ members = [
     "crates/but",
     # Agent coordination for coding agents working in the same repository.
     "crates/but-engineering",
+    # Agent coordination rewrite playground (see `crates/but-engineering-rewrite/docs`).
+    "crates/but-engineering-rewrite",
     # Should be functionally equivalent to `gitbutler-tauri`
     "crates/but-server",
     # Should be reviewed to mostly use `but-api`, to be renamed to `but-tauri` or something.

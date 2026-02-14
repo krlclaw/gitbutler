@@ -1,0 +1,166 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+agent_id=""
+subcmd=""
+path=""
+ttl=""
+strict="0"
+message=""
+
+json_err() {
+  # Always emit valid JSON on stdout.
+  printf '{"ok":false,"error":"%s"}\n' "${1:-internal_error}"
+}
+
+parse_ttl_secs() {
+  local s="$1"
+  if [[ "$s" =~ ^([0-9]+)([a-zA-Z]*)$ ]]; then
+    local n="${BASH_REMATCH[1]}"
+    local unit="${BASH_REMATCH[2]}"
+    case "$unit" in
+      ""|s) echo "$n" ;;
+      m) echo $((n * 60)) ;;
+      h) echo $((n * 3600)) ;;
+      d) echo $((n * 86400)) ;;
+      *) return 1 ;;
+    esac
+  else
+    return 1
+  fi
+}
+
+sql_quote() {
+  local s="$1"
+  s="${s//\'/\'\'}"
+  printf "'%s'" "$s"
+}
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --agent-id)
+      shift
+      [[ $# -gt 0 ]] || { json_err "bad_args"; exit 1; }
+      agent_id="$1"
+      shift
+      ;;
+    claim|check|post|eval)
+      subcmd="$1"
+      shift
+      break
+      ;;
+    *)
+      json_err "bad_args"
+      exit 1
+      ;;
+  esac
+done
+
+[[ -n "$agent_id" && -n "$subcmd" ]] || { json_err "bad_args"; exit 1; }
+
+if [[ "$subcmd" == "post" ]]; then
+  # Accept any remaining args as message; harness doesn't assert content.
+  message="$*"
+  printf '{"ok":true}\n'
+  exit 0
+fi
+
+if [[ "$subcmd" == "eval" ]]; then
+  [[ $# -eq 1 && "$1" == "user-prompt-submit" ]] || { json_err "bad_args"; exit 1; }
+
+  db_dir=".git/gitbutler"
+  db_path="$db_dir/but-engineering-rewrite.db"
+  mkdir -p "$db_dir" || { json_err; exit 1; }
+
+  sqlite3 "$db_path" <<'SQL' >/dev/null
+CREATE TABLE IF NOT EXISTS claims (
+  path TEXT NOT NULL,
+  agent_id TEXT NOT NULL,
+  expires_at_s INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_claims_path_expires ON claims(path, expires_at_s);
+SQL
+
+  now_s="$(date +%s)"
+  active_claims="$(
+    sqlite3 -noheader "$db_path" \
+      "SELECT COUNT(1) FROM claims WHERE expires_at_s > $now_s;" \
+      2>/dev/null || true
+  )"
+  active_claims="${active_claims:-0}"
+
+  printf "Announce what you'll do (files), read the channel, then proceed.\n"
+  printf "claims: %s\n" "$active_claims"
+  exit 0
+fi
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --path)
+      shift
+      [[ $# -gt 0 ]] || { json_err "bad_args"; exit 1; }
+      path="$1"
+      shift
+      ;;
+    --ttl)
+      shift
+      [[ $# -gt 0 ]] || { json_err "bad_args"; exit 1; }
+      ttl="$1"
+      shift
+      ;;
+    --strict)
+      strict="1"
+      shift
+      ;;
+    *)
+      json_err "bad_args"
+      exit 1
+      ;;
+  esac
+done
+
+[[ -n "$path" ]] || { json_err "bad_args"; exit 1; }
+if [[ "$subcmd" == "claim" ]]; then
+  [[ -n "$ttl" ]] || { json_err "bad_args"; exit 1; }
+fi
+
+db_dir=".git/gitbutler"
+db_path="$db_dir/but-engineering-rewrite.db"
+mkdir -p "$db_dir" || { json_err; exit 1; }
+
+sqlite3 "$db_path" <<'SQL' >/dev/null
+CREATE TABLE IF NOT EXISTS claims (
+  path TEXT NOT NULL,
+  agent_id TEXT NOT NULL,
+  expires_at_s INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_claims_path_expires ON claims(path, expires_at_s);
+SQL
+
+now_s="$(date +%s)"
+
+if [[ "$subcmd" == "claim" ]]; then
+  ttl_s="$(parse_ttl_secs "$ttl")" || { json_err "bad_ttl"; exit 1; }
+  expires_at_s=$((now_s + ttl_s))
+  sqlite3 "$db_path" \
+    "INSERT INTO claims(path, agent_id, expires_at_s) VALUES ($(sql_quote "$path"), $(sql_quote "$agent_id"), $expires_at_s);" \
+    >/dev/null || { json_err; exit 1; }
+  printf '{"ok":true}\n'
+  exit 0
+fi
+
+# check
+res="$(
+  sqlite3 -noheader "$db_path" \
+    "SELECT 1 FROM claims WHERE path = $(sql_quote "$path") AND agent_id <> $(sql_quote "$agent_id") AND expires_at_s > $now_s LIMIT 1;" \
+    2>/dev/null || true
+)"
+if [[ "$res" == "1" ]]; then
+  if [[ "$strict" == "1" ]]; then
+    printf '{"decision":"deny","reason_code":"claimed_by_other"}\n'
+  else
+    printf '{"decision":"warn","reason_code":"claimed_by_other"}\n'
+  fi
+else
+  printf '{"decision":"allow","reason_code":"no_conflict"}\n'
+fi

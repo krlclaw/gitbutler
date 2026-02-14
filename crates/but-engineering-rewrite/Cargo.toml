@@ -1,0 +1,14 @@
+[package]
+name = "but-engineering-rewrite"
+version = "0.0.0"
+edition.workspace = true
+authors.workspace = true
+publish = false
+rust-version.workspace = true
+
+[[bin]]
+name = "but-engineering-rewrite"
+path = "src/main.rs"
+
+[dependencies]
+rusqlite.workspace = true
