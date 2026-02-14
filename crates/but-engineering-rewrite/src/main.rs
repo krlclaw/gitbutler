@@ -148,23 +148,38 @@ fn run() -> Result<(), ()> {
             let now_ms = now_unix_ms()?;
             let mut stmt = conn
                 .prepare(
-                    "SELECT agent_id FROM claims \
+                    "SELECT agent_id, path FROM claims \
                      WHERE agent_id <> ?2 AND expires_at_ms > ?3 \
                        AND (path = ?1 OR ?1 LIKE path || '/%' OR path LIKE ?1 || '/%') \
                      ORDER BY expires_at_ms DESC \
-                     LIMIT 5",
+                     LIMIT 20",
                 )
                 .map_err(|_| ())?;
-            let blocking_agents_raw = stmt
-                .query_map(params![path, agent_id, now_ms], |row| row.get::<_, String>(0))
+            let blocking_claims_raw = stmt
+                .query_map(params![path, agent_id, now_ms], |row| {
+                    Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+                })
                 .map_err(|_| ())?
                 .filter_map(|r| r.ok())
-                .collect::<Vec<_>>();
+                .collect::<Vec<(String, String)>>();
             let mut seen = HashSet::<String>::new();
-            let blocking_agents = blocking_agents_raw
-                .into_iter()
-                .filter(|a| seen.insert(a.clone()))
-                .collect::<Vec<_>>();
+            let mut blocking_agents = Vec::<String>::new();
+            let mut blocking_claim_path_by_agent = std::collections::BTreeMap::<String, String>::new();
+            for (blocker, claim_path) in blocking_claims_raw {
+                if seen.insert(blocker.clone()) {
+                    blocking_agents.push(blocker.clone());
+                }
+                // Keep a stable representative claim path per blocker for actionability.
+                blocking_claim_path_by_agent
+                    .entry(blocker)
+                    .or_insert(claim_path);
+            }
+            // Preserve the old low-noise behavior: cap the list.
+            if blocking_agents.len() > 5 {
+                blocking_agents.truncate(5);
+            }
+            let kept_blockers: HashSet<String> = blocking_agents.iter().cloned().collect();
+            blocking_claim_path_by_agent.retain(|k, _| kept_blockers.contains(k));
 
             let (decision, reason_code) = if !blocking_agents.is_empty() {
                 if strict {
@@ -195,12 +210,74 @@ fn run() -> Result<(), ()> {
                 vec![format!("but-engineering-rewrite --agent-id {agent_id} check --path {path}")]
             };
 
+            // Multi-step coordination is usually a multi-agent process. Provide a low-noise,
+            // per-agent action plan to help wrappers drive convergence without guesswork.
+            let mut action_plan_by_agent = serde_json::Map::new();
+            let mut stmt_agents = conn
+                .prepare("SELECT agent_id FROM agent_state ORDER BY agent_id ASC")
+                .map_err(|_| ())?;
+            let agents = stmt_agents
+                .query_map([], |row| row.get::<_, String>(0))
+                .map_err(|_| ())?
+                .filter_map(|r| r.ok())
+                .collect::<Vec<_>>();
+
+            for a in agents {
+                if a == agent_id {
+                    action_plan_by_agent.insert(
+                        a,
+                        Value::from(action_plan.iter().cloned().collect::<Vec<_>>()),
+                    );
+                    continue;
+                }
+
+                if let Some(claim_path) = blocking_claim_path_by_agent.get(&a) {
+                    action_plan_by_agent.insert(
+                        a.clone(),
+                        Value::from(vec![
+                            format!("but-engineering-rewrite --agent-id {a} read"),
+                            format!(
+                                "but-engineering-rewrite --agent-id {a} post \"@{agent_id}: I'm holding a claim on {claim_path} (overlaps {path}). ETA update soon.\""
+                            ),
+                            format!("but-engineering-rewrite --agent-id {a} release --path {claim_path}"),
+                        ]),
+                    );
+                    continue;
+                }
+
+                let active_claim_path: Option<String> = conn
+                    .query_row(
+                        "SELECT path FROM claims WHERE agent_id = ?1 AND expires_at_ms > ?2 ORDER BY expires_at_ms DESC LIMIT 1",
+                        params![a, now_ms],
+                        |row| row.get(0),
+                    )
+                    .optional()
+                    .map_err(|_| ())?;
+
+                if let Some(p) = active_claim_path {
+                    action_plan_by_agent.insert(
+                        a.clone(),
+                        Value::from(vec![format!(
+                            "but-engineering-rewrite --agent-id {a} post \"@{agent_id}: FYI I'm working on {p}; not touching {path}.\""
+                        )]),
+                    );
+                } else {
+                    action_plan_by_agent.insert(
+                        a.clone(),
+                        Value::from(vec![format!(
+                            "but-engineering-rewrite --agent-id {a} post \"@{agent_id}: I have no active claims; I won't touch {path}.\""
+                        )]),
+                    );
+                }
+            }
+
             let dependency_hints = dependency_hints_for_check(&conn, &agent_id)?;
             let out = json!({
                 "decision": decision,
                 "reason_code": reason_code,
                 "blocking_agents": blocking_agents,
                 "action_plan": action_plan,
+                "action_plan_by_agent": Value::Object(action_plan_by_agent),
                 "dependency_hints": dependency_hints,
             });
             print_json(&out.to_string());

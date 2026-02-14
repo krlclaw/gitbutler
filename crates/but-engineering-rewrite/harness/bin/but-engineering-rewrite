@@ -560,7 +560,9 @@ blockers="$(printf "%s\n" "$blockers_raw" | awk 'NF && !seen[$0]++')"
 decision=""
 reason_code=""
 blocking_agents="[]"
+blocking_claims="[]"
 action_plan="[]"
+action_plan_by_agent="{}"
 if [[ -n "$blockers" ]]; then
   if [[ "$strict" == "1" ]]; then
     decision="deny"
@@ -600,6 +602,55 @@ if [[ -n "$blockers" ]]; then
 
   blocking_agents="[$(IFS=,; printf "%s" "${ba_items[*]}")]"
   action_plan="[$(IFS=,; printf "%s" "${ap_items[*]}")]"
+
+  # Expose which claim path(s) overlap the checked path (actionable conflict details).
+  blocking_claims="$(
+    DB_PATH="$db_path" REQUESTER="$agent_id" TARGET_PATH="$path" BLOCKERS="$blockers" python3 -c '
+import json, os, sqlite3, time
+db_path = os.environ["DB_PATH"]
+requester = os.environ["REQUESTER"]
+target_path = os.environ["TARGET_PATH"]
+blockers = [b for b in (os.environ.get("BLOCKERS","") or "").splitlines() if b.strip()]
+
+def overlaps(a: str, b: str) -> bool:
+    return a == b or a.startswith(b + "/") or b.startswith(a + "/")
+
+now_s = int(time.time())
+conn = sqlite3.connect(db_path)
+cur = conn.cursor()
+
+out = []
+for b in blockers:
+    rows = cur.execute(
+        "SELECT path, expires_at_s FROM claims WHERE agent_id = ? AND expires_at_s > ? ORDER BY expires_at_s DESC",
+        (b, now_s),
+    ).fetchall()
+    best = None  # (path, exp_s)
+    for p, exp_s in rows:
+        if not isinstance(p, str) or not p:
+            continue
+        if not overlaps(target_path, p):
+            continue
+        try:
+            exp_i = int(exp_s)
+        except Exception:
+            exp_i = 0
+        cand = (p, exp_i)
+        if best is None:
+            best = cand
+            continue
+        # Prefer the most specific (longest path), then latest expiry.
+        if len(cand[0]) > len(best[0]) or (len(cand[0]) == len(best[0]) and cand[1] > best[1]):
+            best = cand
+    if best is None:
+        continue
+    p, exp_i = best
+    out.append({"agent_id": b, "path": p, "expires_at_ms": exp_i * 1000})
+
+conn.close()
+print(json.dumps(out, separators=(",",":")))
+'
+  )"
 else
   decision="allow"
   reason_code="no_conflict"
@@ -607,6 +658,79 @@ else
   esc_retry="$(json_escape "$retry_cmd")"
   action_plan="[\"$esc_retry\"]"
 fi
+
+# Per-agent action plan: help wrappers drive convergence (multi-step, multi-agent).
+action_plan_by_agent="$(
+  DB_PATH="$db_path" REQUESTER="$agent_id" TARGET_PATH="$path" STRICT="$strict" BLOCKERS="$blockers" python3 -c '
+import json, os, sqlite3, time
+db_path = os.environ["DB_PATH"]
+requester = os.environ["REQUESTER"]
+target_path = os.environ["TARGET_PATH"]
+strict = os.environ.get("STRICT","0") == "1"
+blockers = [b for b in (os.environ.get("BLOCKERS","") or "").splitlines() if b.strip()]
+
+def overlaps(a: str, b: str) -> bool:
+    # Same as harness/rust: exact OR prefix + "/" on either side.
+    return a == b or a.startswith(b + "/") or b.startswith(a + "/")
+
+now_s = int(time.time())
+conn = sqlite3.connect(db_path)
+cur = conn.cursor()
+
+agents = [r[0] for r in cur.execute("SELECT agent_id FROM agent_state ORDER BY agent_id ASC").fetchall()]
+
+# Pick a representative overlapping claim path per blocker (stable first-seen).
+blocking_claim_path = {}
+rows = cur.execute("SELECT agent_id, path FROM claims WHERE expires_at_s > ? AND agent_id <> ? ORDER BY expires_at_s DESC", (now_s, requester)).fetchall()
+for a, p in rows:
+    if a not in blockers:
+        continue
+    if a in blocking_claim_path:
+        continue
+    if overlaps(target_path, p):
+        blocking_claim_path[a] = p
+
+out = {}
+
+def requester_plan():
+    if not blockers:
+        return [f"but-engineering-rewrite --agent-id {requester} check --path {target_path}"]
+    plan = [f"but-engineering-rewrite --agent-id {requester} read"]
+    for b in blockers:
+        plan.append(f"but-engineering-rewrite --agent-id {requester} post \"@{b}: I am about to edit {target_path}. Are you working on it?\"")
+    cmd = f"but-engineering-rewrite --agent-id {requester} check --path {target_path}"
+    if strict:
+        cmd += " --strict"
+    plan.append(cmd)
+    return plan
+
+for a in agents:
+    if a == requester:
+        out[a] = requester_plan()
+        continue
+    if a in blocking_claim_path:
+        cp = blocking_claim_path[a]
+        out[a] = [
+            f"but-engineering-rewrite --agent-id {a} read",
+            f"but-engineering-rewrite --agent-id {a} post \"@{requester}: I am holding a claim on {cp} (overlaps {target_path}). ETA update soon.\"",
+            f"but-engineering-rewrite --agent-id {a} release --path {cp}",
+        ]
+        continue
+
+    row = cur.execute(
+        "SELECT path FROM claims WHERE agent_id = ? AND expires_at_s > ? ORDER BY expires_at_s DESC LIMIT 1",
+        (a, now_s),
+    ).fetchone()
+    if row and isinstance(row[0], str) and row[0]:
+        p = row[0]
+        out[a] = [f"but-engineering-rewrite --agent-id {a} post \"@{requester}: FYI I am working on {p}; not touching {target_path}.\""]
+    else:
+        out[a] = [f"but-engineering-rewrite --agent-id {a} post \"@{requester}: I have no active claims; I will not touch {target_path}.\""]
+
+conn.close()
+print(json.dumps(out, separators=(",",":")))
+'
+)"
 
 # Dependency hints:
 # - Read B's latest intent (if any)
@@ -685,4 +809,23 @@ print(json.dumps(hints, separators=(",",":")))
   )"
 fi
 
-printf '{"decision":"%s","reason_code":"%s","blocking_agents":%s,"action_plan":%s,"dependency_hints":%s}\n' "$decision" "$reason_code" "$blocking_agents" "$action_plan" "$dependency_hints"
+OUT_DECISION="$decision" OUT_REASON="$reason_code" OUT_BLOCKERS="$blocking_agents" OUT_BLOCKING_CLAIMS="$blocking_claims" OUT_ACTION_PLAN="$action_plan" OUT_BY_AGENT="${action_plan_by_agent:-}" OUT_HINTS="$dependency_hints" python3 -c '
+import json, os
+
+def load_json_env(name: str, default):
+    raw = (os.environ.get(name, "") or "").strip()
+    if not raw:
+        return default
+    return json.loads(raw)
+
+out = {
+    "decision": os.environ.get("OUT_DECISION", ""),
+    "reason_code": os.environ.get("OUT_REASON", ""),
+    "blocking_agents": load_json_env("OUT_BLOCKERS", []),
+    "blocking_claims": load_json_env("OUT_BLOCKING_CLAIMS", []),
+    "action_plan": load_json_env("OUT_ACTION_PLAN", []),
+    "action_plan_by_agent": load_json_env("OUT_BY_AGENT", {}),
+    "dependency_hints": load_json_env("OUT_HINTS", []),
+}
+print(json.dumps(out, separators=(",",":")))
+'

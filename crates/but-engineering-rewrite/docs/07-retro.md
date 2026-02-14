@@ -2,6 +2,10 @@
 
 ## 2026-02-14
 
+- Added harness Case 25 to cover the common workflow of checking a directory (`check --path src/`) when another agent holds a file claim inside it (reverse prefix overlap): `crates/but-engineering-rewrite/harness/run.sh`, `crates/but-engineering-rewrite/harness/cases/25-path-prefix-overlap-directory-check.md`.
+- Asserted the conflict output stays actionable by including the specific blocking file claim in `blocking_claims` (not just the blocking agent id).
+- No CLI changes were required for this iteration; existing overlap detection and `blocking_claims` output already covered the scenario.
+
 ### (a) What Changed
 - Added harness Case 04 coverage for “high-signal discovery propagation” via a dedicated `brief` command (`crates/but-engineering-rewrite/harness/run.sh`, `crates/but-engineering-rewrite/harness/cases/04-high-signal-discovery.md`).
 - Tightened the Case 04 harness to assert `next_steps` actually contains the command from the posted discovery payload (not just somewhere in the output).
@@ -199,6 +203,18 @@
 ### (b) What Was Hard
 - SQLite schema migration would be “cleaner” with a unique constraint, but that’s more complexity than needed for the harness; doing a targeted delete keeps the behavior correct with minimal surface area.
 
+## 2026-02-14 (Case 24)
+
+### (a) What Changed
+- Added harness Case 24 to cover a realistic coordination footgun: releasing a claim with a leading `./` path spelling should still unblock others: `crates/but-engineering-rewrite/harness/run.sh`, `crates/but-engineering-rewrite/harness/cases/24-release-path-normalization-dot-prefix.md`.
+- Extended the harness runner list to execute Case 24.
+
+### (b) What Was Hard
+- Avoiding a near-duplicate of Case 23 (which covers `check` normalization) while still testing a separate high-impact workflow (`release`).
+
+### (c) Next Step
+- Expand path normalization beyond leading `./` (e.g. redundant slashes and `..`) if/when we need cross-platform robustness.
+
 ### (c) Next Step
 - Consider upgrading `claims` storage to a real upsert (`UNIQUE(path, agent_id)` + `ON CONFLICT DO UPDATE`) once we want stronger invariants beyond the disposable-repo harness.
 
@@ -217,6 +233,13 @@
 
 ### (b) What Was Hard
 - Getting a robust harness assertion for "status/plan cleared" without JSON parsing in bash; the case asserts the previous values are no longer present in `agents` output instead of matching nested structure.
+
+## 2026-02-14 (Case 21: Convergence Dynamics)
+
+- Added a new harness case that simulates a 3-agent triangle conflict and a short convergence sequence where one agent narrows scope to reduce collisions: `crates/but-engineering-rewrite/harness/run.sh`, `crates/but-engineering-rewrite/harness/cases/21-multi-step-convergence.md`.
+- Extended `check` output to include `action_plan_by_agent` so wrappers can present concrete next actions for each involved agent (not just the caller): `crates/but-engineering-rewrite/src/main.rs`, `crates/but-engineering-rewrite/harness/bin/but-engineering-rewrite`.
+- Added explicit graders for "collisions reduced" (blocker count drops) and "no spam" (deduped blocking agents and agent ids) using JSON parsing instead of brittle grep: `crates/but-engineering-rewrite/harness/run.sh`.
+- Kept the convergence mechanism intentionally simple (release broad claim, re-claim narrower path) to model real coordination without introducing hard locks.
 
 ## 2026-02-14 (Case 19)
 
@@ -295,3 +318,16 @@
 - Fixed a Rust CLI bug where plain `post` discarded the bound `message` value in the match arm (`crates/but-engineering-rewrite/src/main.rs`).
 - Kept the harness assertion non-flaky by only requiring timestamps to be non-decreasing (seconds-level clocks can collide) while still guaranteeing presence and order.
 - Next: consider including `created_at_ms` consistently across `read`/`brief`/`digest` for discoveries too, so UIs can reason about freshness without custom rules.
+
+## 2026-02-14 (Case 22)
+
+- Added harness Case 22 to require `check` to expose `blocking_claims` (agent id + overlapping claim path + expiry), making conflicts directly actionable (`crates/but-engineering-rewrite/harness/run.sh`, `crates/but-engineering-rewrite/harness/cases/22-blocking-claim-paths.md`).
+- Extended the harness stub `check` JSON to compute and emit one "best" overlapping claim per blocking agent (prefer most specific path, then latest expiry) (`crates/but-engineering-rewrite/harness/bin/but-engineering-rewrite`).
+- Kept the change additive (existing keys preserved) so older harness cases remain stable while coordination UIs get richer conflict details.
+
+## 2026-02-14 (Case 23)
+
+- Added harness Case 23 to assert path normalization for common spellings: `src/app.txt` and `./src/app.txt` must be treated as overlapping for coordination to be reliable (`crates/but-engineering-rewrite/harness/run.sh`, `crates/but-engineering-rewrite/harness/cases/23-path-normalization-dot-prefix.md`).
+- This is a high-value “paper cut” scenario: agents frequently copy relative paths with `./`, and missed conflicts here are both silent and costly.
+- Harness stayed green without implementation changes, which indicates the existing claim/check path handling already normalizes this prefix.
+- Next: consider expanding normalization coverage in harness (e.g. `src//app.txt`, `src/./app.txt`, and `src/../src/app.txt`) and decide what should be supported vs rejected.

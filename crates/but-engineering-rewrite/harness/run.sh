@@ -660,6 +660,78 @@ case_15_multi_blocker_action_plan() {
   expect_not_contains "$out_b" "\"C\",\"C\""
 }
 
+case_21_multi_step_convergence() {
+  bold "Case 21: Multi-Step Convergence (3-Agent Coordination)"
+  local repo; repo="$(mk_repo)"
+  trap '[[ -n "${repo:-}" ]] && rm -rf "$repo"' RETURN
+
+  local out_a_claim out_b_claim out_c_broad out_initial out_c_release out_c_narrow out_final
+
+  # Start in a conflicting state:
+  # - A and B collide on the same file.
+  # - C holds a broader directory claim that blocks both (triangle conflict).
+  out_a_claim="$(run_cli "$repo" "A" claim --path src/app.txt --ttl 15m)"
+  out_b_claim="$(run_cli "$repo" "B" claim --path src/app.txt --ttl 15m)"
+  out_c_broad="$(run_cli "$repo" "C" claim --path src/ --ttl 15m)"
+
+  # Initial: B checks and sees two blockers (A + C).
+  out_initial="$(run_cli "$repo" "B" check --path src/app.txt)"
+  expect_contains "$out_initial" "\"decision\""
+  expect_contains "$out_initial" "\"warn\""
+  expect_contains "$out_initial" "\"blocking_agents\""
+  expect_contains "$out_initial" "\"A\""
+  expect_contains "$out_initial" "\"C\""
+
+  # Convergence: C narrows scope (releases broad claim, claims a non-overlapping path).
+  out_c_release="$(run_cli "$repo" "C" release --path src/)"
+  out_c_narrow="$(run_cli "$repo" "C" claim --path src/other.txt --ttl 15m)"
+
+  # Final: B checks again; collisions reduced.
+  out_final="$(run_cli "$repo" "B" check --path src/app.txt)"
+  expect_contains "$out_final" "\"decision\""
+  expect_contains "$out_final" "\"warn\""
+  expect_contains "$out_final" "\"blocking_agents\""
+  expect_contains "$out_final" "\"A\""
+  expect_contains "$out_final" "\"action_plan_by_agent\""
+
+  # Graders:
+  # - collisions reduced (2 blockers -> 0/1 blockers)
+  # - actionability (final includes next actions per A/B/C)
+  # - no spam (deduped blockers; no duplicate agent ids)
+  python3 -c '
+import json, sys
+
+blob = sys.stdin.read()
+try:
+    a_raw, b_raw = blob.split("\n--SPLIT--\n", 1)
+except ValueError:
+    raise SystemExit("expected split marker in harness grader input")
+
+init = json.loads(a_raw)
+final = json.loads(b_raw)
+
+init_blockers = init.get("blocking_agents", [])
+final_blockers = final.get("blocking_agents", [])
+assert isinstance(init_blockers, list) and isinstance(final_blockers, list), "blocking_agents must be a list"
+assert len(init_blockers) >= 2, f"expected initial blockers >=2; got {init_blockers}"
+assert len(final_blockers) <= 1, f"expected final blockers <=1; got {final_blockers}"
+assert len(final_blockers) < len(init_blockers), f"expected collisions reduced; init={init_blockers} final={final_blockers}"
+
+assert len(set(init_blockers)) == len(init_blockers), f"expected deduped initial blockers; got {init_blockers}"
+assert len(set(final_blockers)) == len(final_blockers), f"expected deduped final blockers; got {final_blockers}"
+
+ap = final.get("action_plan_by_agent")
+assert isinstance(ap, dict), "expected action_plan_by_agent object"
+for agent in ("A", "B", "C"):
+    assert agent in ap, f"expected action_plan_by_agent to include {agent}"
+    steps = ap.get(agent)
+    assert isinstance(steps, list) and steps, f"expected non-empty steps for {agent}"
+    assert any(isinstance(s, str) and f"--agent-id {agent}" in s for s in steps), f"expected concrete next step mentioning --agent-id {agent}"
+
+assert len(ap.keys()) == len(set(ap.keys())), "expected no duplicate agent ids in action_plan_by_agent"
+' <<<"$out_initial"$'\n--SPLIT--\n'"$out_final"
+}
+
 case_05f_claim_renewal_dedupe() {
   bold "Case 05f: Claim Renewal (No Duplicate Claims Rows)"
   local repo; repo="$(mk_repo)"
@@ -786,6 +858,58 @@ case_08_path_prefix_overlap() {
   expect_contains "$out_b" "\"decision\""
   expect_contains "$out_b" "\"warn\""
   expect_contains "$out_b" "claimed_by_other"
+}
+
+case_25_path_prefix_overlap_directory_check() {
+  bold "Case 25: Path Prefix Overlap (Directory Check)"
+  local repo; repo="$(mk_repo)"
+  trap '[[ -n "${repo:-}" ]] && rm -rf "$repo"' RETURN
+
+  local out_a out_b
+  # Reverse of Case 08: claim a file, then check a directory that contains it.
+  # This is a common workflow (agent wants to work on a whole folder) and should
+  # still surface actionable conflict details.
+  out_a="$(run_cli "$repo" "A" claim --path src/app.txt --ttl 15m)"
+  out_b="$(run_cli "$repo" "B" check --path src/)"
+
+  expect_contains "$out_b" "\"decision\""
+  expect_contains "$out_b" "\"warn\""
+  expect_contains "$out_b" "claimed_by_other"
+  expect_contains "$out_b" "\"blocking_claims\""
+  expect_contains "$out_b" "\"agent_id\":\"A\""
+  expect_contains "$out_b" "\"path\":\"src/app.txt\""
+}
+
+case_23_path_normalization_dot_prefix() {
+  bold "Case 23: Path Normalization (Leading ./)"
+  local repo; repo="$(mk_repo)"
+  trap '[[ -n "${repo:-}" ]] && rm -rf "$repo"' RETURN
+
+  local out_a out_b
+  out_a="$(run_cli "$repo" "A" claim --path src/app.txt --ttl 15m)"
+  out_b="$(run_cli "$repo" "B" check --path ./src/app.txt)"
+
+  # Coordination is only useful if we normalize common path spellings.
+  expect_contains "$out_b" "\"decision\""
+  expect_contains "$out_b" "\"warn\""
+  expect_contains "$out_b" "claimed_by_other"
+}
+
+case_24_release_path_normalization_dot_prefix() {
+  bold "Case 24: Release Path Normalization (Leading ./)"
+  local repo; repo="$(mk_repo)"
+  trap '[[ -n "${repo:-}" ]] && rm -rf "$repo"' RETURN
+
+  local out_a_claim out_a_release out_b_check
+  out_a_claim="$(run_cli "$repo" "A" claim --path src/app.txt --ttl 15m)"
+  out_a_release="$(run_cli "$repo" "A" release --path ./src/app.txt)"
+  out_b_check="$(run_cli "$repo" "B" check --path src/app.txt)"
+
+  expect_contains "$out_a_claim" "\"ok\":true"
+  expect_contains "$out_a_release" "\"ok\":true"
+  expect_contains "$out_b_check" "\"decision\""
+  expect_contains "$out_b_check" "\"allow\""
+  expect_contains "$out_b_check" "no_conflict"
 }
 
 case_09_channel_messages() {
@@ -981,6 +1105,25 @@ case_14_claims_path_prefix_filter() {
   expect_not_contains "$out_filtered" "\"path\":\"notes.txt\""
 }
 
+case_22_check_includes_blocking_claim_paths() {
+  bold "Case 22: Check Includes Blocking Claim Paths"
+  local repo; repo="$(mk_repo)"
+  trap '[[ -n "${repo:-}" ]] && rm -rf "$repo"' RETURN
+
+  local out_a out_check
+  # A holds a broad directory claim; B checks a specific file under it.
+  out_a="$(run_cli "$repo" "A" claim --path src/ --ttl 15m)"
+  out_check="$(run_cli "$repo" "B" check --path src/app.txt)"
+
+  expect_contains "$out_check" "\"decision\""
+  expect_contains "$out_check" "\"warn\""
+  # New coordination surface: check should expose which claim path is blocking.
+  expect_contains "$out_check" "\"blocking_claims\""
+  expect_contains "$out_check" "\"agent_id\":\"A\""
+  expect_contains "$out_check" "\"path\":\"src\""
+  expect_contains "$out_check" "\"expires_at_ms\""
+}
+
 main() {
   ensure_bin
   mk_out_dir
@@ -1014,11 +1157,15 @@ main() {
     case_05b_check_action_plan
     case_05c_dedup_blocking_agents
     case_15_multi_blocker_action_plan
+    case_21_multi_step_convergence
     case_05f_claim_renewal_dedupe
     case_05g_done_cleanup
     case_06_read_surfaces
     case_07_release_claim
     case_08_path_prefix_overlap
+    case_25_path_prefix_overlap_directory_check
+    case_23_path_normalization_dot_prefix
+    case_24_release_path_normalization_dot_prefix
     case_09_channel_messages
     case_16_read_default_transcript
     case_20_message_timestamps
@@ -1028,6 +1175,7 @@ main() {
     case_13_agents_status_plan
     case_19_clear_status_plan
     case_14_claims_path_prefix_filter
+    case_22_check_includes_blocking_claim_paths
   )
 
   local overall_failed=0 t
