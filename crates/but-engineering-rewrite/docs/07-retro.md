@@ -287,3 +287,11 @@
 
 ### (c) Next Step
 - Define an explicit tag vocabulary (e.g. `component/api` exactly) and validate it on `post --type declaration` to keep hinting deterministic and reduce heuristic creep.
+
+## 2026-02-14 (Case 20)
+
+- Added harness Case 20 to require per-message `created_at_ms` timestamps in the default transcript so clients can render "when" and sort deterministically (`crates/but-engineering-rewrite/harness/run.sh`, `crates/but-engineering-rewrite/harness/cases/20-message-timestamps.md`).
+- Updated the stub CLI `read` output to attach `created_at_ms` to each returned message object (derived from stored `created_at_s`) (`crates/but-engineering-rewrite/harness/bin/but-engineering-rewrite`).
+- Fixed a Rust CLI bug where plain `post` discarded the bound `message` value in the match arm (`crates/but-engineering-rewrite/src/main.rs`).
+- Kept the harness assertion non-flaky by only requiring timestamps to be non-decreasing (seconds-level clocks can collide) while still guaranteeing presence and order.
+- Next: consider including `created_at_ms` consistently across `read`/`brief`/`digest` for discoveries too, so UIs can reason about freshness without custom rules.

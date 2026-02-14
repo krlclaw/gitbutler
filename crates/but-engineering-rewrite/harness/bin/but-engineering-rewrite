@@ -308,7 +308,7 @@ if [[ "$subcmd" == "read" || "$subcmd" == "brief" || "$subcmd" == "digest" ]]; t
     fi
     rows="$(
       sqlite3 -noheader -separator $'\t' "$db_path" \
-        "SELECT agent_id, body_json FROM messages WHERE kind = $(sql_quote "$read_type") ORDER BY id ASC;" \
+        "SELECT created_at_s, agent_id, body_json FROM messages WHERE kind = $(sql_quote "$read_type") ORDER BY id ASC;" \
         2>/dev/null || true
     )"
     messages="$(
@@ -318,18 +318,23 @@ read_type = os.environ.get("READ_TYPE","all")
 rows = os.environ.get("ROWS","")
 out=[]
 for line in rows.splitlines():
-    if "\t" not in line:
+    if line.count("\t") < 2:
         continue
-    agent_id, body_raw = line.split("\t", 1)
+    created_at_s, agent_id, body_raw = line.split("\t", 2)
+    try:
+        created_at_ms = int(created_at_s) * 1000
+    except Exception:
+        created_at_ms = 0
     try:
         body = json.loads(body_raw)
         if isinstance(body, dict):
             body = dict(body)
             body["agent_id"] = agent_id
+            body["created_at_ms"] = created_at_ms
         else:
-            body = {"raw": body, "agent_id": agent_id}
+            body = {"raw": body, "agent_id": agent_id, "created_at_ms": created_at_ms}
     except Exception:
-        body = {"raw": body_raw, "agent_id": agent_id}
+        body = {"raw": body_raw, "agent_id": agent_id, "created_at_ms": created_at_ms}
     out.append(body)
 print(json.dumps(out, separators=(",",":")))
 '

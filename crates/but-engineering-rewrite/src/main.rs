@@ -205,7 +205,7 @@ fn run() -> Result<(), ()> {
             });
             print_json(&out.to_string());
         }
-        Cmd::Post { message: _ } => {
+        Cmd::Post { message } => {
             // Minimal channel support: persist plain text messages so other agents can read them.
             // This keeps the harness realistic (coordination requires a shared transcript).
             let now_ms = now_unix_ms()?;
@@ -248,15 +248,21 @@ fn run() -> Result<(), ()> {
 
                 let mut stmt = conn
                     .prepare(
-                        "SELECT agent_id, body_json FROM messages WHERE kind = 'discovery' ORDER BY id ASC",
+                        "SELECT created_at_ms, agent_id, body_json FROM messages WHERE kind = 'discovery' ORDER BY id ASC",
                     )
                     .map_err(|_| ())?;
                 let rows = stmt
-                    .query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)))
+                    .query_map([], |row| {
+                        Ok((
+                            row.get::<_, i64>(0)?,
+                            row.get::<_, String>(1)?,
+                            row.get::<_, String>(2)?,
+                        ))
+                    })
                     .map_err(|_| ())?;
 
                 for r in rows {
-                    let (agent, body_json) = r.map_err(|_| ())?;
+                    let (created_at_ms, agent, body_json) = r.map_err(|_| ())?;
                     let parsed: Value =
                         serde_json::from_str(&body_json).unwrap_or(Value::String(body_json));
                     let mut obj = match parsed {
@@ -267,6 +273,7 @@ fn run() -> Result<(), ()> {
                     // Attach provenance.
                     if let Value::Object(m) = &mut obj {
                         m.insert("agent_id".to_owned(), Value::String(agent));
+                        m.insert("created_at_ms".to_owned(), Value::from(created_at_ms));
                     }
 
                     // Derive a minimal actionable step, if present.
@@ -292,18 +299,22 @@ fn run() -> Result<(), ()> {
                 // Minimal inspection/debug surface: list stored structured payloads with provenance.
                 let mut stmt = conn
                     .prepare(
-                        "SELECT agent_id, body_json FROM messages WHERE kind = ?1 ORDER BY id ASC",
+                        "SELECT created_at_ms, agent_id, body_json FROM messages WHERE kind = ?1 ORDER BY id ASC",
                     )
                     .map_err(|_| ())?;
                 let rows = stmt
                     .query_map(params![kind], |row| {
-                        Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+                        Ok((
+                            row.get::<_, i64>(0)?,
+                            row.get::<_, String>(1)?,
+                            row.get::<_, String>(2)?,
+                        ))
                     })
                     .map_err(|_| ())?;
 
                 let mut messages: Vec<Value> = Vec::new();
                 for r in rows {
-                    let (agent, body_json) = r.map_err(|_| ())?;
+                    let (created_at_ms, agent, body_json) = r.map_err(|_| ())?;
                     let parsed: Value =
                         serde_json::from_str(&body_json).unwrap_or(Value::String(body_json));
                     let mut obj = match parsed {
@@ -312,6 +323,7 @@ fn run() -> Result<(), ()> {
                     };
                     if let Value::Object(m) = &mut obj {
                         m.insert("agent_id".to_owned(), Value::String(agent));
+                        m.insert("created_at_ms".to_owned(), Value::from(created_at_ms));
                     }
                     messages.push(obj);
                 }

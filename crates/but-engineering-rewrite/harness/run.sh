@@ -825,6 +825,40 @@ case_16_read_default_transcript() {
   expect_contains "$out_read" "ERW_CASE16_UNIQUE"
 }
 
+case_20_message_timestamps() {
+  bold "Case 20: Message Timestamps (Transcript Ordering)"
+  local repo; repo="$(mk_repo)"
+  trap '[[ -n "${repo:-}" ]] && rm -rf "$repo"' RETURN
+
+  run_cli "$repo" "A" post "ERW_CASE20_UNIQUE_A: starting work on src/app.txt" >/dev/null
+  # Coarse timestamp clocks (e.g. seconds) can collide; only require non-decreasing ordering.
+  sleep 0.2
+  run_cli "$repo" "B" post "ERW_CASE20_UNIQUE_B: ack, I'm just reviewing" >/dev/null
+
+  local out_read
+  out_read="$(run_cli "$repo" "C" read)"
+
+  expect_contains "$out_read" "\"ok\""
+  expect_contains "$out_read" "\"kind\":\"message\""
+  expect_contains "$out_read" "ERW_CASE20_UNIQUE_A"
+  expect_contains "$out_read" "ERW_CASE20_UNIQUE_B"
+
+  python3 -c '
+import json, sys
+v = json.loads(sys.stdin.read())
+msgs = v.get("messages", [])
+assert isinstance(msgs, list) and len(msgs) >= 2, "expected at least 2 messages"
+times = []
+for m in msgs:
+    assert isinstance(m, dict), "message must be a JSON object"
+    assert "created_at_ms" in m, "missing created_at_ms"
+    t = m["created_at_ms"]
+    assert isinstance(t, int), "created_at_ms must be an int"
+    times.append(t)
+assert times == sorted(times), f"created_at_ms should be non-decreasing (got {times})"
+' <<<"$out_read"
+}
+
 case_10_claims_list() {
   bold "Case 10: Claims Listing (Visibility)"
   local repo; repo="$(mk_repo)"
@@ -987,6 +1021,7 @@ main() {
     case_08_path_prefix_overlap
     case_09_channel_messages
     case_16_read_default_transcript
+    case_20_message_timestamps
     case_10_claims_list
     case_11_discovery_provenance
     case_12_discovery_provenance_digest
