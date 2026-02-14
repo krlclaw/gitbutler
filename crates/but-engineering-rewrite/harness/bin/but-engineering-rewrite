@@ -7,6 +7,9 @@ path=""
 ttl=""
 strict="0"
 message=""
+post_type=""
+post_json=""
+read_type=""
 
 json_err() {
   # Always emit valid JSON on stdout.
@@ -36,6 +39,13 @@ sql_quote() {
   printf "'%s'" "$s"
 }
 
+json_escape() {
+  local s="$1"
+  s="${s//\\/\\\\}"
+  s="${s//\"/\\\"}"
+  printf "%s" "$s"
+}
+
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --agent-id)
@@ -44,7 +54,7 @@ while [[ $# -gt 0 ]]; do
       agent_id="$1"
       shift
       ;;
-    claim|check|post|eval)
+    claim|release|check|post|read|brief|digest|eval)
       subcmd="$1"
       shift
       break
@@ -59,9 +69,185 @@ done
 [[ -n "$agent_id" && -n "$subcmd" ]] || { json_err "bad_args"; exit 1; }
 
 if [[ "$subcmd" == "post" ]]; then
-  # Accept any remaining args as message; harness doesn't assert content.
-  message="$*"
+  # Two forms:
+  # 1) post <message...>
+  # 2) post --type discovery --json <payload>
+  if [[ "${1:-}" == "--type" ]]; then
+    shift
+    [[ $# -gt 0 ]] || { json_err "bad_args"; exit 1; }
+    post_type="$1"
+    shift
+    [[ "${1:-}" == "--json" ]] || { json_err "bad_args"; exit 1; }
+    shift
+    [[ $# -gt 0 ]] || { json_err "bad_args"; exit 1; }
+    post_json="$1"
+
+    db_dir=".git/gitbutler"
+    db_path="$db_dir/but-engineering-rewrite.db"
+    mkdir -p "$db_dir" || { json_err; exit 1; }
+
+    sqlite3 "$db_path" <<'SQL' >/dev/null
+CREATE TABLE IF NOT EXISTS messages (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  created_at_s INTEGER NOT NULL,
+  agent_id TEXT NOT NULL,
+  kind TEXT NOT NULL,
+  body_json TEXT NOT NULL
+);
+SQL
+
+    now_s="$(date +%s)"
+    sqlite3 "$db_path" \
+      "INSERT INTO messages(created_at_s, agent_id, kind, body_json) VALUES ($now_s, $(sql_quote "$agent_id"), $(sql_quote "$post_type"), $(sql_quote "$post_json"));" \
+      >/dev/null || { json_err; exit 1; }
+  else
+    # Accept any remaining args as message; harness doesn't assert content.
+    message="$*"
+
+    db_dir=".git/gitbutler"
+    db_path="$db_dir/but-engineering-rewrite.db"
+    mkdir -p "$db_dir" || { json_err; exit 1; }
+
+    # Use python's sqlite bindings to avoid shell-quoting pitfalls.
+    python3 -c '
+import json, sqlite3, sys, time
+db_path, agent_id, message = sys.argv[1], sys.argv[2], sys.argv[3]
+conn = sqlite3.connect(db_path)
+cur = conn.cursor()
+cur.execute("""
+CREATE TABLE IF NOT EXISTS messages (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  created_at_s INTEGER NOT NULL,
+  agent_id TEXT NOT NULL,
+  kind TEXT NOT NULL,
+  body_json TEXT NOT NULL
+)
+""")
+body_json = json.dumps({"text": message}, separators=(",",":"))
+cur.execute(
+  "INSERT INTO messages(created_at_s, agent_id, kind, body_json) VALUES (?, ?, ?, ?)",
+  (int(time.time()), agent_id, "message", body_json),
+)
+conn.commit()
+conn.close()
+' "$db_path" "$agent_id" "$message" || { json_err; exit 1; }
+  fi
   printf '{"ok":true}\n'
+  exit 0
+fi
+
+if [[ "$subcmd" == "read" || "$subcmd" == "brief" || "$subcmd" == "digest" ]]; then
+  # Minimal: (read|brief|digest) --type discovery
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --type)
+        shift
+        [[ $# -gt 0 ]] || { json_err "bad_args"; exit 1; }
+        read_type="$1"
+        shift
+        ;;
+      *)
+        json_err "bad_args"
+        exit 1
+        ;;
+    esac
+  done
+
+  # Brief/digest defaults to discovery unless explicitly overridden.
+  if [[ -z "$read_type" && ( "$subcmd" == "brief" || "$subcmd" == "digest" ) ]]; then
+    read_type="discovery"
+  fi
+
+  db_dir=".git/gitbutler"
+  db_path="$db_dir/but-engineering-rewrite.db"
+  mkdir -p "$db_dir" || { json_err; exit 1; }
+
+  sqlite3 "$db_path" <<'SQL' >/dev/null
+CREATE TABLE IF NOT EXISTS messages (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  created_at_s INTEGER NOT NULL,
+  agent_id TEXT NOT NULL,
+  kind TEXT NOT NULL,
+  body_json TEXT NOT NULL
+);
+SQL
+
+  if [[ "$read_type" != "discovery" ]]; then
+    # Minimal inspection surface for structured messages used by the harness.
+    if [[ -z "$read_type" ]]; then
+      read_type="all"
+    fi
+    rows="$(
+      sqlite3 -noheader -separator $'\t' "$db_path" \
+        "SELECT agent_id, body_json FROM messages WHERE kind = $(sql_quote "$read_type") ORDER BY id ASC;" \
+        2>/dev/null || true
+    )"
+    messages="$(
+      READ_TYPE="$read_type" ROWS="$rows" python3 -c '
+import json, os
+read_type = os.environ.get("READ_TYPE","all")
+rows = os.environ.get("ROWS","")
+out=[]
+for line in rows.splitlines():
+    if "\t" not in line:
+        continue
+    agent_id, body_raw = line.split("\t", 1)
+    try:
+        body = json.loads(body_raw)
+        if isinstance(body, dict):
+            body = dict(body)
+            body["agent_id"] = agent_id
+        else:
+            body = {"raw": body, "agent_id": agent_id}
+    except Exception:
+        body = {"raw": body_raw, "agent_id": agent_id}
+    out.append(body)
+print(json.dumps(out, separators=(",",":")))
+'
+    )"
+    printf '{"ok":true,"mode":"%s","kind":"%s","messages":%s}\n' "$subcmd" "$read_type" "${messages:-[]}"
+    exit 0
+  fi
+
+  # Join rows into a JSON array of discovery objects (body_json assumed to be a JSON object).
+  discoveries="$(
+    sqlite3 -noheader -separator $'\t' "$db_path" \
+      "SELECT body_json FROM messages WHERE kind = 'discovery' ORDER BY id ASC;" \
+      2>/dev/null || true
+  )"
+  if [[ -z "$discoveries" ]]; then
+    printf '{"ok":true,"mode":"%s","kind":"discovery","discoveries":[],"next_steps":[]}\n' "$subcmd"
+    exit 0
+  fi
+
+  # High-signal gate: only propagate discoveries explicitly marked high.
+  # Keep it simple and intentionally string-based (harness posts compact JSON).
+  discoveries="$(printf "%s\n" "$discoveries" | grep -F '"signal":"high"' || true)"
+  if [[ -z "$discoveries" ]]; then
+    printf '{"ok":true,"mode":"%s","kind":"discovery","discoveries":[],"next_steps":[]}\n' "$subcmd"
+    exit 0
+  fi
+
+  # Turn newline-delimited JSON objects into a JSON array.
+  disc_arr="$(printf "%s\n" "$discoveries" | awk 'BEGIN{first=1; printf "["} { if (!first) printf ","; first=0; printf "%s", $0 } END{ printf "]" }')"
+
+  # Minimal next_steps derived from the posted payload (best-effort JSON string extraction).
+  next_steps="[]"
+  while IFS= read -r line; do
+    [[ -n "$line" ]] || continue
+    # NOTE: Use a bracketed literal `[{]` to match `{` without regex escaping pitfalls across sed variants.
+    cmd="$(printf "%s" "$line" | sed -nE 's/.*"suggested_action"[[:space:]]*:[[:space:]]*[{][^}]*"cmd"[[:space:]]*:[[:space:]]*"([^"]+)".*/\1/p')"
+    if [[ -n "$cmd" ]]; then
+      esc_cmd="$(json_escape "$cmd")"
+      if [[ "$next_steps" == "[]" ]]; then
+        next_steps="[{\"kind\":\"run\",\"cmd\":\"$esc_cmd\"}]"
+      else
+        next_steps="${next_steps%]},"'{"kind":"run","cmd":"'"$esc_cmd"'"}]'
+      fi
+    fi
+  done <<<"$discoveries"
+
+  printf '{"ok":true,"mode":"%s","kind":"discovery","discoveries":%s,"next_steps":%s}\n' "$subcmd" "$disc_arr" "$next_steps"
   exit 0
 fi
 
@@ -124,6 +310,16 @@ if [[ "$subcmd" == "claim" ]]; then
   [[ -n "$ttl" ]] || { json_err "bad_args"; exit 1; }
 fi
 
+# Minimal normalization to match the Rust CLI:
+# - Drop leading "./"
+# - Drop trailing "/"
+while [[ "$path" == ./* ]]; do
+  path="${path#./}"
+done
+while [[ "$path" == */ && "$path" != "/" ]]; do
+  path="${path%/}"
+done
+
 db_dir=".git/gitbutler"
 db_path="$db_dir/but-engineering-rewrite.db"
 mkdir -p "$db_dir" || { json_err; exit 1; }
@@ -135,9 +331,24 @@ CREATE TABLE IF NOT EXISTS claims (
   expires_at_s INTEGER NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_claims_path_expires ON claims(path, expires_at_s);
+CREATE TABLE IF NOT EXISTS messages (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  created_at_s INTEGER NOT NULL,
+  agent_id TEXT NOT NULL,
+  kind TEXT NOT NULL,
+  body_json TEXT NOT NULL
+);
 SQL
 
 now_s="$(date +%s)"
+
+if [[ "$subcmd" == "release" ]]; then
+  sqlite3 "$db_path" \
+    "DELETE FROM claims WHERE path = $(sql_quote "$path") AND agent_id = $(sql_quote "$agent_id");" \
+    >/dev/null || { json_err; exit 1; }
+  printf '{"ok":true}\n'
+  exit 0
+fi
 
 if [[ "$subcmd" == "claim" ]]; then
   ttl_s="$(parse_ttl_secs "$ttl")" || { json_err "bad_ttl"; exit 1; }
@@ -150,17 +361,108 @@ if [[ "$subcmd" == "claim" ]]; then
 fi
 
 # check
-res="$(
+# Include the blocking agent so check can emit machine-actionable next steps.
+blocker="$(
   sqlite3 -noheader "$db_path" \
-    "SELECT 1 FROM claims WHERE path = $(sql_quote "$path") AND agent_id <> $(sql_quote "$agent_id") AND expires_at_s > $now_s LIMIT 1;" \
+    "SELECT agent_id FROM claims \
+     WHERE agent_id <> $(sql_quote "$agent_id") \
+       AND expires_at_s > $now_s \
+       AND (path = $(sql_quote "$path") OR $(sql_quote "$path") LIKE path || '/%' OR path LIKE $(sql_quote "$path") || '/%') \
+     LIMIT 1;" \
     2>/dev/null || true
 )"
-if [[ "$res" == "1" ]]; then
+decision=""
+reason_code=""
+blocking_agents="[]"
+action_plan="[]"
+if [[ -n "$blocker" ]]; then
   if [[ "$strict" == "1" ]]; then
-    printf '{"decision":"deny","reason_code":"claimed_by_other"}\n'
+    decision="deny"
   else
-    printf '{"decision":"warn","reason_code":"claimed_by_other"}\n'
+    decision="warn"
   fi
+  reason_code="claimed_by_other"
+
+  esc_blocker="$(json_escape "$blocker")"
+  blocking_agents="[\"$esc_blocker\"]"
+
+  read_cmd="but-engineering-rewrite --agent-id $agent_id read"
+  post_cmd="but-engineering-rewrite --agent-id $agent_id post \\\"@$blocker: I'm about to edit $path. Are you working on it?\\\""
+  retry_cmd="but-engineering-rewrite --agent-id $agent_id check --path $path"
+  esc_read="$(json_escape "$read_cmd")"
+  esc_post="$(json_escape "$post_cmd")"
+  esc_retry="$(json_escape "$retry_cmd")"
+  action_plan="[\"$esc_read\",\"$esc_post\",\"$esc_retry\"]"
 else
-  printf '{"decision":"allow","reason_code":"no_conflict"}\n'
+  decision="allow"
+  reason_code="no_conflict"
+  retry_cmd="but-engineering-rewrite --agent-id $agent_id check --path $path"
+  esc_retry="$(json_escape "$retry_cmd")"
+  action_plan="[\"$esc_retry\"]"
 fi
+
+# Dependency hints:
+# - Read B's latest intent (if any)
+# - Compare against other agents' API declarations
+# - If overlap exists, emit structured, actionable hints (no hard locks)
+dependency_hints="[]"
+intent_json="$(
+  sqlite3 -noheader "$db_path" \
+    "SELECT body_json FROM messages WHERE kind = 'intent' AND agent_id = $(sql_quote "$agent_id") ORDER BY id DESC LIMIT 1;" \
+    2>/dev/null || true
+)"
+if [[ -n "$intent_json" ]]; then
+  decl_rows="$(
+    sqlite3 -noheader -separator $'\t' "$db_path" \
+      "SELECT agent_id, body_json FROM messages WHERE kind = 'declaration' AND agent_id <> $(sql_quote "$agent_id") ORDER BY id DESC;" \
+      2>/dev/null || true
+  )"
+
+  dependency_hints="$(
+    INTENT_JSON="$intent_json" DECL_ROWS="$decl_rows" AGENT_ID="$agent_id" python3 -c '
+import json, os
+intent_raw = os.environ.get("INTENT_JSON","")
+decl_rows = os.environ.get("DECL_ROWS","")
+agent_id = os.environ.get("AGENT_ID","")
+hints=[]
+try:
+    intent = json.loads(intent_raw) if intent_raw else {}
+except Exception:
+    intent = {}
+intent_scope = intent.get("scope")
+intent_surface = intent.get("surface") or []
+intent_surface = {t for t in intent_surface if isinstance(t,str)}
+for line in decl_rows.splitlines():
+    if "\t" not in line:
+        continue
+    provider_agent_id, decl_raw = line.split("\t",1)
+    try:
+        decl = json.loads(decl_raw)
+    except Exception:
+        continue
+    tags = decl.get("tags") or []
+    tags = [t for t in tags if isinstance(t,str)]
+    if not any("api" in t.lower() for t in tags):
+        continue
+    scope = decl.get("scope") or "unknown"
+    if intent_scope and scope != intent_scope:
+        continue
+    surface = decl.get("surface") or []
+    surface = [t for t in surface if isinstance(t,str)]
+    overlap = [t for t in surface if t in intent_surface]
+    if not overlap:
+        continue
+    why = "Intent.surface intersects another agent declaration.surface on token(s): " + ", ".join(overlap) + " (declaration tagged api). Coordinate before consuming/changing it."
+    tok = overlap[0]
+    suggested_cmd = (
+        f"but-engineering-rewrite --agent-id {agent_id} post "
+        f"@{provider_agent_id}: I am about to consume {scope} (overlap: {tok}). "
+        f"Are you changing the contract? Any migration notes?"
+    )
+    hints.append({"kind":"dependency_hint","provider_agent_id":provider_agent_id,"scope":scope,"tags":tags,"overlap_tokens":overlap,"why":why,"next_step":{"kind":"ask","suggested_cmd":suggested_cmd}})
+print(json.dumps(hints, separators=(",",":")))
+'
+  )"
+fi
+
+printf '{"decision":"%s","reason_code":"%s","blocking_agents":%s,"action_plan":%s,"dependency_hints":%s}\n' "$decision" "$reason_code" "$blocking_agents" "$action_plan" "$dependency_hints"

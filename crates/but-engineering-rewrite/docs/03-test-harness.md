@@ -23,7 +23,9 @@ What it does:
 
 ## Current Status
 
-The harness is expected to fail right now because the binary is a stub that prints `NOT_IMPLEMENTED`.
+The harness is expected to pass when run against either:
+- the Rust binary (built via Cargo), or
+- the bundled stub (for environments without Rust tooling).
 
 To point the harness at a different binary (e.g. when iterating), set:
 
