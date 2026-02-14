@@ -1037,26 +1037,88 @@ def compute_unread_relevant_updates(conn) -> tuple[list, int, int]:
 
     return updates, prev, new
 
+blocking_agents = load_json_env("OUT_BLOCKERS", [])
+
 conn = sqlite3.connect(db_path) if db_path else None
 stale_agents = []
 unread_updates = []
 unread_prev = 0
 unread_cursor = 0
+blocking_agents_state = []
 if conn is not None:
     try:
         stale_agents = compute_stale_agents(conn)
         unread_updates, unread_prev, unread_cursor = compute_unread_relevant_updates(conn)
+
+        # Coordination usefulness: include status/plan snapshots for blockers
+        # so callers do not need an extra `agents` round-trip.
+        for a in blocking_agents:
+            if not isinstance(a, str) or not a:
+                continue
+            row = conn.execute(
+                "SELECT status, plan, updated_at_s FROM agent_state WHERE agent_id = ?",
+                (a,),
+            ).fetchone()
+            if row:
+                status, plan, updated_at_s = row[0], row[1], row[2]
+                try:
+                    updated_at_ms = int(updated_at_s) * 1000
+                except Exception:
+                    updated_at_ms = 0
+                blocking_agents_state.append(
+                    {
+                        "agent_id": a,
+                        "status": status,
+                        "plan": plan,
+                        "updated_at_ms": updated_at_ms,
+                    }
+                )
+            else:
+                blocking_agents_state.append(
+                    {"agent_id": a, "status": None, "plan": None, "updated_at_ms": 0}
+                )
     finally:
         conn.close()
+
+action_plan = load_json_env("OUT_ACTION_PLAN", [])
+action_plan_by_agent = load_json_env("OUT_BY_AGENT", {})
+
+# Coordination compliance closure semantics:
+# If unread relevant updates exist, propose a deduped "ack" post per update-author (excluding blockers).
+try:
+    if isinstance(unread_updates, list) and unread_updates:
+        ack_agents = sorted(
+            {
+                u.get("agent_id")
+                for u in unread_updates
+                if isinstance(u, dict)
+                and isinstance(u.get("agent_id"), str)
+                and u.get("agent_id")
+                and u.get("agent_id") != requester
+                and u.get("agent_id") not in set(blocking_agents or [])
+            }
+        )
+        for a in ack_agents:
+            cmd = f"but-engineering-rewrite --agent-id {requester} post \"@{a}: ack: saw your update re {target_path}.\""
+            if action_plan and isinstance(action_plan[-1], str) and " check --path " in action_plan[-1]:
+                action_plan.insert(max(0, len(action_plan) - 1), cmd)
+            else:
+                action_plan.append(cmd)
+        if isinstance(action_plan_by_agent, dict):
+            action_plan_by_agent[requester] = action_plan
+except Exception:
+    # Keep stub behavior resilient; never fail the harness due to "nice to have" plan enrichment.
+    pass
 
 out = {
     "decision": os.environ.get("OUT_DECISION", ""),
     "reason_code": os.environ.get("OUT_REASON", ""),
-    "blocking_agents": load_json_env("OUT_BLOCKERS", []),
+    "blocking_agents": blocking_agents,
+    "blocking_agents_state": blocking_agents_state,
     "blocking_claims": load_json_env("OUT_BLOCKING_CLAIMS", []),
     "blocking_claim_paths_by_agent": load_json_env("OUT_CLAIM_PATHS_BY_AGENT", {}),
-    "action_plan": load_json_env("OUT_ACTION_PLAN", []),
-    "action_plan_by_agent": load_json_env("OUT_BY_AGENT", {}),
+    "action_plan": action_plan,
+    "action_plan_by_agent": action_plan_by_agent,
     "dependency_hints": load_json_env("OUT_HINTS", []),
     "stale_agents": stale_agents,
     "unread_relevant_updates_label": "unread relevant updates since last seen",

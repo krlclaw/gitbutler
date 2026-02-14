@@ -2,6 +2,16 @@
 
 ## 2026-02-14
 
+- Added harness Case 39 to lock in closed-loop coordination for unread updates: when `check --path` surfaces an unread relevant update, it should suggest an explicit `post "@X: ack: ..."` step, and that suggestion must not repeat once the cursor advances: `crates/but-engineering-rewrite/harness/run.sh`, `crates/but-engineering-rewrite/harness/cases/39-ack-unread-updates.md`.
+- Extended the Rust CLI `check` action plan to include a deduped ack step per update-author (excluding blocking agents to avoid double-pinging), keeping the behavior additive and low-noise: `crates/but-engineering-rewrite/src/main.rs`.
+- Updated the harness stub CLI to mirror the same ack-enrichment behavior so harness results are consistent when Rust tooling is unavailable: `crates/but-engineering-rewrite/harness/bin/but-engineering-rewrite`.
+- Kept the semantics anti-spam by relying on the existing unread-cursor mechanism: once an update is surfaced, subsequent `check` calls do not re-suggest the ack for the same message window.
+
+- Added harness Case 38 to lock in a coordination-quality behavior: `check --path` should include the blocking agent's `status`/`plan` snapshot so callers do not need an extra `agents` round-trip when blocked: `crates/but-engineering-rewrite/harness/run.sh`, `crates/but-engineering-rewrite/harness/cases/38-blocking-agent-status-plan.md`.
+- Extended the Rust CLI `check` JSON output with an additive `blocking_agents_state` field (status/plan/updated_at) for each blocking agent: `crates/but-engineering-rewrite/src/main.rs`.
+- Updated the harness stub CLI to emit the same `blocking_agents_state` field so the harness remains consistent when Rust tooling is unavailable: `crates/but-engineering-rewrite/harness/bin/but-engineering-rewrite`.
+- Fixed the Case 38 harness assertion helper script to avoid a Python f-string quoting pitfall (keeps the JSON-shape check readable and portable): `crates/but-engineering-rewrite/harness/run.sh`.
+
 - Added a new coordination-compliance harness family (Cases 35-36) to force closed-loop behavioral dynamics: (1) staleness detection for blocking agents with actionable follow-up, and (2) unread relevant update deltas that do not repeat once “seen”: `crates/but-engineering-rewrite/harness/run.sh`, `crates/but-engineering-rewrite/harness/cases/35-status-plan-ttl-staleness.md`, `crates/but-engineering-rewrite/harness/cases/36-check-unread-relevant-updates-cursor.md`.
 - Extended `check --path` JSON output with additive fields: `stale_agents` (explicit stale indicators + suggested `post` command) and `unread_relevant_updates*` (label, cursor, and update payloads), keeping the core hookless and machine-consumable: `crates/but-engineering-rewrite/src/main.rs`.
 - Added minimal persistent cursor state in SQLite (`agent_cursors`) to track per-agent last-seen message id per check topic (`check_path:<path>`), so a second `check` does not repeat the same relevant transcript items: `crates/but-engineering-rewrite/src/main.rs`.

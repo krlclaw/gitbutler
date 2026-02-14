@@ -249,7 +249,7 @@ fn run() -> Result<(), ()> {
 
             // Minimal, scriptable action plan: a few commands that wrappers can show or run.
             // Keep it intentionally stringly-typed for now to keep the CLI tiny.
-            let action_plan: Vec<String> = if !blocking_agents.is_empty() {
+            let mut action_plan: Vec<String> = if !blocking_agents.is_empty() {
                 let mut plan = Vec::<String>::new();
                 plan.push(format!("but-engineering-rewrite --agent-id {agent_id} read"));
                 for blocker in &blocking_agents {
@@ -280,10 +280,6 @@ fn run() -> Result<(), ()> {
 
             for a in agents {
                 if a == agent_id {
-                    action_plan_by_agent.insert(
-                        a,
-                        Value::from(action_plan.iter().cloned().collect::<Vec<_>>()),
-                    );
                     continue;
                 }
 
@@ -320,6 +316,51 @@ fn run() -> Result<(), ()> {
                 }
             }
 
+            let (unread_relevant_updates, unread_prev_cursor, unread_cursor) =
+                unread_relevant_updates_for_check(&conn, &agent_id, &path, now_ms)?;
+
+            // Coordination compliance closure semantics:
+            // If `check` surfaces an unread relevant update, propose a single explicit "ack" per
+            // update-author (excluding blockers, which already get a ping in the plan).
+            if !unread_relevant_updates.is_empty() {
+                use std::collections::BTreeSet;
+                let blocker_set: HashSet<&str> = blocking_agents.iter().map(|s| s.as_str()).collect();
+
+                let mut ack_agents: BTreeSet<String> = BTreeSet::new();
+                for u in &unread_relevant_updates {
+                    if let Some(a) = u.get("agent_id").and_then(|v| v.as_str()) {
+                        if a == agent_id {
+                            continue;
+                        }
+                        if blocker_set.contains(a) {
+                            continue;
+                        }
+                        ack_agents.insert(a.to_owned());
+                    }
+                }
+
+                for a in ack_agents {
+                    let cmd = format!(
+                        "but-engineering-rewrite --agent-id {agent_id} post \"@{a}: ack: saw your update re {path}.\""
+                    );
+                    // Insert before a trailing re-check if present, to keep the plan "read/ack/check".
+                    if action_plan
+                        .last()
+                        .is_some_and(|s| s.contains(" check --path "))
+                    {
+                        let idx = action_plan.len().saturating_sub(1);
+                        action_plan.insert(idx, cmd);
+                    } else {
+                        action_plan.push(cmd);
+                    }
+                }
+            }
+
+            action_plan_by_agent.insert(
+                agent_id.clone(),
+                Value::from(action_plan.iter().cloned().collect::<Vec<_>>()),
+            );
+
             let dependency_hints = dependency_hints_for_check(&conn, &agent_id)?;
             let stale_agents = stale_agents_for_blockers(
                 &conn,
@@ -329,14 +370,51 @@ fn run() -> Result<(), ()> {
                 now_ms,
             )?;
 
-            let (unread_relevant_updates, unread_prev_cursor, unread_cursor) =
-                unread_relevant_updates_for_check(&conn, &agent_id, &path, now_ms)?;
+            // Coordination usefulness: include the current status/plan of blocking agents
+            // so callers don't need an extra `agents` round-trip when they hit a conflict.
+            let mut blocking_agents_state: Vec<Value> = Vec::new();
+            if !blocking_agents.is_empty() {
+                let mut stmt = conn
+                    .prepare(
+                        "SELECT status, plan, updated_at_ms FROM agent_state WHERE agent_id = ?1",
+                    )
+                    .map_err(|_| ())?;
+                for blocker in &blocking_agents {
+                    let row: Option<(Option<String>, Option<String>, i64)> = stmt
+                        .query_row(params![blocker], |row| {
+                            Ok((
+                                row.get::<_, Option<String>>(0)?,
+                                row.get::<_, Option<String>>(1)?,
+                                row.get::<_, i64>(2)?,
+                            ))
+                        })
+                        .optional()
+                        .map_err(|_| ())?;
+                    if let Some((status, plan, updated_at_ms)) = row {
+                        blocking_agents_state.push(json!({
+                            "agent_id": blocker,
+                            "status": status,
+                            "plan": plan,
+                            "updated_at_ms": updated_at_ms,
+                        }));
+                    } else {
+                        blocking_agents_state.push(json!({
+                            "agent_id": blocker,
+                            "status": Value::Null,
+                            "plan": Value::Null,
+                            "updated_at_ms": 0,
+                        }));
+                    }
+                }
+            }
+
             let out = json!({
                 "decision": decision,
                 "reason_code": reason_code,
                 "blocking_agents": blocking_agents,
                 "blocking_claims": blocking_claims,
                 "blocking_claim_paths_by_agent": Value::Object(blocking_claim_paths_by_agent),
+                "blocking_agents_state": blocking_agents_state,
                 "action_plan": action_plan,
                 "action_plan_by_agent": Value::Object(action_plan_by_agent),
                 "dependency_hints": dependency_hints,

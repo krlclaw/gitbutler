@@ -1389,6 +1389,67 @@ case_37_check_unread_updates_parent_dir_overlap() {
   expect_not_contains "$out_b2" "ERW_CASE37_DIR_NOTE"
 }
 
+case_39_ack_unread_updates_closure_semantics() {
+  bold "Case 39: Ack Unread Updates (Closure + Anti-Spam)"
+  local repo; repo="$(mk_repo)"
+  trap '[[ -n "${repo:-}" ]] && rm -rf "$repo"' RETURN
+
+  local out_a_post out_b1 out_b2
+
+  # If an agent posts a relevant update without taking a claim yet, a checker should
+  # be prompted to explicitly acknowledge it (closed-loop coordination), but only once.
+  out_a_post="$(run_cli "$repo" "A" post "ERW_CASE39_NOTE: I'm likely to touch src/app.txt later today")"
+
+  out_b1="$(run_cli "$repo" "B" check --path src/app.txt)"
+  expect_contains "$out_b1" "\"decision\""
+  expect_contains "$out_b1" "\"allow\""
+  expect_contains "$out_b1" "\"unread_relevant_updates\""
+  expect_contains "$out_b1" "ERW_CASE39_NOTE"
+
+  # Coordination usefulness: suggest an explicit ack to close the loop, not just "read".
+  expect_contains "$out_b1" "\"action_plan\""
+  expect_contains "$out_b1" "--agent-id B post"
+  expect_contains "$out_b1" "@A: ack:"
+  expect_contains "$out_b1" "src/app.txt"
+
+  # Anti-spam: once seen, the ack suggestion should not repeat.
+  out_b2="$(run_cli "$repo" "B" check --path src/app.txt)"
+  expect_not_contains "$out_b2" "@A: ack:"
+  expect_not_contains "$out_b2" "ERW_CASE39_NOTE"
+}
+
+case_38_check_includes_blocking_agent_status_plan_snapshot() {
+  bold "Case 38: Check Includes Blocking Agent Status/Plan Snapshot"
+  local repo; repo="$(mk_repo)"
+  trap '[[ -n "${repo:-}" ]] && rm -rf "$repo"' RETURN
+
+  local out_a_status out_a_plan out_a_claim out_b
+
+  out_a_status="$(run_cli "$repo" "A" status ERW_CASE38_STATUS)"
+  out_a_plan="$(run_cli "$repo" "A" plan ERW_CASE38_PLAN)"
+  out_a_claim="$(run_cli "$repo" "A" claim --path src/app.txt --ttl 15m)"
+
+  out_b="$(run_cli "$repo" "B" check --path src/app.txt)"
+  expect_contains "$out_b" "\"decision\""
+  expect_contains "$out_b" "\"warn\""
+  expect_contains "$out_b" "claimed_by_other"
+  expect_contains "$out_b" "\"blocking_agents_state\""
+
+  # Assert it is machine-readable and contains A's snapshot.
+  python3 -c '
+import json, sys
+v = json.loads(sys.stdin.read())
+xs = v.get("blocking_agents_state")
+assert isinstance(xs, list) and xs, "expected blocking_agents_state list"
+m = {x.get("agent_id"): x for x in xs if isinstance(x, dict)}
+a = m.get("A")
+assert isinstance(a, dict), "expected entry for blocker A"
+assert a.get("status") == "ERW_CASE38_STATUS", "unexpected status: %r" % (a.get("status"),)
+assert a.get("plan") == "ERW_CASE38_PLAN", "unexpected plan: %r" % (a.get("plan"),)
+assert isinstance(a.get("updated_at_ms"), int), "expected updated_at_ms int"
+' <<<"$out_b"
+}
+
 main() {
   ensure_bin
   mk_out_dir
@@ -1453,7 +1514,9 @@ main() {
     case_35_status_plan_ttl_staleness_surfaced
     case_36_check_unread_relevant_updates_cursor_advances
     case_37_check_unread_updates_parent_dir_overlap
-	  )
+    case_39_ack_unread_updates_closure_semantics
+    case_38_check_includes_blocking_agent_status_plan_snapshot
+  )
 
   local overall_failed=0 t
   for ((t = 1; t <= trials; t++)); do
