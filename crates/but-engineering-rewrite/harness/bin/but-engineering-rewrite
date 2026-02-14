@@ -48,6 +48,56 @@ json_escape() {
   printf "%s" "$s"
 }
 
+normalize_path() {
+  # Keep stub behavior aligned with the Rust CLI's harness-focused normalization:
+  # - Drop leading "./"
+  # - Drop trailing "/"
+  # - Collapse "." and ".." segments (avoids false overlaps like "src/../README.md" matching "src/").
+  local p="${1:-}"
+
+  while [[ "$p" == ./* ]]; do
+    p="${p#./}"
+  done
+  while [[ "$p" == */ && "$p" != "/" ]]; do
+    p="${p%/}"
+  done
+
+  local IFS='/'
+  local -a parts=()
+  local -a stack=()
+  read -r -a parts <<<"$p"
+
+  local comp
+  for comp in "${parts[@]}"; do
+    [[ -z "$comp" || "$comp" == "." ]] && continue
+    if [[ "$comp" == ".." ]]; then
+      if [[ ${#stack[@]} -gt 0 ]]; then
+        local last_idx
+        last_idx=$((${#stack[@]} - 1))
+        if [[ "${stack[$last_idx]}" != ".." ]]; then
+          unset "stack[$last_idx]"
+          continue
+        fi
+      fi
+      stack+=("..")
+      continue
+    fi
+    stack+=("$comp")
+  done
+
+  local out=""
+  local i
+  for i in "${!stack[@]}"; do
+    if [[ -z "$out" ]]; then
+      out="${stack[$i]}"
+    else
+      out="$out/${stack[$i]}"
+    fi
+  done
+
+  printf "%s" "$out"
+}
+
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --agent-id)
@@ -99,6 +149,13 @@ CREATE TABLE IF NOT EXISTS messages (
   agent_id TEXT NOT NULL,
   kind TEXT NOT NULL,
   body_json TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS agent_cursors (
+  agent_id TEXT NOT NULL,
+  topic TEXT NOT NULL,
+  last_seen_msg_id INTEGER NOT NULL,
+  updated_at_s INTEGER NOT NULL,
+  PRIMARY KEY(agent_id, topic)
 );
 SQL
 
@@ -430,13 +487,7 @@ if [[ "$subcmd" == "claims" ]]; then
     claims_path_prefix=""
   elif [[ $# -eq 2 && "${1:-}" == "--path-prefix" ]]; then
     claims_path_prefix="${2:-}"
-    # Minimal normalization: trim leading "./" and trailing "/".
-    while [[ "$claims_path_prefix" == ./* ]]; do
-      claims_path_prefix="${claims_path_prefix#./}"
-    done
-    while [[ "$claims_path_prefix" == */ && "$claims_path_prefix" != "/" ]]; do
-      claims_path_prefix="${claims_path_prefix%/}"
-    done
+    claims_path_prefix="$(normalize_path "$claims_path_prefix")"
   else
     json_err "bad_args"
     exit 1
@@ -509,12 +560,7 @@ fi
 # Minimal normalization to match the Rust CLI:
 # - Drop leading "./"
 # - Drop trailing "/"
-while [[ "$path" == ./* ]]; do
-  path="${path#./}"
-done
-while [[ "$path" == */ && "$path" != "/" ]]; do
-  path="${path%/}"
-done
+path="$(normalize_path "$path")"
 
 db_dir=".git/gitbutler"
 db_path="$db_dir/but-engineering-rewrite.db"
@@ -561,6 +607,7 @@ decision=""
 reason_code=""
 blocking_agents="[]"
 blocking_claims="[]"
+blocking_claim_paths_by_agent="{}"
 action_plan="[]"
 action_plan_by_agent="{}"
 if [[ -n "$blockers" ]]; then
@@ -651,6 +698,33 @@ conn.close()
 print(json.dumps(out, separators=(",",":")))
 '
   )"
+
+  # Convenience surface: group blocking claim paths by agent so wrappers can render
+  # per-blocker actionable details without client-side grouping logic.
+  blocking_claim_paths_by_agent="$(
+    OUT_BLOCKING_CLAIMS="$blocking_claims" python3 -c '
+import json, os
+
+raw = (os.environ.get("OUT_BLOCKING_CLAIMS","") or "").strip()
+claims = json.loads(raw) if raw else []
+
+out = {}
+for c in claims:
+    if not isinstance(c, dict):
+        continue
+    a = c.get("agent_id")
+    p = c.get("path")
+    if not isinstance(a, str) or not a:
+        continue
+    if not isinstance(p, str) or not p:
+        continue
+    lst = out.setdefault(a, [])
+    if p not in lst:
+        lst.append(p)
+
+print(json.dumps(out, separators=(",",":")))
+'
+  )"
 else
   decision="allow"
   reason_code="no_conflict"
@@ -681,14 +755,26 @@ agents = [r[0] for r in cur.execute("SELECT agent_id FROM agent_state ORDER BY a
 
 # Pick a representative overlapping claim path per blocker (stable first-seen).
 blocking_claim_path = {}
-rows = cur.execute("SELECT agent_id, path FROM claims WHERE expires_at_s > ? AND agent_id <> ? ORDER BY expires_at_s DESC", (now_s, requester)).fetchall()
-for a, p in rows:
+rows = cur.execute(
+    "SELECT agent_id, path, expires_at_s FROM claims WHERE expires_at_s > ? AND agent_id <> ?",
+    (now_s, requester),
+).fetchall()
+by_agent = {}
+for a, p, exp_s in rows:
     if a not in blockers:
         continue
-    if a in blocking_claim_path:
+    if not overlaps(target_path, p):
         continue
-    if overlaps(target_path, p):
-        blocking_claim_path[a] = p
+    try:
+        exp_i = int(exp_s)
+    except Exception:
+        exp_i = 0
+    best = by_agent.get(a)
+    cand = (len(p), exp_i, p)
+    if best is None or cand > best:
+        by_agent[a] = cand
+for a, (_l, _exp, p) in by_agent.items():
+    blocking_claim_path[a] = p
 
 out = {}
 
@@ -810,8 +896,8 @@ print(json.dumps(hints, separators=(",",":")))
   )"
 fi
 
-OUT_DECISION="$decision" OUT_REASON="$reason_code" OUT_BLOCKERS="$blocking_agents" OUT_BLOCKING_CLAIMS="$blocking_claims" OUT_ACTION_PLAN="$action_plan" OUT_BY_AGENT="${action_plan_by_agent:-}" OUT_HINTS="$dependency_hints" python3 -c '
-import json, os
+OUT_DECISION="$decision" OUT_REASON="$reason_code" OUT_BLOCKERS="$blocking_agents" OUT_BLOCKING_CLAIMS="$blocking_claims" OUT_CLAIM_PATHS_BY_AGENT="$blocking_claim_paths_by_agent" OUT_ACTION_PLAN="$action_plan" OUT_BY_AGENT="${action_plan_by_agent:-}" OUT_HINTS="$dependency_hints" DB_PATH="$db_path" REQUESTER="$agent_id" TARGET_PATH="$path" BLOCKERS="$blockers" python3 -c '
+import json, os, sqlite3, time
 
 def load_json_env(name: str, default):
     raw = (os.environ.get(name, "") or "").strip()
@@ -819,14 +905,164 @@ def load_json_env(name: str, default):
         return default
     return json.loads(raw)
 
+db_path = os.environ.get("DB_PATH","")
+requester = os.environ.get("REQUESTER","")
+target_path = os.environ.get("TARGET_PATH","")
+blockers_txt = os.environ.get("BLOCKERS","") or ""
+blockers = [b for b in blockers_txt.splitlines() if b.strip()]
+
+def coord_stale_seconds() -> int:
+    try:
+        v = int((os.environ.get("COORD_STALE_SECONDS","") or "").strip() or "0")
+        if v >= 0:
+            return v
+    except Exception:
+        pass
+    return 15 * 60
+
+def compute_stale_agents(conn) -> list:
+    thresh_s = coord_stale_seconds()
+    if thresh_s <= 0 or not blockers:
+        return []
+    now_s = int(time.time())
+    out = []
+    for a in blockers:
+        row = conn.execute("SELECT updated_at_s FROM agent_state WHERE agent_id = ?", (a,)).fetchone()
+        if not row:
+            continue
+        try:
+            updated_at_s = int(row[0])
+        except Exception:
+            continue
+        stale_for_s = max(0, now_s - updated_at_s)
+        if stale_for_s < thresh_s:
+            continue
+        out.append({
+            "kind": "stale_agent",
+            "agent_id": a,
+            "updated_at_ms": updated_at_s * 1000,
+            "stale_for_ms": stale_for_s * 1000,
+            "threshold_ms": thresh_s * 1000,
+            "is_stale": True,
+            "suggested_cmd": f"but-engineering-rewrite --agent-id {requester} post \"@{a}: can you update your status and plan for {target_path}? (stale)\"",
+        })
+    return out
+
+def compute_unread_relevant_updates(conn) -> tuple[list, int, int]:
+    # Minimal per-agent per-path cursor.
+    # Relevance heuristic: message JSON contains either the checked path or an overlapping parent directory.
+    # Cursor advancement: advance to the latest seen message id even if none are relevant, so re-checks do not repeat.
+    topic = f"check_path:{target_path}"
+    prev = 0
+    row = conn.execute(
+        "SELECT last_seen_msg_id FROM agent_cursors WHERE agent_id = ? AND topic = ?",
+        (requester, topic),
+    ).fetchone()
+    if row:
+        try:
+            prev = int(row[0])
+        except Exception:
+            prev = 0
+
+    # Avoid single quotes in this script (it is embedded in a single-quoted bash string).
+    needles = []
+    needles.append(target_path)
+    needles.append(f"{target_path}/")
+    needles.append(f"./{target_path}")
+    needles.append(f"./{target_path}/")
+    parts = [p for p in (target_path or "").split("/") if p]
+    # Add all ancestors as potential relevance tokens: "a", "a/", "a/b", "a/b/".
+    for i in range(1, max(0, len(parts) - 0)):
+        if i >= len(parts):
+            break
+        parent = "/".join(parts[:i])
+        if not parent:
+            continue
+        needles.append(parent)
+        needles.append(f"{parent}/")
+        needles.append(f"./{parent}")
+        needles.append(f"./{parent}/")
+
+    rows = conn.execute(
+        "SELECT id, created_at_s, agent_id, kind, body_json FROM messages "
+        "WHERE id > ? AND agent_id <> ? AND kind IN (\"message\",\"discovery\") "
+        "ORDER BY id ASC LIMIT 500",
+        (prev, requester),
+    ).fetchall()
+
+    updates = []
+    max_id = prev
+    for (mid, created_at_s, aid, kind, body_json) in rows:
+        try:
+            mid_i = int(mid)
+        except Exception:
+            continue
+        max_id = max(max_id, mid_i)
+        try:
+            created_ms = int(created_at_s) * 1000
+        except Exception:
+            created_ms = 0
+        try:
+            body = json.loads(body_json)
+        except Exception:
+            body = body_json
+
+        is_relevant = False
+        try:
+            for n in needles:
+                if n and (n in body_json):
+                    is_relevant = True
+                    break
+        except Exception:
+            is_relevant = False
+
+        if is_relevant and len(updates) < 20:
+            updates.append({
+                "id": mid_i,
+                "created_at_ms": created_ms,
+                "agent_id": aid,
+                "kind": kind,
+                "body": body,
+            })
+
+    new = max_id
+    if new != prev:
+        now_s = int(time.time())
+        conn.execute(
+            "INSERT INTO agent_cursors(agent_id, topic, last_seen_msg_id, updated_at_s) VALUES (?, ?, ?, ?) "
+            "ON CONFLICT(agent_id, topic) DO UPDATE SET last_seen_msg_id = excluded.last_seen_msg_id, updated_at_s = excluded.updated_at_s",
+            (requester, topic, new, now_s),
+        )
+        conn.commit()
+
+    return updates, prev, new
+
+conn = sqlite3.connect(db_path) if db_path else None
+stale_agents = []
+unread_updates = []
+unread_prev = 0
+unread_cursor = 0
+if conn is not None:
+    try:
+        stale_agents = compute_stale_agents(conn)
+        unread_updates, unread_prev, unread_cursor = compute_unread_relevant_updates(conn)
+    finally:
+        conn.close()
+
 out = {
     "decision": os.environ.get("OUT_DECISION", ""),
     "reason_code": os.environ.get("OUT_REASON", ""),
     "blocking_agents": load_json_env("OUT_BLOCKERS", []),
     "blocking_claims": load_json_env("OUT_BLOCKING_CLAIMS", []),
+    "blocking_claim_paths_by_agent": load_json_env("OUT_CLAIM_PATHS_BY_AGENT", {}),
     "action_plan": load_json_env("OUT_ACTION_PLAN", []),
     "action_plan_by_agent": load_json_env("OUT_BY_AGENT", {}),
     "dependency_hints": load_json_env("OUT_HINTS", []),
+    "stale_agents": stale_agents,
+    "unread_relevant_updates_label": "unread relevant updates since last seen",
+    "unread_relevant_updates_prev_cursor": unread_prev,
+    "unread_relevant_updates_cursor": unread_cursor,
+    "unread_relevant_updates": unread_updates,
 }
 print(json.dumps(out, separators=(",",":")))
 '

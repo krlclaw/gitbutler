@@ -912,6 +912,44 @@ case_24_release_path_normalization_dot_prefix() {
   expect_contains "$out_b_check" "no_conflict"
 }
 
+case_33_release_path_normalization_trailing_slash() {
+  bold "Case 33: Release Path Normalization (Trailing /)"
+  local repo; repo="$(mk_repo)"
+  trap '[[ -n "${repo:-}" ]] && rm -rf "$repo"' RETURN
+
+  local out_a_claim out_a_release out_b_check
+  # Claim a directory without a trailing slash, then release it with a trailing slash.
+  # Coordination only works if wrappers can safely normalize both spellings.
+  out_a_claim="$(run_cli "$repo" "A" claim --path src --ttl 15m)"
+  out_a_release="$(run_cli "$repo" "A" release --path src/)"
+  out_b_check="$(run_cli "$repo" "B" check --path src/app.txt)"
+
+  expect_contains "$out_a_claim" "\"ok\":true"
+  expect_contains "$out_a_release" "\"ok\":true"
+  expect_contains "$out_b_check" "\"decision\""
+  expect_contains "$out_b_check" "\"allow\""
+  expect_contains "$out_b_check" "no_conflict"
+}
+
+case_34_path_normalization_dotdot_segments() {
+  bold "Case 34: Path Normalization (.. Segments)"
+  local repo; repo="$(mk_repo)"
+  trap '[[ -n "${repo:-}" ]] && rm -rf "$repo"' RETURN
+
+  local out_a_claim out_b_check
+  printf "note\n" >"$repo/notes.txt"
+
+  out_a_claim="$(run_cli "$repo" "A" claim --path src/ --ttl 15m)"
+  # Without collapsing "..", naive prefix overlap would treat this as under "src/" and block incorrectly.
+  out_b_check="$(run_cli "$repo" "B" check --path src/../notes.txt)"
+
+  expect_contains "$out_a_claim" "\"ok\":true"
+  expect_contains "$out_b_check" "\"decision\""
+  expect_contains "$out_b_check" "\"allow\""
+  expect_contains "$out_b_check" "no_conflict"
+  expect_not_contains "$out_b_check" "claimed_by_other"
+}
+
 case_09_channel_messages() {
   bold "Case 09: Channel Messages (post/read transcript)"
   local repo; repo="$(mk_repo)"
@@ -1275,6 +1313,82 @@ case_32_allow_includes_nonblocking_fyi() {
   expect_not_contains "$out_check" "--agent-id A release --path"
 }
 
+case_35_status_plan_ttl_staleness_surfaced() {
+  bold "Case 35: Status/Plan TTL Staleness (Surfaced + Actionable)"
+  local repo; repo="$(mk_repo)"
+  trap '[[ -n "${repo:-}" ]] && rm -rf "$repo"' RETURN
+
+  local out_a_status out_a_plan out_a_claim out_b
+
+  out_a_status="$(run_cli "$repo" "A" status ERW_CASE35_STATUS)"
+  out_a_plan="$(run_cli "$repo" "A" plan ERW_CASE35_PLAN)"
+  out_a_claim="$(run_cli "$repo" "A" claim --path src/app.txt --ttl 15m)"
+
+  # Force staleness quickly for the harness by lowering the threshold.
+  sleep 3
+  out_b="$(COORD_STALE_SECONDS=2 run_cli "$repo" "B" check --path src/app.txt)"
+
+  expect_contains "$out_b" "\"decision\""
+  expect_contains "$out_b" "\"warn\""
+  expect_contains "$out_b" "claimed_by_other"
+
+  # Explicit stale indicator for A.
+  expect_contains "$out_b" "\"stale_agents\""
+  expect_contains "$out_b" "\"agent_id\":\"A\""
+  expect_contains "$out_b" "\"is_stale\":true"
+
+  # Actionable next step: a concrete post template asking for status + plan update.
+  expect_contains "$out_b" "\"suggested_cmd\""
+  expect_contains "$out_b" "post"
+  expect_contains "$out_b" "@A"
+  expect_contains "$out_b" "status"
+  expect_contains "$out_b" "plan"
+}
+
+case_36_check_unread_relevant_updates_cursor_advances() {
+  bold "Case 36: Check Unread Relevant Updates (Cursor Advances)"
+  local repo; repo="$(mk_repo)"
+  trap '[[ -n "${repo:-}" ]] && rm -rf "$repo"' RETURN
+
+  local out_a_post out_b1 out_b2
+
+  out_a_post="$(run_cli "$repo" "A" post "ERW_CASE36_UNREAD: updating src/app.txt soon")"
+
+  out_b1="$(run_cli "$repo" "B" check --path src/app.txt)"
+  expect_contains "$out_b1" "\"decision\""
+  expect_contains "$out_b1" "\"allow\""
+  expect_contains "$out_b1" "\"unread_relevant_updates\""
+  expect_contains "$out_b1" "unread relevant updates since last seen"
+  expect_contains "$out_b1" "ERW_CASE36_UNREAD"
+  expect_contains "$out_b1" "\"agent_id\":\"A\""
+
+  out_b2="$(run_cli "$repo" "B" check --path src/app.txt)"
+  expect_contains "$out_b2" "\"unread_relevant_updates\""
+  expect_not_contains "$out_b2" "ERW_CASE36_UNREAD"
+}
+
+case_37_check_unread_updates_parent_dir_overlap() {
+  bold "Case 37: Check Unread Updates (Parent Dir Overlap)"
+  local repo; repo="$(mk_repo)"
+  trap '[[ -n "${repo:-}" ]] && rm -rf "$repo"' RETURN
+
+  local out_a_post out_b1 out_b2
+
+  # Realistic coordination: agents often talk about directories ("src/") instead of exact files.
+  # Checking a file under that directory should still surface the update as relevant.
+  out_a_post="$(run_cli "$repo" "A" post "ERW_CASE37_DIR_NOTE: I'm going to touch src/ soon")"
+
+  out_b1="$(run_cli "$repo" "B" check --path src/app.txt)"
+  expect_contains "$out_b1" "\"decision\""
+  expect_contains "$out_b1" "\"unread_relevant_updates\""
+  expect_contains "$out_b1" "ERW_CASE37_DIR_NOTE"
+  expect_contains "$out_b1" "\"agent_id\":\"A\""
+
+  out_b2="$(run_cli "$repo" "B" check --path src/app.txt)"
+  expect_contains "$out_b2" "\"unread_relevant_updates\""
+  expect_not_contains "$out_b2" "ERW_CASE37_DIR_NOTE"
+}
+
 main() {
   ensure_bin
   mk_out_dir
@@ -1317,6 +1431,8 @@ main() {
     case_25_path_prefix_overlap_directory_check
     case_23_path_normalization_dot_prefix
     case_24_release_path_normalization_dot_prefix
+    case_33_release_path_normalization_trailing_slash
+    case_34_path_normalization_dotdot_segments
     case_09_channel_messages
     case_16_read_default_transcript
     case_20_message_timestamps
@@ -1331,9 +1447,12 @@ main() {
 	    case_28_multiple_blocking_claims_per_agent
 	    case_29_action_plan_release_most_specific_claim
 	    case_30_blocking_claim_paths_by_agent
-	    case_26_nonblocking_agent_fyi_active_claim
-	    case_27_check_ignores_expired_nonblocking_claim
-	    case_32_allow_includes_nonblocking_fyi
+    case_26_nonblocking_agent_fyi_active_claim
+    case_27_check_ignores_expired_nonblocking_claim
+    case_32_allow_includes_nonblocking_fyi
+    case_35_status_plan_ttl_staleness_surfaced
+    case_36_check_unread_relevant_updates_cursor_advances
+    case_37_check_unread_updates_parent_dir_overlap
 	  )
 
   local overall_failed=0 t

@@ -148,7 +148,7 @@ fn run() -> Result<(), ()> {
             let now_ms = now_unix_ms()?;
             let mut stmt = conn
                 .prepare(
-                    "SELECT agent_id, path FROM claims \
+                    "SELECT agent_id, path, expires_at_ms FROM claims \
                      WHERE agent_id <> ?2 AND expires_at_ms > ?3 \
                        AND (path = ?1 OR ?1 LIKE path || '/%' OR path LIKE ?1 || '/%') \
                      ORDER BY expires_at_ms DESC \
@@ -157,22 +157,41 @@ fn run() -> Result<(), ()> {
                 .map_err(|_| ())?;
             let blocking_claims_raw = stmt
                 .query_map(params![path, agent_id, now_ms], |row| {
-                    Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, i64>(2)?,
+                    ))
                 })
                 .map_err(|_| ())?
                 .filter_map(|r| r.ok())
-                .collect::<Vec<(String, String)>>();
+                .collect::<Vec<(String, String, i64)>>();
             let mut seen = HashSet::<String>::new();
             let mut blocking_agents = Vec::<String>::new();
-            let mut blocking_claim_path_by_agent = std::collections::BTreeMap::<String, String>::new();
-            for (blocker, claim_path) in blocking_claims_raw {
+            // Keep a deterministic, actionable representative claim path per blocker:
+            // prefer the most specific (longest) overlapping claim; tie-break on expiry then path.
+            let mut blocking_claim_path_by_agent =
+                std::collections::BTreeMap::<String, (String, i64)>::new();
+            for (blocker, claim_path, expires_at_ms) in blocking_claims_raw {
                 if seen.insert(blocker.clone()) {
                     blocking_agents.push(blocker.clone());
                 }
-                // Keep a stable representative claim path per blocker for actionability.
-                blocking_claim_path_by_agent
-                    .entry(blocker)
-                    .or_insert(claim_path);
+                match blocking_claim_path_by_agent.get_mut(&blocker) {
+                    None => {
+                        blocking_claim_path_by_agent
+                            .insert(blocker, (claim_path, expires_at_ms));
+                    }
+                    Some((best_path, best_exp)) => {
+                        let better = claim_path.len() > best_path.len()
+                            || (claim_path.len() == best_path.len()
+                                && (expires_at_ms > *best_exp
+                                    || (expires_at_ms == *best_exp && claim_path < *best_path)));
+                        if better {
+                            *best_path = claim_path;
+                            *best_exp = expires_at_ms;
+                        }
+                    }
+                }
             }
             // Preserve the old low-noise behavior: cap the list.
             if blocking_agents.len() > 5 {
@@ -184,6 +203,7 @@ fn run() -> Result<(), ()> {
             // Expose all overlapping claim paths per blocker for actionable coordination.
             // This is intentionally redundant with `blocking_agents`: consumers can show both.
             let mut blocking_claims: Vec<Value> = Vec::new();
+            let mut blocking_claim_paths_by_agent = serde_json::Map::new();
             if !blocking_agents.is_empty() {
                 let mut stmt_blocking = conn
                     .prepare(
@@ -195,6 +215,7 @@ fn run() -> Result<(), ()> {
                     )
                     .map_err(|_| ())?;
                 for blocker in &blocking_agents {
+                    let mut paths_for_blocker: Vec<Value> = Vec::new();
                     let rows = stmt_blocking
                         .query_map(params![blocker, now_ms, path], |row| {
                             Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
@@ -202,11 +223,16 @@ fn run() -> Result<(), ()> {
                         .map_err(|_| ())?;
                     for r in rows {
                         let (p, expires_at_ms) = r.map_err(|_| ())?;
+                        paths_for_blocker.push(Value::String(p.clone()));
                         blocking_claims.push(json!({
                             "agent_id": blocker,
                             "path": p,
                             "expires_at_ms": expires_at_ms,
                         }));
+                    }
+                    if !paths_for_blocker.is_empty() {
+                        blocking_claim_paths_by_agent
+                            .insert(blocker.to_owned(), Value::from(paths_for_blocker));
                     }
                 }
             }
@@ -261,7 +287,7 @@ fn run() -> Result<(), ()> {
                     continue;
                 }
 
-                if let Some(claim_path) = blocking_claim_path_by_agent.get(&a) {
+                if let Some((claim_path, _)) = blocking_claim_path_by_agent.get(&a) {
                     action_plan_by_agent.insert(
                         a.clone(),
                         Value::from(vec![
@@ -291,25 +317,34 @@ fn run() -> Result<(), ()> {
                             "but-engineering-rewrite --agent-id {a} post \"@{agent_id}: FYI I'm working on {p}; not touching {path}.\""
                         )]),
                     );
-                } else {
-                    action_plan_by_agent.insert(
-                        a.clone(),
-                        Value::from(vec![format!(
-                            "but-engineering-rewrite --agent-id {a} post \"@{agent_id}: I have no active claims; I won't touch {path}.\""
-                        )]),
-                    );
                 }
             }
 
             let dependency_hints = dependency_hints_for_check(&conn, &agent_id)?;
+            let stale_agents = stale_agents_for_blockers(
+                &conn,
+                &agent_id,
+                &blocking_agents,
+                &path,
+                now_ms,
+            )?;
+
+            let (unread_relevant_updates, unread_prev_cursor, unread_cursor) =
+                unread_relevant_updates_for_check(&conn, &agent_id, &path, now_ms)?;
             let out = json!({
                 "decision": decision,
                 "reason_code": reason_code,
                 "blocking_agents": blocking_agents,
                 "blocking_claims": blocking_claims,
+                "blocking_claim_paths_by_agent": Value::Object(blocking_claim_paths_by_agent),
                 "action_plan": action_plan,
                 "action_plan_by_agent": Value::Object(action_plan_by_agent),
                 "dependency_hints": dependency_hints,
+                "stale_agents": stale_agents,
+                "unread_relevant_updates_label": "unread relevant updates since last seen",
+                "unread_relevant_updates_prev_cursor": unread_prev_cursor,
+                "unread_relevant_updates_cursor": unread_cursor,
+                "unread_relevant_updates": unread_relevant_updates,
             });
             print_json(&out.to_string());
         }
@@ -608,6 +643,8 @@ fn normalize_claim_path(s: &str) -> String {
     // Minimal, string-based normalization for harness use:
     // - Drop a leading "./"
     // - Drop trailing "/" (so claiming "src/" and checking "src/app.txt" overlaps cleanly)
+    // - Collapse "." and ".." segments to avoid false positives like "src/../README.md"
+    //   being treated as overlapping "src/".
     let mut out = s.trim().to_owned();
     while out.starts_with("./") {
         out = out.trim_start_matches("./").to_owned();
@@ -615,7 +652,26 @@ fn normalize_claim_path(s: &str) -> String {
     while out.ends_with('/') && out != "/" {
         out.pop();
     }
-    out
+
+    let mut parts: Vec<&str> = Vec::new();
+    for p in out.split('/') {
+        if p.is_empty() || p == "." {
+            continue;
+        }
+        if p == ".." {
+            if let Some(last) = parts.last() {
+                if *last != ".." {
+                    parts.pop();
+                    continue;
+                }
+            }
+            parts.push("..");
+            continue;
+        }
+        parts.push(p);
+    }
+
+    parts.join("/")
 }
 
 fn load_discoveries_and_next_steps(
@@ -891,10 +947,176 @@ fn init_db(conn: &Connection) -> Result<(), ()> {
             kind TEXT NOT NULL,\
             body_json TEXT NOT NULL\
          );\
+         CREATE TABLE IF NOT EXISTS agent_cursors (\
+            agent_id TEXT NOT NULL,\
+            topic TEXT NOT NULL,\
+            last_seen_msg_id INTEGER NOT NULL,\
+            updated_at_ms INTEGER NOT NULL,\
+            PRIMARY KEY(agent_id, topic)\
+         );\
         ",
     )
     .map_err(|_| ())?;
     Ok(())
+}
+
+fn coord_stale_threshold_ms() -> i64 {
+    // Harness-controlled staleness threshold for coordination surfaces.
+    // Keep a sensible default so wrappers can opt in without configuration.
+    let default_s: i64 = 15 * 60;
+    let s = std::env::var("COORD_STALE_SECONDS")
+        .ok()
+        .and_then(|v| v.trim().parse::<i64>().ok())
+        .filter(|v| *v >= 0)
+        .unwrap_or(default_s);
+    s.saturating_mul(1000)
+}
+
+fn stale_agents_for_blockers(
+    conn: &Connection,
+    requester_agent_id: &str,
+    blockers: &[String],
+    path: &str,
+    now_ms: i64,
+) -> Result<Vec<Value>, ()> {
+    let thresh_ms = coord_stale_threshold_ms();
+    if thresh_ms <= 0 || blockers.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let mut out: Vec<Value> = Vec::new();
+    for a in blockers {
+        let updated_at_ms: Option<i64> = conn
+            .query_row(
+                "SELECT updated_at_ms FROM agent_state WHERE agent_id = ?1",
+                params![a],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(|_| ())?;
+        let Some(updated_at_ms) = updated_at_ms else {
+            continue;
+        };
+
+        let stale_for_ms = now_ms.saturating_sub(updated_at_ms);
+        let is_stale = stale_for_ms >= thresh_ms;
+        if !is_stale {
+            continue;
+        }
+
+        let suggested_cmd = format!(
+            "but-engineering-rewrite --agent-id {requester_agent_id} post \"@{a}: can you update your status and plan for {path}? (stale)\""
+        );
+
+        out.push(json!({
+            "kind": "stale_agent",
+            "agent_id": a,
+            "updated_at_ms": updated_at_ms,
+            "stale_for_ms": stale_for_ms,
+            "threshold_ms": thresh_ms,
+            "is_stale": true,
+            "suggested_cmd": suggested_cmd,
+        }));
+    }
+
+    Ok(out)
+}
+
+fn unread_relevant_updates_for_check(
+    conn: &Connection,
+    agent_id: &str,
+    path: &str,
+    now_ms: i64,
+) -> Result<(Vec<Value>, i64, i64), ()> {
+    let topic = format!("check_path:{path}");
+
+    let prev_cursor: i64 = conn
+        .query_row(
+            "SELECT last_seen_msg_id FROM agent_cursors WHERE agent_id = ?1 AND topic = ?2",
+            params![agent_id, topic],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(|_| ())?
+        .unwrap_or(0);
+
+    // Heuristic relevance: surface updates that mention either the exact path being checked
+    // or an overlapping parent directory (any ancestor). This matches real-world coordination
+    // where agents often talk about directories ("src/") rather than exact files ("src/app.txt").
+    let mut needles: Vec<String> = Vec::new();
+    needles.push(path.to_owned());
+    needles.push(format!("{path}/"));
+    needles.push(format!("./{path}"));
+    needles.push(format!("./{path}/"));
+    // Add all ancestors: a/b/c.txt -> a/b and a
+    let mut cur = path;
+    while let Some((parent, _base)) = cur.rsplit_once('/') {
+        if parent.is_empty() {
+            break;
+        }
+        needles.push(parent.to_owned());
+        needles.push(format!("{parent}/"));
+        needles.push(format!("./{parent}"));
+        needles.push(format!("./{parent}/"));
+        cur = parent;
+    }
+
+    let mut stmt = conn
+        .prepare(
+            "SELECT id, created_at_ms, agent_id, kind, body_json FROM messages \
+             WHERE id > ?1 AND agent_id <> ?2 AND kind IN ('message','discovery') \
+             ORDER BY id ASC \
+             LIMIT 500",
+        )
+        .map_err(|_| ())?;
+
+    let rows = stmt
+        .query_map(params![prev_cursor, agent_id], |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, i64>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, String>(3)?,
+                row.get::<_, String>(4)?,
+            ))
+        })
+        .map_err(|_| ())?;
+
+    let mut updates: Vec<Value> = Vec::new();
+    let mut max_id = prev_cursor;
+    for r in rows {
+        let (id, created_at_ms, from_agent, kind, body_json) = r.map_err(|_| ())?;
+        max_id = max_id.max(id);
+
+        if !needles.iter().any(|n| body_json.contains(n)) {
+            continue;
+        }
+        if updates.len() >= 20 {
+            continue;
+        }
+
+        let body_v: Value =
+            serde_json::from_str(&body_json).unwrap_or(Value::String(body_json.clone()));
+        updates.push(json!({
+            "id": id,
+            "created_at_ms": created_at_ms,
+            "agent_id": from_agent,
+            "kind": kind,
+            "body": body_v,
+        }));
+    }
+
+    let new_cursor = max_id;
+    if new_cursor != prev_cursor {
+        conn.execute(
+            "INSERT INTO agent_cursors(agent_id, topic, last_seen_msg_id, updated_at_ms) VALUES (?1, ?2, ?3, ?4) \
+             ON CONFLICT(agent_id, topic) DO UPDATE SET last_seen_msg_id = excluded.last_seen_msg_id, updated_at_ms = excluded.updated_at_ms",
+            params![agent_id, topic, new_cursor, now_ms],
+        )
+        .map_err(|_| ())?;
+    }
+
+    Ok((updates, prev_cursor, new_cursor))
 }
 
 fn ensure_agent_row(conn: &Connection, agent_id: &str, now_ms: i64) -> Result<(), ()> {

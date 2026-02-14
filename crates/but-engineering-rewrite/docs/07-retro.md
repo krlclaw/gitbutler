@@ -2,6 +2,41 @@
 
 ## 2026-02-14
 
+- Added a new coordination-compliance harness family (Cases 35-36) to force closed-loop behavioral dynamics: (1) staleness detection for blocking agents with actionable follow-up, and (2) unread relevant update deltas that do not repeat once “seen”: `crates/but-engineering-rewrite/harness/run.sh`, `crates/but-engineering-rewrite/harness/cases/35-status-plan-ttl-staleness.md`, `crates/but-engineering-rewrite/harness/cases/36-check-unread-relevant-updates-cursor.md`.
+- Extended `check --path` JSON output with additive fields: `stale_agents` (explicit stale indicators + suggested `post` command) and `unread_relevant_updates*` (label, cursor, and update payloads), keeping the core hookless and machine-consumable: `crates/but-engineering-rewrite/src/main.rs`.
+- Added minimal persistent cursor state in SQLite (`agent_cursors`) to track per-agent last-seen message id per check topic (`check_path:<path>`), so a second `check` does not repeat the same relevant transcript items: `crates/but-engineering-rewrite/src/main.rs`.
+- Added `COORD_STALE_SECONDS` env var to let the harness force quick staleness in tests (2s) without changing defaults for real use: `crates/but-engineering-rewrite/src/main.rs`, `crates/but-engineering-rewrite/harness/run.sh`.
+- Updated the harness stub CLI to mirror the new DB table and `check` JSON fields so the harness stays consistent even when Rust tooling is unavailable: `crates/but-engineering-rewrite/harness/bin/but-engineering-rewrite`.
+- Added harness Case 37 to lock in “directory mention” relevance: if an agent posts about `src/`, a `check --path src/app.txt` should surface that unread note as relevant: `crates/but-engineering-rewrite/harness/run.sh`, `crates/but-engineering-rewrite/harness/cases/37-check-unread-updates-parent-dir-overlap.md`.
+- Updated unread-update relevance matching to treat any ancestor directory as overlapping (not only exact file path), matching how humans coordinate in practice: `crates/but-engineering-rewrite/src/main.rs`, `crates/but-engineering-rewrite/harness/bin/but-engineering-rewrite`.
+- Made the unread cursor advance based on the max seen message id (even if none are relevant) so repeated `check` calls do not re-scan the same transcript window: `crates/but-engineering-rewrite/src/main.rs`, `crates/but-engineering-rewrite/harness/bin/but-engineering-rewrite`.
+
+- Added harness Case 34 to ensure `check --path` collapses `..` segments (e.g. `src/../notes.txt`), preventing false-positive claim overlaps that would otherwise create needless coordination churn: `crates/but-engineering-rewrite/harness/run.sh`, `crates/but-engineering-rewrite/harness/cases/34-path-normalization-dotdot.md`.
+- Extended the Rust CLI path normalizer to collapse `.`/`..` segments in a filesystem-free way (string-only stack), keeping overlap checks stable for common wrapper-produced relative paths: `crates/but-engineering-rewrite/src/main.rs`.
+- Updated the harness stub CLI to use the same `.`/`..` collapsing normalization so behavior stays aligned when Rust tooling is unavailable: `crates/but-engineering-rewrite/harness/bin/but-engineering-rewrite`.
+- Kept the scenario narrowly focused on coordination correctness (avoiding an incorrect `claimed_by_other` decision), without attempting full canonicalization or filesystem resolution.
+
+- Added harness Case 33 to ensure `release --path` normalizes trailing slashes (e.g. releasing `src/` should clear a claim stored as `src`), preventing stale leases due to common path spelling differences: `crates/but-engineering-rewrite/harness/run.sh`, `crates/but-engineering-rewrite/harness/cases/33-release-path-normalization-trailing-slash.md`.
+- Kept the scenario focused on coordination ergonomics for wrappers: a successful release must immediately unblock `check` for another agent on a descendant path.
+- No CLI changes were required for this iteration; existing path normalization already trims trailing `/` consistently for `claim` and `release`: `crates/but-engineering-rewrite/src/main.rs`.
+
+- Added harness Case 32 to lock in a coordination-quality behavior: even when `check` returns `allow`, it should still emit low-noise FYI steps for other agents with active (non-overlapping) claims, so wrappers can show “who’s working on what” without forcing a conflict: `crates/but-engineering-rewrite/harness/run.sh`, `crates/but-engineering-rewrite/harness/cases/32-allow-includes-nonblocking-fyi.md`.
+- Asserted the FYI entry does not suggest releasing unrelated claims (avoid churn), while still mentioning both the other agent’s active claim path and the checked path for clarity: `crates/but-engineering-rewrite/harness/run.sh`.
+- No CLI changes were required for this iteration; the existing `action_plan_by_agent` behavior already emits FYI steps for active non-blocking claims even on `allow`: `crates/but-engineering-rewrite/src/main.rs`.
+
+- Added harness Case 31 to ensure `claims --path-prefix` normalizes common spellings like a leading `./` (matching `check`/`release` path normalization), keeping coordination wrappers from needing bespoke path cleanup: `crates/but-engineering-rewrite/harness/run.sh`, `crates/but-engineering-rewrite/harness/cases/31-claims-filter-path-normalization-dot-prefix.md`.
+- Confirmed the Rust CLI already normalizes `claims --path-prefix` during arg parsing, so the new scenario passed without further implementation work: `crates/but-engineering-rewrite/src/main.rs`.
+- This case specifically targets the filtered coordination view (not conflict detection) to avoid duplicating the existing `check`/`release` path-normalization cases while still locking in wrapper ergonomics.
+
+- Added harness Case 30 to lock in a more coordination-useful `check` surface: `blocking_claim_paths_by_agent` groups overlapping claim paths per blocker (most-specific first), so wrappers don’t need to regroup the flat list client-side: `crates/but-engineering-rewrite/harness/run.sh`, `crates/but-engineering-rewrite/harness/cases/30-blocking-claim-paths-by-agent.md`.
+- Extended the Rust CLI `check` output to include `blocking_claim_paths_by_agent` alongside the existing `blocking_claims` list: `crates/but-engineering-rewrite/src/main.rs`.
+- Extended the harness stub CLI to emit `blocking_claim_paths_by_agent` as well, keeping behavior aligned when Rust tooling is unavailable: `crates/but-engineering-rewrite/harness/bin/but-engineering-rewrite`.
+- Kept the scenario realistic by covering the common “directory + file claim by the same blocker” case, and asserting stable ordering and dedupe (most-specific first): `crates/but-engineering-rewrite/harness/run.sh`.
+
+- Added harness Case 29 to make `check` more coordination-useful when a blocker holds multiple overlapping claims: the per-agent plan should suggest releasing the most specific claim first (avoid releasing a broad directory claim if a file claim would unblock): `crates/but-engineering-rewrite/harness/run.sh`, `crates/but-engineering-rewrite/harness/cases/29-action-plan-release-most-specific.md`.
+- Updated the stub CLI’s `action_plan_by_agent` to choose the most-specific overlapping claim path per blocker (longest path; tie-break on expiry) so suggested releases are low-churn: `crates/but-engineering-rewrite/harness/bin/but-engineering-rewrite`.
+- Updated the Rust CLI to mirror this behavior, and to avoid emitting `action_plan_by_agent` entries for agents with no active claims (reduces noise and matches existing harness expectations): `crates/but-engineering-rewrite/src/main.rs`.
+
 - Added harness Case 28 to keep `check` conflict output actionable when a blocker holds multiple overlapping claims (directory + file): `crates/but-engineering-rewrite/harness/run.sh`, `crates/but-engineering-rewrite/harness/cases/28-multiple-blocking-claims-per-agent.md`.
 - Updated the stub CLI `blocking_claims` emission to include all overlapping claim paths per blocking agent (deduped), not just a single "best" path: `crates/but-engineering-rewrite/harness/bin/but-engineering-rewrite`.
 - Mirrored the `blocking_claims` surface in the Rust CLI so behavior stays aligned when Rust tooling is available: `crates/but-engineering-rewrite/src/main.rs`.
