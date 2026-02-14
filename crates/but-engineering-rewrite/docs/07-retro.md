@@ -218,6 +218,13 @@
 ### (b) What Was Hard
 - Getting a robust harness assertion for "status/plan cleared" without JSON parsing in bash; the case asserts the previous values are no longer present in `agents` output instead of matching nested structure.
 
+## 2026-02-14 (Case 19)
+
+- Added harness Case 19 to ensure `status --clear` and `plan --clear` exist and prevent stale coordination signals: `crates/but-engineering-rewrite/harness/run.sh`, `crates/but-engineering-rewrite/harness/cases/19-clear-status-plan.md`.
+- Asserted clearing is field-scoped (clearing status preserves plan) and that the change is visible via `agents`.
+- Kept the change harness-only; both implementations already support `--clear`, so no product code changes were needed this iteration.
+- Reinforced a coordination invariant: stale status/plan is actively harmful, so explicit clearing must be first-class and easy.
+
 ### (c) Next Step
 - Decide whether `done` should support `--no-post` and/or `--release --path ...` variants, and whether completion messages should be a first-class kind (e.g. `kind: done`) rather than a plain channel message.
 
