@@ -22,7 +22,7 @@ REPLAY_FAILED=0
 declare -a REPLAY_LINES=()
 
 bold() { printf "\033[1m%s\033[0m\n" "$*"; }
-fail() { printf "FAIL: %s\n" "$*" >&2; return 1; }
+fail() { HARNESS_CASE_FAILED=1; printf "FAIL: %s\n" "$*" >&2; return 1; }
 
 now_ms() {
   python3 -c 'import time; print(int(time.time()*1000))'
@@ -1105,6 +1105,23 @@ case_14_claims_path_prefix_filter() {
   expect_not_contains "$out_filtered" "\"path\":\"notes.txt\""
 }
 
+case_31_claims_filter_path_normalization_dot_prefix() {
+  bold "Case 31: Claims Filter (Path Normalization: Leading ./)"
+  local repo; repo="$(mk_repo)"
+  trap '[[ -n "${repo:-}" ]] && rm -rf "$repo"' RETURN
+
+  local out_a_dir out_c_file out_filtered
+  out_a_dir="$(run_cli "$repo" "A" claim --path src/ --ttl 15m)"
+  out_c_file="$(run_cli "$repo" "C" claim --path src/app.txt --ttl 15m)"
+
+  # Filtering should normalize common "./" spellings, just like `check`/`release`.
+  out_filtered="$(run_cli "$repo" "B" claims --path-prefix ./src/app.txt)"
+  expect_contains "$out_filtered" "\"ok\":true"
+  expect_contains "$out_filtered" "\"claims\""
+  expect_contains "$out_filtered" "\"path\":\"src\""
+  expect_contains "$out_filtered" "\"path\":\"src/app.txt\""
+}
+
 case_22_check_includes_blocking_claim_paths() {
   bold "Case 22: Check Includes Blocking Claim Paths"
   local repo; repo="$(mk_repo)"
@@ -1144,6 +1161,56 @@ case_28_multiple_blocking_claims_per_agent() {
   expect_contains "$out_check" "\"agent_id\":\"A\""
   expect_contains "$out_check" "\"path\":\"src\""
   expect_contains "$out_check" "\"path\":\"src/app.txt\""
+}
+
+case_29_action_plan_release_most_specific_claim() {
+  bold "Case 29: Action Plan Releases Most Specific Claim"
+  local repo; repo="$(mk_repo)"
+  trap '[[ -n "${repo:-}" ]] && rm -rf "$repo"' RETURN
+
+  local out_a_dir out_a_file out_check
+  out_a_dir="$(run_cli "$repo" "A" claim --path src/ --ttl 15m)"
+  out_a_file="$(run_cli "$repo" "A" claim --path src/app.txt --ttl 15m)"
+  out_check="$(run_cli "$repo" "B" check --path src/app.txt)"
+
+  expect_contains "$out_check" "\"decision\""
+  expect_contains "$out_check" "\"warn\""
+  expect_contains "$out_check" "\"action_plan_by_agent\""
+
+  # Coordination usefulness: when a blocker has multiple overlapping claims, prefer releasing
+  # the most specific (least disruptive) claim path.
+  expect_contains "$out_check" "--agent-id A release --path src/app.txt"
+  expect_not_contains "$out_check" "--agent-id A release --path src\""
+}
+
+case_30_blocking_claim_paths_by_agent() {
+  bold "Case 30: Blocking Claim Paths By Agent (Mapping)"
+  local repo; repo="$(mk_repo)"
+  trap '[[ -n "${repo:-}" ]] && rm -rf "$repo"' RETURN
+
+  local out_a_dir out_a_file out_check
+  out_a_dir="$(run_cli "$repo" "A" claim --path src/ --ttl 15m)"
+  out_a_file="$(run_cli "$repo" "A" claim --path src/app.txt --ttl 15m)"
+  out_check="$(run_cli "$repo" "B" check --path src/app.txt)"
+
+  expect_contains "$out_check" "\"decision\""
+  expect_contains "$out_check" "\"warn\""
+  expect_contains "$out_check" "\"blocking_agents\""
+  expect_contains "$out_check" "\"A\""
+  expect_contains "$out_check" "\"blocking_claim_paths_by_agent\""
+
+  python3 -c '
+import json, sys
+
+v = json.loads(sys.stdin.read())
+m = v.get("blocking_claim_paths_by_agent")
+assert isinstance(m, dict), "expected blocking_claim_paths_by_agent object"
+paths = m.get("A")
+assert isinstance(paths, list) and paths, "expected non-empty paths list for blocker A"
+assert paths[0] == "src/app.txt", f"expected most specific path first; got {paths}"
+assert "src" in paths, f"expected directory claim path present (normalized trailing slash); got {paths}"
+assert len(paths) == len(set(paths)), f"expected deduped claim paths; got {paths}"
+' <<<"$out_check"
 }
 
 case_26_nonblocking_agent_fyi_active_claim() {
@@ -1187,6 +1254,25 @@ case_27_check_ignores_expired_nonblocking_claim() {
   # Coordination usefulness: don't surface stale FYI steps for expired, non-blocking claims.
   expect_not_contains "$out_check" "--agent-id C"
   expect_not_contains "$out_check" "src/other.txt"
+}
+
+case_32_allow_includes_nonblocking_fyi() {
+  bold "Case 32: Allow Still Includes Non-Blocking FYI"
+  local repo; repo="$(mk_repo)"
+  trap '[[ -n "${repo:-}" ]] && rm -rf "$repo"' RETURN
+
+  local out_a out_check
+  out_a="$(run_cli "$repo" "A" claim --path docs/readme.md --ttl 15m)"
+  out_check="$(run_cli "$repo" "B" check --path src/app.txt)"
+
+  # Even when not blocked, `check` should still provide a low-noise FYI step for other agents
+  # with active claims (helps avoid duplicated work without forcing unnecessary releases).
+  expect_contains "$out_check" "\"decision\""
+  expect_contains "$out_check" "\"allow\""
+  expect_contains "$out_check" "\"action_plan_by_agent\""
+  expect_contains "$out_check" "--agent-id A"
+  expect_contains "$out_check" "FYI I am working on docs/readme.md; not touching src/app.txt."
+  expect_not_contains "$out_check" "--agent-id A release --path"
 }
 
 main() {
@@ -1240,10 +1326,14 @@ main() {
     case_13_agents_status_plan
 	    case_19_clear_status_plan
 	    case_14_claims_path_prefix_filter
+	    case_31_claims_filter_path_normalization_dot_prefix
 	    case_22_check_includes_blocking_claim_paths
 	    case_28_multiple_blocking_claims_per_agent
+	    case_29_action_plan_release_most_specific_claim
+	    case_30_blocking_claim_paths_by_agent
 	    case_26_nonblocking_agent_fyi_active_claim
 	    case_27_check_ignores_expired_nonblocking_claim
+	    case_32_allow_includes_nonblocking_fyi
 	  )
 
   local overall_failed=0 t
@@ -1254,7 +1344,11 @@ main() {
     local c
     for c in "${cases[@]}"; do
       CURRENT_CASE="$c"
-      "$c" || trial_failed=1
+      HARNESS_CASE_FAILED=0
+      "$c" || true
+      if [[ "$HARNESS_CASE_FAILED" -ne 0 ]]; then
+        trial_failed=1
+      fi
     done
 
     if [[ "$trial_failed" -ne 0 ]]; then
