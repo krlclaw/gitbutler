@@ -661,24 +661,20 @@ fn run() -> Result<(), ()> {
                 .map_err(|_| ())?
             };
 
+            fn map_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<(String, String, i64)> {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, i64>(2)?,
+                ))
+            }
+
             let rows = if let Some(prefix) = &path_prefix {
-                stmt.query_map(params![now_ms, prefix], |row| {
-                    Ok((
-                        row.get::<_, String>(0)?,
-                        row.get::<_, String>(1)?,
-                        row.get::<_, i64>(2)?,
-                    ))
-                })
-                .map_err(|_| ())?
+                stmt.query_map(params![now_ms, prefix], map_row)
+                    .map_err(|_| ())?
             } else {
-                stmt.query_map(params![now_ms], |row| {
-                    Ok((
-                        row.get::<_, String>(0)?,
-                        row.get::<_, String>(1)?,
-                        row.get::<_, i64>(2)?,
-                    ))
-                })
-                .map_err(|_| ())?
+                stmt.query_map(params![now_ms], map_row)
+                    .map_err(|_| ())?
             };
 
             let mut claims: Vec<Value> = Vec::new();

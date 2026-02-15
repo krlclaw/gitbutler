@@ -8,6 +8,13 @@ PROMPTS_DIR="$E2E_DIR/prompts"
 # Ensure non-interactive shells can find tool CLIs (Homebrew + user-local).
 export PATH="/opt/homebrew/bin:/usr/local/bin:$HOME/.local/bin:$PATH"
 
+# Rustup shims may be missing on some machines; fall back to toolchain bins.
+for d in "$HOME/.rustup/toolchains/"*/bin; do
+  if [ -d "$d" ]; then
+    export PATH="$d:$PATH"
+  fi
+done
+
 # Real CLI (preferred). For local dev machines without Rust, set BIN=... to a prebuilt binary.
 BIN="${BIN:-$ROOT/target/debug/but-engineering-rewrite}"
 STUB_BIN="$ROOT/crates/but-engineering-rewrite/harness/bin/but-engineering-rewrite"
@@ -26,7 +33,7 @@ Usage: crates/but-engineering-rewrite/e2e/run.sh [options]
 
 Options:
   --scenario <smoke|collision|discovery|triangle>
-  --provider <codex|claude|both>  (both only supported for smoke)
+  --provider <codex|claude|both>  (both only supported for smoke unless --no-agents)
   --timebox-s <seconds>
   --out-dir <path>     Write outputs to this directory (default: e2e/out/<ts>.<pid>)
   --allow-stub        Allow using the harness stub binary if the real binary isn't available.
@@ -346,6 +353,15 @@ meta_patch_repo() {
   python3 - "$META_PATH" "$OUT_DIR" "$TRACE_PATH" "$repo" "$KEEP_REPO" <<'PY'
 import json, sys
 
+
+def load_first_json(text: str):
+    # Tolerant parser: if stdout contains extra noise, parse the first JSON value.
+    import json
+    dec = json.JSONDecoder()
+    text = text.lstrip()
+    obj, idx = dec.raw_decode(text)
+    return obj
+
 meta_path = sys.argv[1]
 out_dir = sys.argv[2]
 trace_path = sys.argv[3]
@@ -383,9 +399,19 @@ scenario_smoke() {
   python3 - "$OUT_DIR/cli.check.B.stdout" <<'PY'
 import json, sys
 
+
+def load_first_json(text: str):
+    # Tolerant parser: if stdout contains extra noise, parse the first JSON value.
+    import json
+    dec = json.JSONDecoder()
+    text = text.lstrip()
+    obj, idx = dec.raw_decode(text)
+    return obj
+
 path = sys.argv[1]
 with open(path, "r", encoding="utf-8") as f:
-    v = json.loads(f.read())
+    s = f.read()
+v = load_first_json(s)
 
 if v.get("decision") != "warn":
     raise SystemExit(f"expected decision=warn, got {v.get('decision')!r}")
@@ -453,9 +479,19 @@ scenario_collision() {
   python3 - "$OUT_DIR/cli.read.messages.stdout" <<'PY'
 import json, sys
 
+
+def load_first_json(text: str):
+    # Tolerant parser: if stdout contains extra noise, parse the first JSON value.
+    import json
+    dec = json.JSONDecoder()
+    text = text.lstrip()
+    obj, idx = dec.raw_decode(text)
+    return obj
+
 path = sys.argv[1]
 with open(path, "r", encoding="utf-8") as f:
-    v = json.loads(f.read())
+    s = f.read()
+v = load_first_json(s)
 
 msgs = v.get("messages", [])
 def text(m):
@@ -497,9 +533,19 @@ PY
   python3 - "$OUT_DIR/cli.check.B2.stdout" <<'PY'
 import json, sys
 
+
+def load_first_json(text: str):
+    # Tolerant parser: if stdout contains extra noise, parse the first JSON value.
+    import json
+    dec = json.JSONDecoder()
+    text = text.lstrip()
+    obj, idx = dec.raw_decode(text)
+    return obj
+
 path = sys.argv[1]
 with open(path, "r", encoding="utf-8") as f:
-    v = json.loads(f.read())
+    s = f.read()
+v = load_first_json(s)
 
 if v.get("decision") != "allow":
     raise SystemExit(f"expected decision=allow after release, got {v.get('decision')!r}")
@@ -544,9 +590,19 @@ PY
   python3 - "$OUT_DIR/cli.brief.B.stdout" <<'PY'
 import json, sys
 
+
+def load_first_json(text: str):
+    # Tolerant parser: if stdout contains extra noise, parse the first JSON value.
+    import json
+    dec = json.JSONDecoder()
+    text = text.lstrip()
+    obj, idx = dec.raw_decode(text)
+    return obj
+
 path = sys.argv[1]
 with open(path, "r", encoding="utf-8") as f:
-    v = json.loads(f.read())
+    s = f.read()
+v = load_first_json(s)
 
 discoveries = v.get("discoveries", [])
 if not discoveries:
@@ -579,9 +635,19 @@ PY
   python3 - "$OUT_DIR/cli.digest.B.stdout" <<'PY'
 import json, sys
 
+
+def load_first_json(text: str):
+    # Tolerant parser: if stdout contains extra noise, parse the first JSON value.
+    import json
+    dec = json.JSONDecoder()
+    text = text.lstrip()
+    obj, idx = dec.raw_decode(text)
+    return obj
+
 path = sys.argv[1]
 with open(path, "r", encoding="utf-8") as f:
-    v = json.loads(f.read())
+    s = f.read()
+v = load_first_json(s)
 
 discoveries = v.get("discoveries", [])
 if not discoveries:
@@ -610,9 +676,19 @@ PY
   python3 - "$OUT_DIR/cli.read.messages.discovery.stdout" <<'PY'
 import json, sys
 
+
+def load_first_json(text: str):
+    # Tolerant parser: if stdout contains extra noise, parse the first JSON value.
+    import json
+    dec = json.JSONDecoder()
+    text = text.lstrip()
+    obj, idx = dec.raw_decode(text)
+    return obj
+
 path = sys.argv[1]
 with open(path, "r", encoding="utf-8") as f:
-    v = json.loads(f.read())
+    s = f.read()
+v = load_first_json(s)
 
 msgs = v.get("messages", [])
 ok = False
@@ -674,6 +750,15 @@ scenario_triangle() {
   python3 - "$OUT_DIR/cli.check.B.warn.stdout" "$OUT_DIR/cli.check.B.deny.stdout" <<'PY'
 import json, sys
 
+
+def load_first_json(text: str):
+    # Tolerant parser: if stdout contains extra noise, parse the first JSON value.
+    import json
+    dec = json.JSONDecoder()
+    text = text.lstrip()
+    obj, idx = dec.raw_decode(text)
+    return obj
+
 warn_path, deny_path = sys.argv[1], sys.argv[2]
 warn = json.load(open(warn_path, "r", encoding="utf-8"))
 deny = json.load(open(deny_path, "r", encoding="utf-8"))
@@ -728,6 +813,15 @@ PY
 
   python3 - "$OUT_DIR/cli.check.A.warn.stdout" "$OUT_DIR/cli.check.C.warn.stdout" <<'PY'
 import json, sys
+
+
+def load_first_json(text: str):
+    # Tolerant parser: if stdout contains extra noise, parse the first JSON value.
+    import json
+    dec = json.JSONDecoder()
+    text = text.lstrip()
+    obj, idx = dec.raw_decode(text)
+    return obj
 
 a_path, c_path = sys.argv[1], sys.argv[2]
 a = json.load(open(a_path, "r", encoding="utf-8"))
@@ -801,8 +895,9 @@ main() {
 
   ensure_bin
 
-  if [[ "$PROVIDER" == "both" ]] && [[ "$SCENARIO" != "smoke" ]]; then
-    fail "--provider both is only supported for --scenario smoke"
+  # If we're not spawning agents, provider doesn't matter; allow "both" for convenience.
+  if [[ "$NO_AGENTS" -ne 1 ]] && [[ "$PROVIDER" == "both" ]] && [[ "$SCENARIO" != "smoke" ]]; then
+    fail "--provider both is only supported for --scenario smoke (or pass --no-agents)"
   fi
 
   local repo
@@ -828,6 +923,15 @@ set -e
   # Deterministic artifact so CI/local runs can consume results without parsing stdout.
   python3 - "$OUT_DIR/verdict.json" "$SCENARIO" "$PROVIDER" "$TIMEBOX_S" "$ec" "$TRACE_PATH" "$repo" "$KEEP_REPO" <<'PY'
 import json, sys
+
+
+def load_first_json(text: str):
+    # Tolerant parser: if stdout contains extra noise, parse the first JSON value.
+    import json
+    dec = json.JSONDecoder()
+    text = text.lstrip()
+    obj, idx = dec.raw_decode(text)
+    return obj
 
 out_path = sys.argv[1]
 scenario = sys.argv[2]
