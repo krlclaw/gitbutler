@@ -627,11 +627,62 @@ if [[ -n "$blockers" ]]; then
   ba_items+=("\"$esc_read\"") # placeholder; fixed below
   ap_items+=("\"$esc_read\"")
 
+  # Anti-spam: if the requester already pinged a blocker about this path using the standard
+  # "Are you working on it?" message, do not keep suggesting the same ping on every check poll.
+  already_pinged_blockers="$(
+    DB_PATH="$db_path" REQUESTER="$agent_id" TARGET_PATH="$path" BLOCKERS="$blockers" python3 -c '
+import json, os, sqlite3
+db_path = os.environ["DB_PATH"]
+requester = os.environ["REQUESTER"]
+target_path = os.environ["TARGET_PATH"]
+blockers = [b for b in (os.environ.get("BLOCKERS","") or "").splitlines() if b.strip()]
+want = {b: ("@" + b + ":") for b in blockers}
+if not blockers:
+    raise SystemExit(0)
+conn = sqlite3.connect(db_path)
+cur = conn.cursor()
+rows = cur.execute(
+    "SELECT body_json FROM messages WHERE agent_id = ? AND kind = \"message\" ORDER BY id DESC LIMIT 200",
+    (requester,),
+).fetchall()
+texts = []
+for (body_json,) in rows:
+    try:
+        v = json.loads(body_json)
+    except Exception:
+        v = body_json
+    if isinstance(v, dict):
+        t = v.get("text")
+    elif isinstance(v, str):
+        t = v
+    else:
+        t = None
+    if isinstance(t, str):
+        texts.append(t)
+conn.close()
+pinged = set()
+for b in blockers:
+    pref = want.get(b) or ("@" + b + ":")
+    for t in texts:
+        if pref in t and target_path in t and "Are you working on it?" in t:
+            pinged.add(b)
+            break
+for b in blockers:
+    if b in pinged:
+        print(b)
+'
+  )"
+
   # blocking_agents and per-blocker "ping" steps.
   while IFS= read -r blocker; do
     [[ -n "$blocker" ]] || continue
     esc_blocker="$(json_escape "$blocker")"
     ba_items+=("\"$esc_blocker\"")
+
+    if [[ -n "$already_pinged_blockers" ]] && printf "%s\n" "$already_pinged_blockers" | grep -Fqx -- "$blocker"; then
+      continue
+    fi
+
     post_cmd="but-engineering-rewrite --agent-id $agent_id post \\\"@$blocker: I'm about to edit $path. Are you working on it?\\\""
     esc_post="$(json_escape "$post_cmd")"
     ap_items+=("\"$esc_post\"")
@@ -728,9 +779,8 @@ print(json.dumps(out, separators=(",",":")))
 else
   decision="allow"
   reason_code="no_conflict"
-  retry_cmd="but-engineering-rewrite --agent-id $agent_id check --path $path"
-  esc_retry="$(json_escape "$retry_cmd")"
-  action_plan="[\"$esc_retry\"]"
+  # For allow decisions, `check` already happened; avoid suggesting a redundant re-check.
+  action_plan="[]"
 fi
 
 # Per-agent action plan: help wrappers drive convergence (multi-step, multi-agent).
@@ -750,6 +800,35 @@ def overlaps(a: str, b: str) -> bool:
 now_s = int(time.time())
 conn = sqlite3.connect(db_path)
 cur = conn.cursor()
+
+# Anti-spam: if the requester already pinged a blocker about this path using the standard
+# "Are you working on it?" message, do not keep suggesting the same ping on every check poll.
+pinged_blockers = set()
+if blockers:
+    rows = cur.execute(
+        "SELECT body_json FROM messages WHERE agent_id = ? AND kind = \"message\" ORDER BY id DESC LIMIT 200",
+        (requester,),
+    ).fetchall()
+    texts = []
+    for (body_json,) in rows:
+        try:
+            v = json.loads(body_json)
+        except Exception:
+            v = body_json
+        if isinstance(v, dict):
+            t = v.get("text")
+        elif isinstance(v, str):
+            t = v
+        else:
+            t = None
+        if isinstance(t, str):
+            texts.append(t)
+    for b in blockers:
+        pref = "@" + b + ":"
+        for t in texts:
+            if pref in t and target_path in t and "Are you working on it?" in t:
+                pinged_blockers.add(b)
+                break
 
 agents = [r[0] for r in cur.execute("SELECT agent_id FROM agent_state ORDER BY agent_id ASC").fetchall()]
 
@@ -780,9 +859,12 @@ out = {}
 
 def requester_plan():
     if not blockers:
-        return [f"but-engineering-rewrite --agent-id {requester} check --path {target_path}"]
+        # For allow decisions, `check` already happened; avoid suggesting a redundant re-check.
+        return []
     plan = [f"but-engineering-rewrite --agent-id {requester} read"]
     for b in blockers:
+        if b in pinged_blockers:
+            continue
         plan.append(f"but-engineering-rewrite --agent-id {requester} post \"@{b}: I am about to edit {target_path}. Are you working on it?\"")
     cmd = f"but-engineering-rewrite --agent-id {requester} check --path {target_path}"
     if strict:
@@ -983,6 +1065,35 @@ def compute_unread_relevant_updates(conn) -> tuple[list, int, int]:
         needles.append(f"./{parent}")
         needles.append(f"./{parent}/")
 
+    def is_path_char(ch: str) -> bool:
+        return (ch or "").isalnum() or ch in "._-/"
+
+    # Avoid substring false positives: "src/app.txt" should not match "src/app.txt.bak".
+    # Treat directory needles like "src/" as directory mentions, not generic prefixes: "src/" should not match
+    # "src/app.txt" (the more specific file needle should match instead).
+    def contains_path_token(hay: str, needle: str) -> bool:
+        if not isinstance(hay, str) or not isinstance(needle, str) or not hay or not needle:
+            return False
+        i = 0
+        while True:
+            j = hay.find(needle, i)
+            if j < 0:
+                return False
+            k = j + len(needle)
+            before_ok = (j == 0) or (not is_path_char(hay[j - 1]))
+            if k >= len(hay):
+                after_ok = True
+            else:
+                nxt = hay[k]
+                # Treat "." as a continuation only when it starts an extension-like suffix (".bak").
+                if nxt == ".":
+                    after_ok = not (k + 1 < len(hay) and (hay[k + 1] or "").isalnum())
+                else:
+                    after_ok = not is_path_char(nxt)
+            if before_ok and after_ok:
+                return True
+            i = j + 1
+
     rows = conn.execute(
         "SELECT id, created_at_s, agent_id, kind, body_json FROM messages "
         "WHERE id > ? AND agent_id <> ? AND kind IN (\"message\",\"discovery\") "
@@ -1007,14 +1118,17 @@ def compute_unread_relevant_updates(conn) -> tuple[list, int, int]:
         except Exception:
             body = body_json
 
-        is_relevant = False
-        try:
-            for n in needles:
-                if n and (n in body_json):
-                    is_relevant = True
-                    break
-        except Exception:
-            is_relevant = False
+        hay = None
+        if isinstance(body, dict):
+            txt = body.get("text")
+            if isinstance(txt, str):
+                hay = txt
+        elif isinstance(body, str):
+            hay = body
+        if not isinstance(hay, str):
+            hay = body_json if isinstance(body_json, str) else str(body_json)
+
+        is_relevant = any(contains_path_token(hay, n) for n in needles if isinstance(n, str) and n)
 
         if is_relevant and len(updates) < 20:
             updates.append({
@@ -1083,22 +1197,784 @@ if conn is not None:
 action_plan = load_json_env("OUT_ACTION_PLAN", [])
 action_plan_by_agent = load_json_env("OUT_BY_AGENT", {})
 
-# Coordination compliance closure semantics:
-# If unread relevant updates exist, propose a deduped "ack" post per update-author (excluding blockers).
+# If a blocking agent has already posted a relevant update about this path, suppress the generic
+# "Are you working on it?" ping (even after the update has been surfaced and the unread cursor advanced).
+# Keep the loop closed by continuing to suggest an explicit ack until the requester actually acks.
 try:
-    if isinstance(unread_updates, list) and unread_updates:
-        ack_agents = sorted(
-            {
-                u.get("agent_id")
-                for u in unread_updates
-                if isinstance(u, dict)
-                and isinstance(u.get("agent_id"), str)
-                and u.get("agent_id")
-                and u.get("agent_id") != requester
-                and u.get("agent_id") not in set(blocking_agents or [])
-            }
-        )
-        for a in ack_agents:
+    blockers_with_any_update = set()
+    pending_ack_agents = set()
+    last_update = {}
+
+    # Heuristic relevance (same token rules as unread updates):
+    needles = []
+    needles.append(target_path)
+    needles.append(f"{target_path}/")
+    needles.append(f"./{target_path}")
+    needles.append(f"./{target_path}/")
+    parts = [p for p in (target_path or "").split("/") if p]
+    for i in range(1, max(0, len(parts) - 0)):
+        if i >= len(parts):
+            break
+        parent = "/".join(parts[:i])
+        if not parent:
+            continue
+        needles.append(parent)
+        needles.append(f"{parent}/")
+        needles.append(f"./{parent}")
+        needles.append(f"./{parent}/")
+
+    def is_path_char(ch: str) -> bool:
+        return (ch or "").isalnum() or ch in "._-/"
+
+    def contains_path_token(hay: str, needle: str) -> bool:
+        if not isinstance(hay, str) or not isinstance(needle, str) or not hay or not needle:
+            return False
+        i = 0
+        while True:
+            j = hay.find(needle, i)
+            if j < 0:
+                return False
+            k = j + len(needle)
+            before_ok = (j == 0) or (not is_path_char(hay[j - 1]))
+            if k >= len(hay):
+                after_ok = True
+            else:
+                nxt = hay[k]
+                if nxt == ".":
+                    after_ok = not (k + 1 < len(hay) and (hay[k + 1] or "").isalnum())
+                else:
+                    after_ok = not is_path_char(nxt)
+            if before_ok and after_ok:
+                return True
+            i = j + 1
+
+    if db_path and blocking_agents:
+        conn2 = sqlite3.connect(db_path)
+        try:
+            for b in blocking_agents:
+                if not isinstance(b, str) or not b:
+                    continue
+                rows = conn2.execute(
+                    "SELECT created_at_s, body_json FROM messages WHERE agent_id = ? AND kind IN (\"message\",\"discovery\") ORDER BY id DESC LIMIT 500",
+                    (b,),
+                ).fetchall()
+                for (created_at_s, body_json) in rows:
+                    try:
+                        created_ms = int(created_at_s) * 1000
+                    except Exception:
+                        created_ms = 0
+                    try:
+                        body = json.loads(body_json)
+                    except Exception:
+                        body = body_json
+                    txt = None
+                    if isinstance(body, dict):
+                        txt = body.get("text")
+                    elif isinstance(body, str):
+                        txt = body
+                    if not isinstance(txt, str):
+                        txt = body_json if isinstance(body_json, str) else str(body_json)
+                    if any(contains_path_token(txt, n) for n in needles if isinstance(n, str) and n):
+                        blockers_with_any_update.add(b)
+                        last_update[b] = (created_ms, txt)
+                        break
+
+            ack_to_me_prefix = f"@{requester}: ack:"
+            ack_to_me_prefix_lower = ack_to_me_prefix.lower()
+            resolve_to_me_prefix_lower = f"@{requester}: resolve:".lower()
+            resolved_to_me_prefix_lower = f"@{requester}: resolved:".lower()
+            released_to_me_prefix_lower = f"@{requester}: released:".lower()
+            # `resolved?` / `resolve?` is often a question, not explicit closure.
+            resolve_to_me_prefix_punct = [resolve_to_me_prefix_lower[:-1] + p for p in (".", "!", ",")]
+            resolved_to_me_prefix_punct = [resolved_to_me_prefix_lower[:-1] + p for p in (".", "!", ",")]
+            released_to_me_prefix_punct = [released_to_me_prefix_lower[:-1] + p for p in (".", "!", ",")]
+            resolve_to_me_prefix_bare = resolve_to_me_prefix_lower[:-1]
+            resolved_to_me_prefix_bare = resolved_to_me_prefix_lower[:-1]
+            released_to_me_prefix_bare = released_to_me_prefix_lower[:-1]
+
+            def near_start_direct_mention_line(t: str, pref: str) -> bool:
+                # Treat resolve as explicit closure only for a near-start direct mention on this line, not a quote.
+                try:
+                    t = t or ""
+                    i = t.find(pref)
+                    if i < 0 or i > 64:
+                        return False
+                    if i > 0 and t[i - 1] not in (" ", ":", "(", "[", "{"):
+                        return False
+                    prefix = t[:i]
+                    bad = [chr(34), chr(39), chr(96), ">"]
+                    if any(q in prefix for q in bad):
+                        return False
+                    return True
+                except Exception:
+                    return False
+
+            def near_start_direct_mention_bare_line(t: str, pref: str) -> bool:
+                # Like near_start_direct_mention_line, but for bare `@<me>: resolve` / `resolved` (no trailing punctuation).
+                # Require a word boundary; specifically reject `resolve?` / `resolved?`.
+                try:
+                    t = t or ""
+                    i = t.find(pref)
+                    if i < 0 or i > 64:
+                        return False
+                    if i > 0 and t[i - 1] not in (" ", ":", "(", "[", "{"):
+                        return False
+                    prefix = t[:i]
+                    bad = [chr(34), chr(39), chr(96), ">"]
+                    if any(q in prefix for q in bad):
+                        return False
+                    j = i + len(pref)
+                    if j >= len(t):
+                        return True
+                    nxt = t[j]
+                    if nxt == "?":
+                        return False
+                    if nxt.isspace() or nxt in (".", "!", ",", ":"):
+                        return True
+                    return False
+                except Exception:
+                    return False
+
+            def strip_common_list_prefix(s: str) -> str:
+                # Support common "reply checklist" formatting like:
+                # - @B: ack: ...
+                # - [x] @B: ack: ...
+                # 1. @B: ack: ...
+                try:
+                    s = s or ""
+                    if not s:
+                        return s
+                    if s[0] in ("-", "*", "+"):
+                        i = 1
+                        while i < len(s) and s[i].isspace():
+                            i += 1
+                        s2 = s[i:]
+                    else:
+                        s2 = s
+                    i = 0
+                    while i < len(s2) and s2[i].isdigit():
+                        i += 1
+                    if (
+                        i > 0
+                        and i < len(s2)
+                        and s2[i] in (".", ")")
+                        # Require whitespace after the marker to avoid stripping e.g. "1.23".
+                        and i + 1 < len(s2)
+                        and s2[i + 1].isspace()
+                    ):
+                        i += 1
+                        while i < len(s2) and s2[i].isspace():
+                            i += 1
+                        s2 = s2[i:]
+
+                    # GitHub-style task list marker: "- [x] ..." / "- [ ] ..."
+                    if s2.startswith("[") and len(s2) >= 3 and s2[2] == "]" and s2[1] in (" ", "x", "X"):
+                        j = 3
+                        while j < len(s2) and s2[j].isspace():
+                            j += 1
+                        return s2[j:]
+                    return s2
+                except Exception:
+                    return s
+
+            def strip_md_emphasis(s: str) -> str:
+                # Support common emphasis wrappers at the start of a reply line, e.g.:
+                # **@B: ack:** ...
+                # *@B: ack:* ...
+                #
+                # Keep this intentionally narrow: only strip leading '*' / '_' when they are
+                # immediately followed by '@'.
+                try:
+                    s = s or ""
+                    i = 0
+                    while i < len(s) and s[i] in ("*", "_"):
+                        i += 1
+                    if i == 0 or i > 3 or i >= len(s) or s[i] != "@":
+                        return s
+                    return s[i:]
+                except Exception:
+                    return s
+
+            def strip_wrappers(s: str) -> str:
+                # Support common punctuation wrappers at the start of a directive, e.g.:
+                # (@B: resolve: ...) / [@B: ack: ...]
+                try:
+                    s = s or ""
+                    i = 0
+                    stripped = 0
+                    while i < len(s) and stripped < 3:
+                        if s[i] in ("(", "[", "{"):
+                            i += 1
+                            stripped += 1
+                            while i < len(s) and s[i].isspace():
+                                i += 1
+                            continue
+                        if s[i] == "`" and i + 1 < len(s) and s[i + 1] == "@":
+                            # Inline-code wrapper: only treat as a wrapper when it directly precedes a mention,
+                            # e.g. "`@B: resolve:` ...".
+                            i += 1
+                            stripped += 1
+                            while i < len(s) and s[i].isspace():
+                                i += 1
+                            continue
+                        break
+                    return s[i:]
+                except Exception:
+                    return s
+
+            def is_indented_at_mention(line: str) -> bool:
+                # Ignore indented Markdown "code block" style pastes like:
+                # "    @B: resolve: ..." which are almost always prior context.
+                try:
+                    s = line or ""
+                    i = 0
+                    spaces = 0
+                    saw_tab = False
+                    while i < len(s) and s[i] in (" ", "\t"):
+                        if s[i] == " ":
+                            spaces += 1
+                        else:
+                            saw_tab = True
+                        i += 1
+                    if i >= len(s) or s[i] != "@":
+                        return False
+                    return saw_tab or spaces >= 4
+                except Exception:
+                    return False
+
+            def is_explicit_closure_txt(txt: str) -> bool:
+                # Evaluate per-line so quoted snippets on earlier lines do not suppress real closure on later lines.
+                # Ignore fenced code blocks (```), since users paste prior context that can include `@<me>: resolve:`.
+                in_fenced_code_block = False
+                for line in (txt or "").splitlines()[:16]:
+                    t_raw = (line or "").lstrip()
+                    if t_raw.startswith("```"):
+                        in_fenced_code_block = not in_fenced_code_block
+                        continue
+                    if in_fenced_code_block:
+                        continue
+                    if is_indented_at_mention(line):
+                        continue
+                    t = t_raw.lower()
+                    if not t:
+                        continue
+                    # Humans often omit the colon after the @mention, and sometimes use sentence punctuation
+                    # instead of the trailing colon.
+                    ack_to_me_prefix_space_lower = ack_to_me_prefix_lower.replace(": ack:", " ack:", 1)
+                    ack_needles = [
+                        ack_to_me_prefix_lower,
+                        ack_to_me_prefix_space_lower,
+                        ack_to_me_prefix_lower.replace(": ack:", ": acknowledged", 1),
+                        ack_to_me_prefix_space_lower.replace(" ack:", " acknowledged", 1),
+                    ]
+                    ack_bare = []
+                    for n in list(ack_needles):
+                        if n.endswith(":"):
+                            base = n[:-1]
+                            ack_bare.append(base)
+                            for p in [".", "!", "?", ","]:
+                                ack_needles.append(base + p)
+                    def is_ack_line(s: str) -> bool:
+                        try:
+                            s = s or ""
+                            if any(s.startswith(n) for n in ack_needles):
+                                return True
+                            for base in ack_bare:
+                                if s.startswith(base):
+                                    after = s[len(base):len(base)+1]
+                                    if after == "" or after in (" ", "\t", ".", "!", "?", ",", ":"):
+                                        return True
+                            return False
+                        except Exception:
+                            return False
+                    if (
+                        is_ack_line(t)
+                        or is_ack_line(strip_md_emphasis(t))
+                        or is_ack_line(strip_md_emphasis(strip_common_list_prefix(t)))
+                        or is_ack_line(strip_wrappers(t))
+                        or is_ack_line(strip_wrappers(strip_md_emphasis(t)))
+                        or is_ack_line(strip_wrappers(strip_md_emphasis(strip_common_list_prefix(t))))
+                    ):
+                        return True
+                    if (
+                        near_start_direct_mention_line(t, resolve_to_me_prefix_lower)
+                        or any(near_start_direct_mention_line(t, p) for p in resolve_to_me_prefix_punct)
+                        or near_start_direct_mention_line(t, resolved_to_me_prefix_lower)
+                        or any(near_start_direct_mention_line(t, p) for p in resolved_to_me_prefix_punct)
+                        or near_start_direct_mention_bare_line(t, resolve_to_me_prefix_bare)
+                        or near_start_direct_mention_bare_line(t, resolved_to_me_prefix_bare)
+                        or near_start_direct_mention_line(t, released_to_me_prefix_lower)
+                        or any(near_start_direct_mention_line(t, p) for p in released_to_me_prefix_punct)
+                        or near_start_direct_mention_bare_line(t, released_to_me_prefix_bare)
+                        or near_start_direct_mention_line(strip_md_emphasis(t), resolve_to_me_prefix_lower)
+                        or any(near_start_direct_mention_line(strip_md_emphasis(t), p) for p in resolve_to_me_prefix_punct)
+                        or near_start_direct_mention_line(strip_md_emphasis(t), resolved_to_me_prefix_lower)
+                        or any(near_start_direct_mention_line(strip_md_emphasis(t), p) for p in resolved_to_me_prefix_punct)
+                        or near_start_direct_mention_bare_line(strip_md_emphasis(t), resolve_to_me_prefix_bare)
+                        or near_start_direct_mention_bare_line(strip_md_emphasis(t), resolved_to_me_prefix_bare)
+                        or near_start_direct_mention_line(strip_md_emphasis(t), released_to_me_prefix_lower)
+                        or any(near_start_direct_mention_line(strip_md_emphasis(t), p) for p in released_to_me_prefix_punct)
+                        or near_start_direct_mention_bare_line(strip_md_emphasis(t), released_to_me_prefix_bare)
+                        or near_start_direct_mention_line(strip_md_emphasis(strip_common_list_prefix(t)), resolve_to_me_prefix_lower)
+                        or any(near_start_direct_mention_line(strip_md_emphasis(strip_common_list_prefix(t)), p) for p in resolve_to_me_prefix_punct)
+                        or near_start_direct_mention_line(strip_md_emphasis(strip_common_list_prefix(t)), resolved_to_me_prefix_lower)
+                        or any(near_start_direct_mention_line(strip_md_emphasis(strip_common_list_prefix(t)), p) for p in resolved_to_me_prefix_punct)
+                        or near_start_direct_mention_bare_line(strip_md_emphasis(strip_common_list_prefix(t)), resolve_to_me_prefix_bare)
+                        or near_start_direct_mention_bare_line(strip_md_emphasis(strip_common_list_prefix(t)), resolved_to_me_prefix_bare)
+                        or near_start_direct_mention_line(strip_md_emphasis(strip_common_list_prefix(t)), released_to_me_prefix_lower)
+                        or any(near_start_direct_mention_line(strip_md_emphasis(strip_common_list_prefix(t)), p) for p in released_to_me_prefix_punct)
+                        or near_start_direct_mention_bare_line(strip_md_emphasis(strip_common_list_prefix(t)), released_to_me_prefix_bare)
+                        or near_start_direct_mention_line(strip_wrappers(t), resolve_to_me_prefix_lower)
+                        or any(near_start_direct_mention_line(strip_wrappers(t), p) for p in resolve_to_me_prefix_punct)
+                        or near_start_direct_mention_line(strip_wrappers(t), resolved_to_me_prefix_lower)
+                        or any(near_start_direct_mention_line(strip_wrappers(t), p) for p in resolved_to_me_prefix_punct)
+                        or near_start_direct_mention_bare_line(strip_wrappers(t), resolve_to_me_prefix_bare)
+                        or near_start_direct_mention_bare_line(strip_wrappers(t), resolved_to_me_prefix_bare)
+                        or near_start_direct_mention_line(strip_wrappers(t), released_to_me_prefix_lower)
+                        or any(near_start_direct_mention_line(strip_wrappers(t), p) for p in released_to_me_prefix_punct)
+                        or near_start_direct_mention_bare_line(strip_wrappers(t), released_to_me_prefix_bare)
+                        or near_start_direct_mention_line(strip_wrappers(strip_md_emphasis(t)), resolve_to_me_prefix_lower)
+                        or any(near_start_direct_mention_line(strip_wrappers(strip_md_emphasis(t)), p) for p in resolve_to_me_prefix_punct)
+                        or near_start_direct_mention_line(strip_wrappers(strip_md_emphasis(t)), resolved_to_me_prefix_lower)
+                        or any(near_start_direct_mention_line(strip_wrappers(strip_md_emphasis(t)), p) for p in resolved_to_me_prefix_punct)
+                        or near_start_direct_mention_bare_line(strip_wrappers(strip_md_emphasis(t)), resolve_to_me_prefix_bare)
+                        or near_start_direct_mention_bare_line(strip_wrappers(strip_md_emphasis(t)), resolved_to_me_prefix_bare)
+                        or near_start_direct_mention_line(strip_wrappers(strip_md_emphasis(t)), released_to_me_prefix_lower)
+                        or any(near_start_direct_mention_line(strip_wrappers(strip_md_emphasis(t)), p) for p in released_to_me_prefix_punct)
+                        or near_start_direct_mention_bare_line(strip_wrappers(strip_md_emphasis(t)), released_to_me_prefix_bare)
+                        or near_start_direct_mention_line(strip_wrappers(strip_md_emphasis(strip_common_list_prefix(t))), resolve_to_me_prefix_lower)
+                        or any(near_start_direct_mention_line(strip_wrappers(strip_md_emphasis(strip_common_list_prefix(t))), p) for p in resolve_to_me_prefix_punct)
+                        or near_start_direct_mention_line(strip_wrappers(strip_md_emphasis(strip_common_list_prefix(t))), resolved_to_me_prefix_lower)
+                        or any(near_start_direct_mention_line(strip_wrappers(strip_md_emphasis(strip_common_list_prefix(t))), p) for p in resolved_to_me_prefix_punct)
+                        or near_start_direct_mention_bare_line(strip_wrappers(strip_md_emphasis(strip_common_list_prefix(t))), resolve_to_me_prefix_bare)
+                        or near_start_direct_mention_bare_line(strip_wrappers(strip_md_emphasis(strip_common_list_prefix(t))), resolved_to_me_prefix_bare)
+                        or near_start_direct_mention_line(strip_wrappers(strip_md_emphasis(strip_common_list_prefix(t))), released_to_me_prefix_lower)
+                        or any(near_start_direct_mention_line(strip_wrappers(strip_md_emphasis(strip_common_list_prefix(t))), p) for p in released_to_me_prefix_punct)
+                        or near_start_direct_mention_bare_line(strip_wrappers(strip_md_emphasis(strip_common_list_prefix(t))), released_to_me_prefix_bare)
+                    ):
+                        return True
+                return False
+            for b, (created_ms, txt) in (last_update or {}).items():
+                if not isinstance(b, str) or not b:
+                    continue
+                if isinstance(txt, str) and is_explicit_closure_txt(txt):
+                    continue
+                since_s = 0
+                try:
+                    since_s = int(created_ms // 1000)
+                except Exception:
+                    since_s = 0
+                ack_needles = []
+                for base in [
+                    f"@{b}: ack",
+                    f"@{b} ack",
+                    f"@{b}: acknowledged",
+                    f"@{b} acknowledged",
+                    f"@{b}: thanks",
+                    f"@{b} thanks",
+                    f"@{b}: got it",
+                    f"@{b} got it",
+                ]:
+                    bl = base.lower()
+                    ack_needles.append(bl)
+                    ack_needles.append(bl + " ")
+                    ack_needles.append(bl + "\t")
+                    for p in [":", ".", "!", "?", ","]:
+                        ack_needles.append(bl + p)
+                acked = False
+                rows = conn2.execute(
+                    "SELECT body_json FROM messages WHERE agent_id = ? AND kind = \"message\" AND created_at_s >= ? ORDER BY id DESC LIMIT 500",
+                    (requester, since_s),
+                ).fetchall()
+                for (body_json,) in rows:
+                    try:
+                        body = json.loads(body_json)
+                    except Exception:
+                        body = body_json
+                    txt2 = None
+                    if isinstance(body, dict):
+                        txt2 = body.get("text")
+                    elif isinstance(body, str):
+                        txt2 = body
+                    if not isinstance(txt2, str):
+                        continue
+                    t2 = txt2.lstrip().lower()
+                    def is_ack_sent_line(s: str) -> bool:
+                        try:
+                            return any((s or "").startswith(n) for n in ack_needles)
+                        except Exception:
+                            return False
+                    if (
+                        is_ack_sent_line(t2)
+                        or is_ack_sent_line(strip_md_emphasis(t2))
+                        or is_ack_sent_line(strip_md_emphasis(strip_common_list_prefix(t2)))
+                        or is_ack_sent_line(strip_wrappers(t2))
+                        or is_ack_sent_line(strip_wrappers(strip_md_emphasis(t2)))
+                        or is_ack_sent_line(strip_wrappers(strip_md_emphasis(strip_common_list_prefix(t2))))
+                    ):
+                        acked = True
+                        break
+                if not acked:
+                    pending_ack_agents.add(b)
+        finally:
+            conn2.close()
+
+    blockers_with_unread_updates = {
+        u.get("agent_id")
+        for u in (unread_updates or [])
+        if isinstance(u, dict)
+        and isinstance(u.get("agent_id"), str)
+        and u.get("agent_id") in set(blocking_agents or [])
+    }
+    blockers_with_unread_updates = {b for b in blockers_with_unread_updates if isinstance(b, str) and b}
+    blockers_with_any_update = {b for b in blockers_with_any_update if isinstance(b, str) and b}
+
+    suppress_pings_for = set(blockers_with_any_update) | set(blockers_with_unread_updates)
+    if suppress_pings_for and isinstance(action_plan, list):
+        filtered = []
+        for cmd in action_plan:
+            if not isinstance(cmd, str):
+                filtered.append(cmd)
+                continue
+            should_drop = False
+            for b in suppress_pings_for:
+                im = "I" + chr(39) + "m"
+                if f"@{b}: {im} about to edit {target_path}. Are you working on it?" in cmd:
+                    should_drop = True
+                    break
+            if not should_drop:
+                filtered.append(cmd)
+        action_plan = filtered
+        # Keep parity between `action_plan` and `action_plan_by_agent[requester]` even when no acks are inserted.
+        if isinstance(action_plan_by_agent, dict):
+            action_plan_by_agent[requester] = action_plan
+
+    # Closure semantics: suggest a deduped ack per unread update author, and keep suggesting an ack for
+    # blockers with a relevant note until the requester actually acks.
+    if (isinstance(unread_updates, list) and unread_updates) or pending_ack_agents:
+        pinged_blockers = set()
+        try:
+            if isinstance(action_plan, list):
+                im = "I" + chr(39) + "m"
+                for b in (blocking_agents or []):
+                    if not isinstance(b, str) or not b:
+                        continue
+                    ping_frag = f"@{b}: {im} about to edit {target_path}. Are you working on it?"
+                    if any(isinstance(cmd, str) and ping_frag in cmd for cmd in action_plan):
+                        pinged_blockers.add(b)
+        except Exception:
+            pinged_blockers = set()
+
+        ack_to_me_prefix = f"@{requester}: ack:"
+        ack_to_me_prefix_lower = ack_to_me_prefix.lower()
+        resolve_to_me_prefix_lower = f"@{requester}: resolve:".lower()
+        resolved_to_me_prefix_lower = f"@{requester}: resolved:".lower()
+        released_to_me_prefix_lower = f"@{requester}: released:".lower()
+        # `resolved?` / `resolve?` is often a question, not explicit closure.
+        resolve_to_me_prefix_punct = [resolve_to_me_prefix_lower[:-1] + p for p in (".", "!", ",")]
+        resolved_to_me_prefix_punct = [resolved_to_me_prefix_lower[:-1] + p for p in (".", "!", ",")]
+        released_to_me_prefix_punct = [released_to_me_prefix_lower[:-1] + p for p in (".", "!", ",")]
+        resolve_to_me_prefix_bare = resolve_to_me_prefix_lower[:-1]
+        resolved_to_me_prefix_bare = resolved_to_me_prefix_lower[:-1]
+        released_to_me_prefix_bare = released_to_me_prefix_lower[:-1]
+
+        def near_start_direct_mention_line(t: str, pref: str) -> bool:
+            # Treat resolve as explicit closure only for a near-start direct mention on this line, not a quote.
+            try:
+                t = t or ""
+                i = t.find(pref)
+                if i < 0 or i > 64:
+                    return False
+                if i > 0 and t[i - 1] not in (" ", ":", "(", "[", "{"):
+                    return False
+                prefix = t[:i]
+                bad = [chr(34), chr(39), chr(96), ">"]
+                if any(q in prefix for q in bad):
+                    return False
+                return True
+            except Exception:
+                return False
+
+        def near_start_direct_mention_bare_line(t: str, pref: str) -> bool:
+            # Like near_start_direct_mention_line, but for bare `@<me>: resolve` / `resolved` (no trailing punctuation).
+            # Require a word boundary; specifically reject `resolve?` / `resolved?`.
+            try:
+                t = t or ""
+                i = t.find(pref)
+                if i < 0 or i > 64:
+                    return False
+                if i > 0 and t[i - 1] not in (" ", ":", "(", "[", "{"):
+                    return False
+                prefix = t[:i]
+                bad = [chr(34), chr(39), chr(96), ">"]
+                if any(q in prefix for q in bad):
+                    return False
+                j = i + len(pref)
+                if j >= len(t):
+                    return True
+                nxt = t[j]
+                if nxt == "?":
+                    return False
+                if nxt.isspace() or nxt in (".", "!", ",", ":"):
+                    return True
+                return False
+            except Exception:
+                return False
+
+        def strip_common_list_prefix(s: str) -> str:
+            # Support common "reply checklist" formatting like:
+            # - @B: ack: ...
+            # - [x] @B: ack: ...
+            # 1. @B: ack: ...
+            try:
+                s = s or ""
+                if not s:
+                    return s
+                if s[0] in ("-", "*", "+"):
+                    i = 1
+                    while i < len(s) and s[i].isspace():
+                        i += 1
+                    s2 = s[i:]
+                else:
+                    s2 = s
+                i = 0
+                while i < len(s2) and s2[i].isdigit():
+                    i += 1
+                if (
+                    i > 0
+                    and i < len(s2)
+                    and s2[i] in (".", ")")
+                    # Require whitespace after the marker to avoid stripping e.g. "1.23".
+                    and i + 1 < len(s2)
+                    and s2[i + 1].isspace()
+                ):
+                    i += 1
+                    while i < len(s2) and s2[i].isspace():
+                        i += 1
+                    s2 = s2[i:]
+
+                # GitHub-style task list marker: "- [x] ..." / "- [ ] ..."
+                if s2.startswith("[") and len(s2) >= 3 and s2[2] == "]" and s2[1] in (" ", "x", "X"):
+                    j = 3
+                    while j < len(s2) and s2[j].isspace():
+                        j += 1
+                    return s2[j:]
+                return s2
+            except Exception:
+                return s
+
+        def strip_md_emphasis(s: str) -> str:
+            # Support common emphasis wrappers at the start of a reply line, e.g.:
+            # **@B: ack:** ...
+            # *@B: ack:* ...
+            #
+            # Keep this intentionally narrow: only strip leading '*' / '_' when they are
+            # immediately followed by '@'.
+            try:
+                s = s or ""
+                i = 0
+                while i < len(s) and s[i] in ("*", "_"):
+                    i += 1
+                if i == 0 or i > 3 or i >= len(s) or s[i] != "@":
+                    return s
+                return s[i:]
+            except Exception:
+                return s
+
+        def strip_wrappers(s: str) -> str:
+            # Support common punctuation wrappers at the start of a directive, e.g.:
+            # (@B: resolve: ...) / [@B: ack: ...]
+            try:
+                s = s or ""
+                i = 0
+                stripped = 0
+                while i < len(s) and stripped < 3:
+                    if s[i] in ("(", "[", "{"):
+                        i += 1
+                        stripped += 1
+                        while i < len(s) and s[i].isspace():
+                            i += 1
+                        continue
+                    if s[i] == "`" and i + 1 < len(s) and s[i + 1] == "@":
+                        i += 1
+                        stripped += 1
+                        while i < len(s) and s[i].isspace():
+                            i += 1
+                        continue
+                    break
+                return s[i:]
+            except Exception:
+                return s
+
+        def is_indented_at_mention(line: str) -> bool:
+            # Ignore indented Markdown "code block" style pastes like:
+            # "    @B: resolve: ..." which are almost always prior context.
+            try:
+                s = line or ""
+                i = 0
+                spaces = 0
+                saw_tab = False
+                while i < len(s) and s[i] in (" ", "\t"):
+                    if s[i] == " ":
+                        spaces += 1
+                    else:
+                        saw_tab = True
+                    i += 1
+                if i >= len(s) or s[i] != "@":
+                    return False
+                return saw_tab or spaces >= 4
+            except Exception:
+                return False
+
+        def is_closure_to_me(u):
+            if not isinstance(u, dict):
+                return False
+            body = u.get("body")
+            txt = None
+            if isinstance(body, dict):
+                txt = body.get("text")
+            elif isinstance(body, str):
+                txt = body
+            if not isinstance(txt, str):
+                return False
+            # Evaluate per-line so a quoted resolve on one line does not suppress a real resolve on another.
+            # Ignore fenced code blocks (```), since users paste prior context that can include `@<me>: resolve:`.
+            in_fenced_code_block = False
+            for line in (txt or "").splitlines()[:16]:
+                t_raw = (line or "").lstrip()
+                if t_raw.startswith("```"):
+                    in_fenced_code_block = not in_fenced_code_block
+                    continue
+                if in_fenced_code_block:
+                    continue
+                if is_indented_at_mention(line):
+                    continue
+                t = t_raw.lower()
+                if not t:
+                    continue
+                # Humans often omit the colon after the @mention, and sometimes use sentence punctuation
+                # (or a comma) instead of the trailing colon after `ack`.
+                ack_to_me_prefix_space_lower = ack_to_me_prefix_lower.replace(": ack:", " ack:", 1)
+                ack_needles = [
+                    ack_to_me_prefix_lower,
+                    ack_to_me_prefix_space_lower,
+                    ack_to_me_prefix_lower.replace(": ack:", ": acknowledged", 1),
+                    ack_to_me_prefix_space_lower.replace(" ack:", " acknowledged", 1),
+                    # Common "ack" synonyms used as a directed reply to an agent.
+                    ack_to_me_prefix_lower.replace(": ack:", ": thanks", 1),
+                    ack_to_me_prefix_space_lower.replace(" ack:", " thanks", 1),
+                    ack_to_me_prefix_lower.replace(": ack:", ": got it", 1),
+                    ack_to_me_prefix_space_lower.replace(" ack:", " got it", 1),
+                ]
+                ack_bare = []
+                for n in list(ack_needles):
+                    if n.endswith(":"):
+                        base = n[:-1]
+                        ack_bare.append(base)
+                        for p in [".", "!", "?", ","]:
+                            ack_needles.append(base + p)
+                def is_ack_line(s: str) -> bool:
+                    try:
+                        s = s or ""
+                        if any(s.startswith(n) for n in ack_needles):
+                            return True
+                        for base in ack_bare:
+                            if s.startswith(base):
+                                after = s[len(base):len(base)+1]
+                                if after == "" or after in (" ", "\t", ".", "!", "?", ",", ":"):
+                                    return True
+                        return False
+                    except Exception:
+                        return False
+                if (
+                    is_ack_line(t)
+                    or is_ack_line(strip_md_emphasis(t))
+                    or is_ack_line(strip_md_emphasis(strip_common_list_prefix(t)))
+                    or is_ack_line(strip_wrappers(t))
+                    or is_ack_line(strip_wrappers(strip_md_emphasis(t)))
+                    or is_ack_line(strip_wrappers(strip_md_emphasis(strip_common_list_prefix(t))))
+                ):
+                    return True
+                if (
+                    near_start_direct_mention_line(t, resolve_to_me_prefix_lower)
+                    or any(near_start_direct_mention_line(t, p) for p in resolve_to_me_prefix_punct)
+                    or near_start_direct_mention_line(t, resolved_to_me_prefix_lower)
+                    or any(near_start_direct_mention_line(t, p) for p in resolved_to_me_prefix_punct)
+                    or near_start_direct_mention_bare_line(t, resolve_to_me_prefix_bare)
+                    or near_start_direct_mention_bare_line(t, resolved_to_me_prefix_bare)
+                    or near_start_direct_mention_line(t, released_to_me_prefix_lower)
+                    or any(near_start_direct_mention_line(t, p) for p in released_to_me_prefix_punct)
+                    or near_start_direct_mention_bare_line(t, released_to_me_prefix_bare)
+                    or near_start_direct_mention_line(strip_md_emphasis(t), resolve_to_me_prefix_lower)
+                    or any(near_start_direct_mention_line(strip_md_emphasis(t), p) for p in resolve_to_me_prefix_punct)
+                    or near_start_direct_mention_line(strip_md_emphasis(t), resolved_to_me_prefix_lower)
+                    or any(near_start_direct_mention_line(strip_md_emphasis(t), p) for p in resolved_to_me_prefix_punct)
+                    or near_start_direct_mention_bare_line(strip_md_emphasis(t), resolve_to_me_prefix_bare)
+                    or near_start_direct_mention_bare_line(strip_md_emphasis(t), resolved_to_me_prefix_bare)
+                    or near_start_direct_mention_line(strip_md_emphasis(t), released_to_me_prefix_lower)
+                    or any(near_start_direct_mention_line(strip_md_emphasis(t), p) for p in released_to_me_prefix_punct)
+                    or near_start_direct_mention_bare_line(strip_md_emphasis(t), released_to_me_prefix_bare)
+                    or near_start_direct_mention_line(strip_md_emphasis(strip_common_list_prefix(t)), resolve_to_me_prefix_lower)
+                    or any(near_start_direct_mention_line(strip_md_emphasis(strip_common_list_prefix(t)), p) for p in resolve_to_me_prefix_punct)
+                    or near_start_direct_mention_line(strip_md_emphasis(strip_common_list_prefix(t)), resolved_to_me_prefix_lower)
+                    or any(near_start_direct_mention_line(strip_md_emphasis(strip_common_list_prefix(t)), p) for p in resolved_to_me_prefix_punct)
+                    or near_start_direct_mention_bare_line(strip_md_emphasis(strip_common_list_prefix(t)), resolve_to_me_prefix_bare)
+                    or near_start_direct_mention_bare_line(strip_md_emphasis(strip_common_list_prefix(t)), resolved_to_me_prefix_bare)
+                    or near_start_direct_mention_line(strip_md_emphasis(strip_common_list_prefix(t)), released_to_me_prefix_lower)
+                    or any(near_start_direct_mention_line(strip_md_emphasis(strip_common_list_prefix(t)), p) for p in released_to_me_prefix_punct)
+                    or near_start_direct_mention_bare_line(strip_md_emphasis(strip_common_list_prefix(t)), released_to_me_prefix_bare)
+                    or near_start_direct_mention_line(strip_wrappers(t), resolve_to_me_prefix_lower)
+                    or any(near_start_direct_mention_line(strip_wrappers(t), p) for p in resolve_to_me_prefix_punct)
+                    or near_start_direct_mention_line(strip_wrappers(t), resolved_to_me_prefix_lower)
+                    or any(near_start_direct_mention_line(strip_wrappers(t), p) for p in resolved_to_me_prefix_punct)
+                    or near_start_direct_mention_bare_line(strip_wrappers(t), resolve_to_me_prefix_bare)
+                    or near_start_direct_mention_bare_line(strip_wrappers(t), resolved_to_me_prefix_bare)
+                    or near_start_direct_mention_line(strip_wrappers(t), released_to_me_prefix_lower)
+                    or any(near_start_direct_mention_line(strip_wrappers(t), p) for p in released_to_me_prefix_punct)
+                    or near_start_direct_mention_bare_line(strip_wrappers(t), released_to_me_prefix_bare)
+                    or near_start_direct_mention_line(strip_wrappers(strip_md_emphasis(t)), resolve_to_me_prefix_lower)
+                    or any(near_start_direct_mention_line(strip_wrappers(strip_md_emphasis(t)), p) for p in resolve_to_me_prefix_punct)
+                    or near_start_direct_mention_line(strip_wrappers(strip_md_emphasis(t)), resolved_to_me_prefix_lower)
+                    or any(near_start_direct_mention_line(strip_wrappers(strip_md_emphasis(t)), p) for p in resolved_to_me_prefix_punct)
+                    or near_start_direct_mention_bare_line(strip_wrappers(strip_md_emphasis(t)), resolve_to_me_prefix_bare)
+                    or near_start_direct_mention_bare_line(strip_wrappers(strip_md_emphasis(t)), resolved_to_me_prefix_bare)
+                    or near_start_direct_mention_line(strip_wrappers(strip_md_emphasis(t)), released_to_me_prefix_lower)
+                    or any(near_start_direct_mention_line(strip_wrappers(strip_md_emphasis(t)), p) for p in released_to_me_prefix_punct)
+                    or near_start_direct_mention_bare_line(strip_wrappers(strip_md_emphasis(t)), released_to_me_prefix_bare)
+                    or near_start_direct_mention_line(strip_wrappers(strip_md_emphasis(strip_common_list_prefix(t))), resolve_to_me_prefix_lower)
+                    or any(near_start_direct_mention_line(strip_wrappers(strip_md_emphasis(strip_common_list_prefix(t))), p) for p in resolve_to_me_prefix_punct)
+                    or near_start_direct_mention_line(strip_wrappers(strip_md_emphasis(strip_common_list_prefix(t))), resolved_to_me_prefix_lower)
+                    or any(near_start_direct_mention_line(strip_wrappers(strip_md_emphasis(strip_common_list_prefix(t))), p) for p in resolved_to_me_prefix_punct)
+                    or near_start_direct_mention_bare_line(strip_wrappers(strip_md_emphasis(strip_common_list_prefix(t))), resolve_to_me_prefix_bare)
+                    or near_start_direct_mention_bare_line(strip_wrappers(strip_md_emphasis(strip_common_list_prefix(t))), resolved_to_me_prefix_bare)
+                    or near_start_direct_mention_line(strip_wrappers(strip_md_emphasis(strip_common_list_prefix(t))), released_to_me_prefix_lower)
+                    or any(near_start_direct_mention_line(strip_wrappers(strip_md_emphasis(strip_common_list_prefix(t))), p) for p in released_to_me_prefix_punct)
+                    or near_start_direct_mention_bare_line(strip_wrappers(strip_md_emphasis(strip_common_list_prefix(t))), released_to_me_prefix_bare)
+                ):
+                    return True
+            return False
+
+        ack_set = set()
+        if isinstance(unread_updates, list):
+            for u in unread_updates:
+                if not isinstance(u, dict):
+                    continue
+                a = u.get("agent_id")
+                if not isinstance(a, str) or not a or a == requester:
+                    continue
+                if a in pinged_blockers:
+                    continue
+                if is_closure_to_me(u):
+                    continue
+                ack_set.add(a)
+        for a in pending_ack_agents:
+            if not isinstance(a, str) or not a or a == requester:
+                continue
+            if a in pinged_blockers:
+                continue
+            ack_set.add(a)
+
+        for a in sorted(ack_set):
             cmd = f"but-engineering-rewrite --agent-id {requester} post \"@{a}: ack: saw your update re {target_path}.\""
             if action_plan and isinstance(action_plan[-1], str) and " check --path " in action_plan[-1]:
                 action_plan.insert(max(0, len(action_plan) - 1), cmd)

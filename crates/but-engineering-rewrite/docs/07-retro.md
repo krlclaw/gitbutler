@@ -1,6 +1,30 @@
 # Retro Notes
 
+## 2026-02-15
+
+- Extended the E2E scaffold with a minimal E2E-02 slice (`--scenario discovery`) that posts a valid structured discovery, asserts it appears in `brief`/`digest`, and ensures the suggested action is executed (posts an ack): `crates/but-engineering-rewrite/e2e/run.sh`.
+- Added a pinned Codex prompt for the discovery scenario to keep the real-agent path deterministic and verdictable via a sentinel token: `crates/but-engineering-rewrite/e2e/prompts/discovery.step1.codex.txt`.
+- Re-ran the fast harness after the E2E changes to ensure no regressions before checkpointing: `./crates/but-engineering-rewrite/harness/run.sh`.
+- Grew the harness into a more realistic "closed-loop coordination" suite by adding cases around unread relevant updates, ack suggestions (dedupe + anti-ping-pong), and suppressing redundant blocker pings: `crates/but-engineering-rewrite/harness/run.sh`, `crates/but-engineering-rewrite/harness/cases/`.
+- Kept Rust and the harness stub in parity by mirroring the coordination heuristics (closure/ack parsing, unread relevance matching, and action plan shaping) in both implementations: `crates/but-engineering-rewrite/src/main.rs`, `crates/but-engineering-rewrite/harness/bin/but-engineering-rewrite`.
+- Added an opt-in E2E scaffold with a deterministic CLI smoke scenario plus optional real-agent spawn (Codex/Claude), with timeboxing, transcripts, and a structured JSONL trace: `crates/but-engineering-rewrite/e2e/run.sh`, `crates/but-engineering-rewrite/e2e/prompts/`.
+- Extended the E2E scaffold with a minimal E2E-01 “collision -> read/ack -> release -> proceed” slice (`--scenario collision`), including pinned Codex prompts and a per-scenario sentinel token for deterministic verdicts: `crates/but-engineering-rewrite/e2e/run.sh`, `crates/but-engineering-rewrite/e2e/prompts/collision.step*.codex.txt`.
+- Captured the working priorities in a living backlog doc so the next slices are obvious: `crates/but-engineering-rewrite/docs/08-backlog.md`.
+- Harness remained green after the above changes, making this a safe checkpoint: `./crates/but-engineering-rewrite/harness/run.sh`.
+
 ## 2026-02-14
+
+- Added harness Case 42 to prevent "ack ping-pong" loops: when an unread relevant update is itself the exact auto-ack template (`@X: ack: saw your update re <path>.`), `check --path` must not suggest acknowledging it back: `crates/but-engineering-rewrite/harness/run.sh`, `crates/but-engineering-rewrite/harness/cases/42-ack-loop-suppression-auto-ack.md`.
+- Improved coordination usefulness for allow decisions by removing the redundant "re-run check" step from `action_plan` when there are no blockers (the `check` already happened): `crates/but-engineering-rewrite/src/main.rs`, `crates/but-engineering-rewrite/harness/bin/but-engineering-rewrite`.
+- Kept behavior aligned between Rust and the harness stub by applying the same auto-ack suppression predicate during ack-enrichment in both implementations: `crates/but-engineering-rewrite/src/main.rs`, `crates/but-engineering-rewrite/harness/bin/but-engineering-rewrite`.
+
+- Added harness Case 40 to ensure closure semantics still work under contention: when `check --strict` denies due to a blocking claim, it should still surface unread relevant updates from non-blocking agents and suggest a single `@X: ack: ...` step: `crates/but-engineering-rewrite/harness/run.sh`, `crates/but-engineering-rewrite/harness/cases/40-strict-deny-ack-unread-updates-nonblocker.md`.
+- Asserted the ack suggestion is scoped correctly: ack the non-blocking updater (`C`) but do not ack the blocker (`A`), since blockers already have explicit coordination steps in the conflict plan: `crates/but-engineering-rewrite/harness/run.sh`.
+- No implementation changes were required; both the Rust CLI and the stub already enrich `action_plan` with deduped acks based on unread relevant updates, independent of allow/warn/deny decisions.
+
+- Added harness Case 41 to cover a common miscommunication+repair loop: a broad directory claim blocks a teammate, the teammate asks for clarification, the blocker releases, and the checker sees the repair message as an unread relevant update: `crates/but-engineering-rewrite/harness/run.sh`, `crates/but-engineering-rewrite/harness/cases/41-miscommunication-repair-release-and-ack.md`.
+- Locked in closure semantics after repair: once unblocked, `check --path` should suggest a single explicit `@A: ack: ...` back to the repairing agent, and should not keep suggesting the original blocker-ping step once there are no blockers: `crates/but-engineering-rewrite/harness/run.sh`.
+- Kept the scenario anti-spam by asserting a third `check` does not repeat the same repair message or the ack suggestion (cursor advanced): `crates/but-engineering-rewrite/harness/run.sh`.
 
 - Added harness Case 39 to lock in closed-loop coordination for unread updates: when `check --path` surfaces an unread relevant update, it should suggest an explicit `post "@X: ack: ..."` step, and that suggestion must not repeat once the cursor advances: `crates/but-engineering-rewrite/harness/run.sh`, `crates/but-engineering-rewrite/harness/cases/39-ack-unread-updates.md`.
 - Extended the Rust CLI `check` action plan to include a deduped ack step per update-author (excluding blocking agents to avoid double-pinging), keeping the behavior additive and low-noise: `crates/but-engineering-rewrite/src/main.rs`.

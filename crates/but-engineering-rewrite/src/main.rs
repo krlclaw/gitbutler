@@ -35,6 +35,560 @@ enum Cmd {
     EvalUserPromptSubmit,
 }
 
+fn is_path_token_byte(b: u8) -> bool {
+    b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-' | b'/')
+}
+
+// For boundary checks: treat "." as a continuation only when it starts an extension-like suffix (".bak").
+fn continues_path_token(hs: &[u8], idx: usize) -> bool {
+    if idx >= hs.len() {
+        return false;
+    }
+    let b = hs[idx];
+    if b == b'.' {
+        return idx + 1 < hs.len() && hs[idx + 1].is_ascii_alphanumeric();
+    }
+    is_path_token_byte(b)
+}
+
+// Avoid substring false positives: `src/app.txt` should not match `src/app.txt.bak`.
+// Treat directory needles like `src/` as directory mentions, not generic prefixes: `src/` should not match
+// `src/app.txt` (the more specific file needle should match instead).
+fn contains_path_token(haystack: &str, needle: &str) -> bool {
+    if needle.is_empty() || haystack.is_empty() {
+        return false;
+    }
+    let hs = haystack.as_bytes();
+    let mut start = 0usize;
+    while let Some(rel) = haystack.get(start..).and_then(|s| s.find(needle)) {
+        let i = start + rel;
+        let j = i + needle.len();
+
+        let before_ok = i == 0 || !is_path_token_byte(hs[i - 1]);
+        let after_ok = j == hs.len() || !continues_path_token(hs, j);
+        if before_ok && after_ok {
+            return true;
+        }
+        start = i + 1;
+        if start >= hs.len() {
+            break;
+        }
+    }
+    false
+}
+
+fn relevant_needles_for_path(path: &str) -> Vec<String> {
+    let mut needles: Vec<String> = Vec::new();
+    needles.push(path.to_owned());
+    needles.push(format!("{path}/"));
+    needles.push(format!("./{path}"));
+    needles.push(format!("./{path}/"));
+    // Add all ancestors: a/b/c.txt -> a/b and a
+    let mut cur = path;
+    while let Some((parent, _base)) = cur.rsplit_once('/') {
+        if parent.is_empty() {
+            break;
+        }
+        needles.push(parent.to_owned());
+        needles.push(format!("{parent}/"));
+        needles.push(format!("./{parent}"));
+        needles.push(format!("./{parent}/"));
+        cur = parent;
+    }
+    needles
+}
+
+fn extract_message_text(body_v: &Value, body_json: &str) -> String {
+    if let Some(t) = body_v.get("text").and_then(|v| v.as_str()) {
+        return t.to_owned();
+    }
+    if let Some(s) = body_v.as_str() {
+        return s.to_owned();
+    }
+    body_json.to_owned()
+}
+
+fn last_relevant_update_from_agent(
+    conn: &Connection,
+    from_agent_id: &str,
+    path: &str,
+) -> Result<Option<(i64, i64, String)>, ()> {
+    let needles = relevant_needles_for_path(path);
+    let mut stmt = conn
+        .prepare(
+            "SELECT id, created_at_ms, body_json FROM messages \
+             WHERE agent_id = ?1 AND kind IN ('message','discovery') \
+             ORDER BY id DESC \
+             LIMIT 500",
+        )
+        .map_err(|_| ())?;
+    let rows = stmt
+        .query_map(params![from_agent_id], |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, i64>(1)?,
+                row.get::<_, String>(2)?,
+            ))
+        })
+        .map_err(|_| ())?;
+
+    for r in rows {
+        let (id, created_at_ms, body_json) = r.map_err(|_| ())?;
+        let body_v: Value =
+            serde_json::from_str(&body_json).unwrap_or(Value::String(body_json.clone()));
+        let txt = extract_message_text(&body_v, &body_json);
+        if needles.iter().any(|n| contains_path_token(&txt, n)) {
+            return Ok(Some((id, created_at_ms, txt)));
+        }
+    }
+    Ok(None)
+}
+
+fn requester_has_acked_since(
+    conn: &Connection,
+    requester_agent_id: &str,
+    target_agent_id: &str,
+    since_created_at_ms: i64,
+) -> Result<bool, ()> {
+    // Humans often omit the colon after the @mention. Treat both as equivalent, but still require
+    // a near-start direct mention to avoid mid-sentence false positives.
+    //
+    // Also accept common sentence punctuation (`.`/`!`/`?`) used in place of the trailing colon.
+    let mut ack_needles_lower: Vec<String> = Vec::with_capacity(8);
+    for base in [
+        format!("@{target_agent_id}: ack"),
+        format!("@{target_agent_id} ack"),
+        format!("@{target_agent_id}: acknowledged"),
+        format!("@{target_agent_id} acknowledged"),
+        format!("@{target_agent_id}: thanks"),
+        format!("@{target_agent_id} thanks"),
+        format!("@{target_agent_id}: got it"),
+        format!("@{target_agent_id} got it"),
+    ] {
+        let base_lower = base.to_ascii_lowercase();
+        // Also accept a bare ack prefix without punctuation (often typed as "@A: ack thanks").
+        ack_needles_lower.push(base_lower.clone());
+        ack_needles_lower.push(format!("{base_lower} "));
+        ack_needles_lower.push(format!("{base_lower}\t"));
+        for p in [':', '.', '!', '?', ','] {
+            ack_needles_lower.push(format!("{base_lower}{p}"));
+        }
+    }
+    let mut stmt = conn
+        .prepare(
+            "SELECT body_json FROM messages \
+             WHERE agent_id = ?1 AND kind = 'message' AND created_at_ms >= ?2 \
+             ORDER BY id DESC \
+             LIMIT 500",
+        )
+        .map_err(|_| ())?;
+    let rows = stmt
+        .query_map(params![requester_agent_id, since_created_at_ms], |row| row.get::<_, String>(0))
+        .map_err(|_| ())?;
+
+    for r in rows {
+        let body_json = r.map_err(|_| ())?;
+        let body_v: Value =
+            serde_json::from_str(&body_json).unwrap_or(Value::String(body_json.clone()));
+        let txt = extract_message_text(&body_v, &body_json);
+        let mut scanned_bytes: usize = 0;
+        let mut in_fenced_code_block = false;
+        for line in txt.lines().take(16) {
+            scanned_bytes = scanned_bytes.saturating_add(line.len());
+            if scanned_bytes > 1024 {
+                break;
+            }
+            let l = line.trim_start();
+            if l.starts_with("```") {
+                in_fenced_code_block = !in_fenced_code_block;
+                continue;
+            }
+            if in_fenced_code_block || l.is_empty() {
+                continue;
+            }
+            for candidate in [
+                l,
+                strip_common_list_prefix(l),
+                strip_leading_markdown_emphasis(l),
+                strip_leading_markdown_emphasis(strip_common_list_prefix(l)),
+            ] {
+                for c in [candidate, strip_leading_wrappers(candidate)] {
+                    let c_lower = c.to_ascii_lowercase();
+                    if ack_needles_lower.iter().any(|n| c_lower.starts_with(n)) {
+                        return Ok(true);
+                    }
+                }
+            }
+        }
+    }
+    Ok(false)
+}
+
+fn strip_common_list_prefix(line: &str) -> &str {
+    // Support common "reply checklist" formatting like:
+    // - @B: ack: ...
+    // - [x] @B: ack: ...
+    // 1. @B: ack: ...
+    // - 1. @B: ack: ...
+    // without becoming overly permissive (avoid mid-sentence false positives).
+    let b = line.as_bytes();
+    if b.is_empty() {
+        return line;
+    }
+
+    let mut i: usize = 0;
+    if matches!(b[0], b'-' | b'*' | b'+') {
+        i = 1;
+    }
+
+    // Skip whitespace after a bullet marker (or at start of line, though callers typically lstrip already).
+    while i < b.len() && (b[i] == b' ' || b[i] == b'\t') {
+        i += 1;
+    }
+
+    // Optional numeric list marker (supports nested patterns like "- 1. ...").
+    let mut j = i;
+    while j < b.len() && b[j].is_ascii_digit() {
+        j += 1;
+    }
+    if j > i && j < b.len() && (b[j] == b'.' || b[j] == b')') {
+        // Require at least one whitespace after the marker to avoid stripping e.g. "1.23".
+        if j + 1 < b.len() && (b[j + 1] == b' ' || b[j + 1] == b'\t') {
+            i = j + 1;
+            while i < b.len() && (b[i] == b' ' || b[i] == b'\t') {
+                i += 1;
+            }
+        }
+    }
+
+    // If we didn't strip a bullet and didn't strip a numeric marker, this isn't a list prefix.
+    if i == 0 {
+        return line;
+    }
+
+    // GitHub-style task list marker: "- [x] ..." / "- [ ] ..."
+    if i + 3 <= b.len()
+        && b[i] == b'['
+        && (b[i + 1] == b' ' || b[i + 1] == b'x' || b[i + 1] == b'X')
+        && b[i + 2] == b']'
+    {
+        i += 3;
+        while i < b.len() && (b[i] == b' ' || b[i] == b'\t') {
+            i += 1;
+        }
+    }
+    &line[i..]
+}
+
+fn strip_leading_markdown_emphasis(line: &str) -> &str {
+    // Support common emphasis wrappers at the start of a reply line, e.g.:
+    // **@B: ack:** ...
+    // *@B: ack:* ...
+    //
+    // Keep this intentionally narrow: only strip leading '*' / '_' when they are immediately
+    // followed by '@'.
+    let b = line.as_bytes();
+    if b.is_empty() {
+        return line;
+    }
+
+    let mut i: usize = 0;
+    while i < b.len() && (b[i] == b'*' || b[i] == b'_') {
+        i += 1;
+    }
+    if i == 0 || i > 3 || i >= b.len() {
+        return line;
+    }
+    if b[i] != b'@' {
+        return line;
+    }
+    &line[i..]
+}
+
+fn strip_leading_wrappers(line: &str) -> &str {
+    // Support common punctuation wrappers at the start of a directive, e.g.:
+    // (@B: resolve: ...) / [@B: ack: ...]
+    // `@B: resolve:` (inline-code formatted)
+    //
+    // Keep this intentionally narrow to avoid mid-sentence false positives.
+    let b = line.as_bytes();
+    if b.is_empty() {
+        return line;
+    }
+
+    let mut i: usize = 0;
+    let mut stripped: usize = 0;
+    while i < b.len() && stripped < 3 {
+        match b[i] {
+            b'(' | b'[' | b'{' => {
+                i += 1;
+                stripped += 1;
+                while i < b.len() && (b[i] == b' ' || b[i] == b'\t') {
+                    i += 1;
+                }
+            }
+            b'`' => {
+                // Inline-code wrapper: only treat as a wrapper when it directly precedes a mention,
+                // e.g. "`@B: resolve:` ...". Avoid becoming permissive about arbitrary backticks.
+                if i + 1 < b.len() && b[i + 1] == b'@' {
+                    i += 1;
+                    stripped += 1;
+                    while i < b.len() && (b[i] == b' ' || b[i] == b'\t') {
+                        i += 1;
+                    }
+                } else {
+                    break;
+                }
+            }
+            _ => break,
+        }
+    }
+    &line[i..]
+}
+
+fn is_indented_at_mention(line: &str) -> bool {
+    // Ignore indented Markdown "code block" style pastes like:
+    // "    @B: resolve: ..." which are almost always prior context.
+    // Keep this intentionally narrow to avoid breaking nested-list variants.
+    let b = line.as_bytes();
+    if b.is_empty() {
+        return false;
+    }
+    let mut i: usize = 0;
+    let mut spaces: usize = 0;
+    let mut saw_tab = false;
+    while i < b.len() {
+        match b[i] {
+            b' ' => {
+                spaces += 1;
+                i += 1;
+            }
+            b'\t' => {
+                saw_tab = true;
+                i += 1;
+            }
+            _ => break,
+        }
+    }
+    if i >= b.len() || b[i] != b'@' {
+        return false;
+    }
+    saw_tab || spaces >= 4
+}
+
+fn is_explicit_closure_to_me(
+    text: &str,
+    ack_to_me_prefix: &str,
+    resolve_to_me_prefix_lower: &str,
+    resolved_to_me_prefix_lower: &str,
+    released_to_me_prefix_lower: &str,
+) -> bool {
+    let ack_to_me_prefix_lower = ack_to_me_prefix.to_ascii_lowercase();
+    let ack_to_me_prefix_space_lower =
+        ack_to_me_prefix_lower.replacen(": ack:", " ack:", 1);
+    let mut ack_needles_lower: Vec<String> = Vec::with_capacity(12);
+    let mut ack_bare_lower: Vec<String> = Vec::with_capacity(4);
+    for n in [
+        ack_to_me_prefix_lower.clone(),
+        ack_to_me_prefix_space_lower.clone(),
+        ack_to_me_prefix_lower.replacen(": ack:", ": acknowledged", 1),
+        ack_to_me_prefix_space_lower.replacen(" ack:", " acknowledged", 1),
+        // Common "ack" synonyms used as a directed reply to an agent.
+        ack_to_me_prefix_lower.replacen(": ack:", ": thanks", 1),
+        ack_to_me_prefix_space_lower.replacen(" ack:", " thanks", 1),
+        ack_to_me_prefix_lower.replacen(": ack:", ": got it", 1),
+        ack_to_me_prefix_space_lower.replacen(" ack:", " got it", 1),
+    ] {
+        ack_needles_lower.push(n.to_owned());
+        if let Some(base) = n.strip_suffix(':') {
+            ack_bare_lower.push(base.to_owned());
+            for p in ['.', '!', '?', ','] {
+                ack_needles_lower.push(format!("{base}{p}"));
+            }
+        }
+    }
+
+    // Treat `@<me>: ack:` as explicit closure, but avoid quote-induced false positives and
+    // false negatives by evaluating per-line (humans commonly quote on one line and reply on the next).
+    //
+    // For `resolve:` / `resolved:` / `released:`, we keep the heuristic intentionally narrow:
+    // only treat it as closure when it's a near-start direct `@<me>:` mention on that specific line.
+    // Also accept common sentence punctuation variants like `resolved.` / `resolve!` (humans often
+    // use '.'/'!'/'?' instead of a trailing colon).
+    //
+    // NOTE: ignore fenced code blocks (```), since users often paste prior context containing
+    // `@<me>: resolve:` / `@<me>: ack:` inside code blocks.
+    let mut closure_needles: Vec<String> = Vec::with_capacity(12);
+    for n in [
+        resolve_to_me_prefix_lower,
+        resolved_to_me_prefix_lower,
+        released_to_me_prefix_lower,
+    ] {
+        closure_needles.push(n.to_owned());
+        if let Some(base) = n.strip_suffix(':') {
+            // `resolved?` / `resolve?` is frequently used as a question ("is this resolved?"),
+            // so avoid treating `?` as an explicit closure signal.
+            for p in ['.', '!', ','] {
+                closure_needles.push(format!("{base}{p}"));
+            }
+        }
+    }
+    // Also treat bare `@<me>: resolve` / `@<me>: resolved` as explicit closure when followed by
+    // a word boundary. Humans often omit trailing punctuation entirely (e.g. "@B: resolved thanks").
+    // Keep this intentionally narrow; in particular, reject `resolve?` / `resolved?`.
+    let mut closure_bare: Vec<String> = Vec::with_capacity(4);
+    for n in [
+        resolve_to_me_prefix_lower,
+        resolved_to_me_prefix_lower,
+        released_to_me_prefix_lower,
+    ] {
+        if let Some(base) = n.strip_suffix(':') {
+            closure_bare.push(base.to_owned());
+        }
+    }
+
+    let mut scanned_bytes: usize = 0;
+    let mut in_fenced_code_block = false;
+    for line in text.lines().take(16) {
+        scanned_bytes = scanned_bytes.saturating_add(line.len());
+        if scanned_bytes > 1024 {
+            break;
+        }
+
+        if is_indented_at_mention(line) {
+            continue;
+        }
+
+        let l = line.trim_start();
+        if l.starts_with("```") {
+            in_fenced_code_block = !in_fenced_code_block;
+            continue;
+        }
+        if in_fenced_code_block {
+            continue;
+        }
+        if l.is_empty() {
+            continue;
+        }
+
+        let l_lower = l.to_ascii_lowercase();
+        let l_md = strip_leading_markdown_emphasis(l);
+        let l_md_lower = l_md.to_ascii_lowercase();
+        let l_list_md = strip_leading_markdown_emphasis(strip_common_list_prefix(l));
+        let l_list_md_lower = l_list_md.to_ascii_lowercase();
+
+        let l_wrap = strip_leading_wrappers(l);
+        let l_wrap_lower = l_wrap.to_ascii_lowercase();
+        let l_md_wrap = strip_leading_wrappers(l_md);
+        let l_md_wrap_lower = l_md_wrap.to_ascii_lowercase();
+        let l_list_md_wrap = strip_leading_wrappers(l_list_md);
+        let l_list_md_wrap_lower = l_list_md_wrap.to_ascii_lowercase();
+
+        let is_ack_line = |raw: &str, lower: &str| {
+            if ack_needles_lower.iter().any(|n| lower.starts_with(n)) {
+                return true;
+            }
+            for base in &ack_bare_lower {
+                if lower.starts_with(base) {
+                    let after = raw.as_bytes().get(base.len()).copied();
+                    match after {
+                        None => return true,
+                        Some(b'?') => return true,
+                        Some(b' ' | b'\t') => return true,
+                        Some(b'.' | b'!' | b',' | b':') => return true,
+                        _ => continue,
+                    }
+                }
+            }
+            false
+        };
+
+        if is_ack_line(l, &l_lower)
+            || is_ack_line(l_md, &l_md_lower)
+            || is_ack_line(l_list_md, &l_list_md_lower)
+            || is_ack_line(l_wrap, &l_wrap_lower)
+            || is_ack_line(l_md_wrap, &l_md_wrap_lower)
+            || is_ack_line(l_list_md_wrap, &l_list_md_wrap_lower)
+        {
+            return true;
+        }
+
+        let candidates: [(&str, &str); 6] = [
+            (l, &l_lower),
+            (l_md, &l_md_lower),
+            (l_list_md, &l_list_md_lower),
+            (l_wrap, &l_wrap_lower),
+            (l_md_wrap, &l_md_wrap_lower),
+            (l_list_md_wrap, &l_list_md_wrap_lower),
+        ];
+        for (c_raw, c_lower) in candidates {
+            for needle in &closure_needles {
+                if let Some(idx) = c_lower.find(needle) {
+                    if idx > 64 {
+                        continue;
+                    }
+                    if idx > 0 {
+                        let prev = c_raw.as_bytes().get(idx - 1).copied().unwrap_or(b' ');
+                        if prev != b' '
+                            && prev != b':'
+                            && prev != b'('
+                            && prev != b'['
+                            && prev != b'{'
+                        {
+                            continue;
+                        }
+                    }
+                    let prefix = &c_raw[..idx];
+                    if prefix.contains('"')
+                        || prefix.contains('\'')
+                        || prefix.contains('`')
+                        || prefix.contains('>')
+                    {
+                        continue;
+                    }
+                    return true;
+                }
+            }
+            for needle in &closure_bare {
+                if let Some(idx) = c_lower.find(needle) {
+                    if idx > 64 {
+                        continue;
+                    }
+                    if idx > 0 {
+                        let prev = c_raw.as_bytes().get(idx - 1).copied().unwrap_or(b' ');
+                        if prev != b' '
+                            && prev != b':'
+                            && prev != b'('
+                            && prev != b'['
+                            && prev != b'{'
+                        {
+                            continue;
+                        }
+                    }
+                    let prefix = &c_raw[..idx];
+                    if prefix.contains('"')
+                        || prefix.contains('\'')
+                        || prefix.contains('`')
+                        || prefix.contains('>')
+                    {
+                        continue;
+                    }
+                    let after = c_raw.as_bytes().get(idx + needle.len()).copied();
+                    match after {
+                        None => return true,
+                        Some(b'?') => continue,
+                        Some(b' ' | b'\t') => return true,
+                        Some(b'.' | b'!' | b',' | b':') => return true,
+                        _ => continue,
+                    }
+                }
+            }
+        }
+    }
+
+    false
+}
+
 fn main() {
     match run() {
         Ok(()) => {}
@@ -247,15 +801,72 @@ fn run() -> Result<(), ()> {
                 ("allow", "no_conflict")
             };
 
+            let (unread_relevant_updates, unread_prev_cursor, unread_cursor) =
+                unread_relevant_updates_for_check(&conn, &agent_id, &path, now_ms)?;
+
+            // If a blocking agent has already posted a relevant update about this path, suppress the
+            // generic "Are you working on it?" ping and instead prefer closed-loop acknowledgement.
+            let blocking_set: HashSet<&str> = blocking_agents.iter().map(|s| s.as_str()).collect();
+            let blockers_with_unread_update: HashSet<String> = unread_relevant_updates
+                .iter()
+                .filter_map(|u| u.get("agent_id").and_then(|v| v.as_str()).map(|s| s.to_owned()))
+                .filter(|a| blocking_set.contains(a.as_str()))
+                .collect();
+
+            // Even after an update is surfaced (cursor advanced), we should not regress into spamming
+            // the generic ping. Track whether each blocker has communicated about this path at all,
+            // and keep suggesting an explicit ack until the requester actually acks.
+            let ack_to_me_prefix = format!("@{agent_id}: ack:");
+            let resolve_to_me_prefix = format!("@{agent_id}: resolve:");
+            let resolved_to_me_prefix = format!("@{agent_id}: resolved:");
+            let released_to_me_prefix = format!("@{agent_id}: released:");
+            let resolve_to_me_prefix_lower = resolve_to_me_prefix.to_ascii_lowercase();
+            let resolved_to_me_prefix_lower = resolved_to_me_prefix.to_ascii_lowercase();
+            let released_to_me_prefix_lower = released_to_me_prefix.to_ascii_lowercase();
+            let mut blockers_with_any_relevant_update: HashSet<String> = HashSet::new();
+            let mut pending_ack_blockers: HashSet<String> = HashSet::new();
+            for blocker in &blocking_agents {
+                if let Some((_id, created_at_ms, txt)) =
+                    last_relevant_update_from_agent(&conn, blocker, &path)?
+                {
+                    blockers_with_any_relevant_update.insert(blocker.to_owned());
+                    if is_explicit_closure_to_me(
+                        &txt,
+                        &ack_to_me_prefix,
+                        &resolve_to_me_prefix_lower,
+                        &resolved_to_me_prefix_lower,
+                        &released_to_me_prefix_lower,
+                    ) {
+                        continue;
+                    }
+                    if !requester_has_acked_since(&conn, &agent_id, blocker, created_at_ms)? {
+                        pending_ack_blockers.insert(blocker.to_owned());
+                    }
+                }
+            }
+
             // Minimal, scriptable action plan: a few commands that wrappers can show or run.
             // Keep it intentionally stringly-typed for now to keep the CLI tiny.
+            let mut pinged_blockers: HashSet<String> = HashSet::new();
             let mut action_plan: Vec<String> = if !blocking_agents.is_empty() {
                 let mut plan = Vec::<String>::new();
                 plan.push(format!("but-engineering-rewrite --agent-id {agent_id} read"));
                 for blocker in &blocking_agents {
+                    if blockers_with_any_relevant_update.contains(blocker)
+                        || blockers_with_unread_update.contains(blocker)
+                    {
+                        continue;
+                    }
+                    // Anti-spam: if the requester already pinged this blocker about this path using
+                    // the standard "Are you working on it?" template, don't keep suggesting the same
+                    // @mention on every subsequent `check` poll.
+                    if requester_already_pinged_blocker(&conn, &agent_id, blocker, &path)? {
+                        continue;
+                    }
                     plan.push(format!(
                         "but-engineering-rewrite --agent-id {agent_id} post \"@{blocker}: I'm about to edit {path}. Are you working on it?\""
                     ));
+                    pinged_blockers.insert(blocker.to_owned());
                 }
                 plan.push(format!(
                     "but-engineering-rewrite --agent-id {agent_id} check --path {path}{}",
@@ -263,7 +874,8 @@ fn run() -> Result<(), ()> {
                 ));
                 plan
             } else {
-                vec![format!("but-engineering-rewrite --agent-id {agent_id} check --path {path}")]
+                // For allow decisions, `check` already happened; avoid suggesting a redundant re-check.
+                Vec::new()
             };
 
             // Multi-step coordination is usually a multi-agent process. Provide a low-noise,
@@ -316,27 +928,61 @@ fn run() -> Result<(), ()> {
                 }
             }
 
-            let (unread_relevant_updates, unread_prev_cursor, unread_cursor) =
-                unread_relevant_updates_for_check(&conn, &agent_id, &path, now_ms)?;
-
             // Coordination compliance closure semantics:
             // If `check` surfaces an unread relevant update, propose a single explicit "ack" per
-            // update-author (excluding blockers, which already get a ping in the plan).
-            if !unread_relevant_updates.is_empty() {
+            // update-author (excluding agents already pinged by the conflict plan).
+            //
+            // Also keep suggesting an ack for blockers who have already communicated about this path
+            // until the requester actually posts an ack (prevents "ping regression" after cursor advances).
+            if !unread_relevant_updates.is_empty() || !pending_ack_blockers.is_empty() {
                 use std::collections::BTreeSet;
-                let blocker_set: HashSet<&str> = blocking_agents.iter().map(|s| s.as_str()).collect();
+                let pinged_set: HashSet<&str> = pinged_blockers.iter().map(|s| s.as_str()).collect();
 
+                // Avoid "ack ping-pong" loops: if the unread update is itself an ack directed
+                // at this agent, do not suggest acknowledging it back.
+                //
+                // Similarly, treat `@<me>: resolve:` / `resolved:` as explicit closure and do not
+                // suggest acknowledging it back.
+                //
+                // Keep this intentionally simple and prefix-based so it also covers human-written
+                // ack variants (not just the exact auto-ack template).
                 let mut ack_agents: BTreeSet<String> = BTreeSet::new();
                 for u in &unread_relevant_updates {
                     if let Some(a) = u.get("agent_id").and_then(|v| v.as_str()) {
                         if a == agent_id {
                             continue;
                         }
-                        if blocker_set.contains(a) {
+                        if pinged_set.contains(a) {
+                            continue;
+                        }
+                        let body_text = u.get("body").and_then(|b| match b {
+                            Value::Object(m) => m.get("text").and_then(|v| v.as_str()),
+                            Value::String(s) => Some(s.as_str()),
+                            _ => None,
+                        });
+                        if body_text.is_some_and(|t| {
+                            is_explicit_closure_to_me(
+                                t,
+                                &ack_to_me_prefix,
+                                &resolve_to_me_prefix_lower,
+                                &resolved_to_me_prefix_lower,
+                                &released_to_me_prefix_lower,
+                            )
+                        }) {
                             continue;
                         }
                         ack_agents.insert(a.to_owned());
                     }
+                }
+
+                for a in &pending_ack_blockers {
+                    if a == &agent_id {
+                        continue;
+                    }
+                    if pinged_set.contains(a.as_str()) {
+                        continue;
+                    }
+                    ack_agents.insert(a.to_owned());
                 }
 
                 for a in ack_agents {
@@ -1050,6 +1696,42 @@ fn coord_stale_threshold_ms() -> i64 {
     s.saturating_mul(1000)
 }
 
+fn requester_already_pinged_blocker(
+    conn: &Connection,
+    requester_agent_id: &str,
+    blocker_agent_id: &str,
+    path: &str,
+) -> Result<bool, ()> {
+    let prefix = format!("@{blocker_agent_id}:");
+    let mut stmt = conn
+        .prepare(
+            "SELECT body_json FROM messages \
+             WHERE agent_id = ?1 AND kind = 'message' \
+             ORDER BY id DESC \
+             LIMIT 200",
+        )
+        .map_err(|_| ())?;
+    let rows = stmt
+        .query_map(params![requester_agent_id], |row| row.get::<_, String>(0))
+        .map_err(|_| ())?;
+    for r in rows {
+        let body_json = r.map_err(|_| ())?;
+        let v: Value = serde_json::from_str(&body_json).unwrap_or(Value::String(body_json));
+        let text = v
+            .get("text")
+            .and_then(|t| t.as_str())
+            .or_else(|| v.as_str())
+            .unwrap_or("");
+        if text.contains(&prefix)
+            && text.contains(path)
+            && text.contains("Are you working on it?")
+        {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
 fn stale_agents_for_blockers(
     conn: &Connection,
     requester_agent_id: &str,
@@ -1121,23 +1803,7 @@ fn unread_relevant_updates_for_check(
     // Heuristic relevance: surface updates that mention either the exact path being checked
     // or an overlapping parent directory (any ancestor). This matches real-world coordination
     // where agents often talk about directories ("src/") rather than exact files ("src/app.txt").
-    let mut needles: Vec<String> = Vec::new();
-    needles.push(path.to_owned());
-    needles.push(format!("{path}/"));
-    needles.push(format!("./{path}"));
-    needles.push(format!("./{path}/"));
-    // Add all ancestors: a/b/c.txt -> a/b and a
-    let mut cur = path;
-    while let Some((parent, _base)) = cur.rsplit_once('/') {
-        if parent.is_empty() {
-            break;
-        }
-        needles.push(parent.to_owned());
-        needles.push(format!("{parent}/"));
-        needles.push(format!("./{parent}"));
-        needles.push(format!("./{parent}/"));
-        cur = parent;
-    }
+    let needles = relevant_needles_for_path(path);
 
     let mut stmt = conn
         .prepare(
@@ -1166,15 +1832,17 @@ fn unread_relevant_updates_for_check(
         let (id, created_at_ms, from_agent, kind, body_json) = r.map_err(|_| ())?;
         max_id = max_id.max(id);
 
-        if !needles.iter().any(|n| body_json.contains(n)) {
+        let body_v: Value =
+            serde_json::from_str(&body_json).unwrap_or(Value::String(body_json.clone()));
+
+        let txt = extract_message_text(&body_v, &body_json);
+        if !needles.iter().any(|n| contains_path_token(&txt, n)) {
             continue;
         }
         if updates.len() >= 20 {
             continue;
         }
 
-        let body_v: Value =
-            serde_json::from_str(&body_json).unwrap_or(Value::String(body_json.clone()));
         updates.push(json!({
             "id": id,
             "created_at_ms": created_at_ms,

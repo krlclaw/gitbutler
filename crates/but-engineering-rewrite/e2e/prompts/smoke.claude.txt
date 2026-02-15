@@ -1,0 +1,4 @@
+E2E smoke test:
+
+Reply with exactly: SMOKE_AGENT_OK
+
