@@ -1418,6 +1418,1080 @@ case_39_ack_unread_updates_closure_semantics() {
   expect_not_contains "$out_b2" "ERW_CASE39_NOTE"
 }
 
+case_40_strict_deny_ack_unread_updates_nonblocker() {
+  bold "Case 40: Strict Deny + Ack Unread Updates (Non-Blocker)"
+  local repo; repo="$(mk_repo)"
+  trap '[[ -n "${repo:-}" ]] && rm -rf "$repo"' RETURN
+
+  local out_a_claim out_c_post out_b
+
+  out_a_claim="$(run_cli "$repo" "A" claim --path src/app.txt --ttl 15m)"
+  out_c_post="$(run_cli "$repo" "C" post "ERW_CASE40_NOTE: Heads up, src/app.txt touches the CLI arg parsing edge-case")"
+
+  out_b="$(run_cli "$repo" "B" check --path src/app.txt --strict)"
+  expect_contains "$out_b" "\"decision\""
+  expect_contains "$out_b" "\"deny\""
+  expect_contains "$out_b" "claimed_by_other"
+  expect_contains "$out_b" "\"blocking_agents\""
+  expect_contains "$out_b" "\"A\""
+
+  # Unread relevant update from a non-blocking agent should still surface.
+  expect_contains "$out_b" "\"unread_relevant_updates\""
+  expect_contains "$out_b" "ERW_CASE40_NOTE"
+  expect_contains "$out_b" "\"agent_id\":\"C\""
+
+  # Closure semantics: suggest ack to C, but not to blocker A.
+  expect_contains "$out_b" "\"action_plan\""
+  expect_contains "$out_b" "@C: ack:"
+  expect_not_contains "$out_b" "@A: ack:"
+}
+
+case_41_miscommunication_repair_release_and_ack() {
+  bold "Case 41: Miscommunication Repair (Release + Ack Closure)"
+  local repo; repo="$(mk_repo)"
+  trap '[[ -n "${repo:-}" ]] && rm -rf "$repo"' RETURN
+
+  local out_a_claim out_b1 out_b_post out_a_reply out_a_release out_b2 out_b3
+
+  # A grabs a broad claim (often done defensively), but B only needs a specific file.
+  out_a_claim="$(run_cli "$repo" "A" claim --path src/ --ttl 15m)"
+
+  # B hits the conflict and should be prompted to ping A to clarify.
+  out_b1="$(run_cli "$repo" "B" check --path src/app.txt)"
+  expect_contains "$out_b1" "\"decision\""
+  expect_contains "$out_b1" "\"warn\""
+  expect_contains "$out_b1" "claimed_by_other"
+  expect_contains "$out_b1" "\"blocking_agents\""
+  expect_contains "$out_b1" "\"A\""
+  expect_contains "$out_b1" "\"action_plan\""
+  expect_contains "$out_b1" "--agent-id B read"
+  expect_contains "$out_b1" "--agent-id B post"
+  expect_contains "$out_b1" "@A:"
+  expect_contains "$out_b1" "Are you working on it?"
+
+  # Miscommunication repair loop: B asks, A replies and releases the broad claim.
+  out_b_post="$(run_cli "$repo" "B" post "@A: I'm only changing src/app.txt; can you narrow/release src/?")"
+  out_a_reply="$(run_cli "$repo" "A" post "ERW_CASE41_REPAIR: @B: ack: I'm not touching src/app.txt; releasing src/ claim now.")"
+  out_a_release="$(run_cli "$repo" "A" release --path src/)"
+
+  # After the release, B should be unblocked and should see A's reply as an unread relevant update.
+  out_b2="$(run_cli "$repo" "B" check --path src/app.txt)"
+  expect_contains "$out_b2" "\"decision\""
+  expect_contains "$out_b2" "\"allow\""
+  expect_contains "$out_b2" "\"blocking_agents\""
+  expect_contains "$out_b2" "\"blocking_agents\":[]"
+  expect_contains "$out_b2" "\"unread_relevant_updates\""
+  expect_contains "$out_b2" "ERW_CASE41_REPAIR"
+
+  # Closure semantics: suggest a single explicit ack back to A (now a non-blocker).
+  expect_contains "$out_b2" "\"action_plan\""
+  expect_contains "$out_b2" "@A: ack:"
+
+  # And the original blocker-ping should no longer appear in the plan.
+  expect_not_contains "$out_b2" "Are you working on it?"
+
+  # Anti-spam: once surfaced, the update and ack suggestion should not repeat.
+  out_b3="$(run_cli "$repo" "B" check --path src/app.txt)"
+  expect_not_contains "$out_b3" "ERW_CASE41_REPAIR"
+  expect_not_contains "$out_b3" "@A: ack:"
+}
+
+case_49_resolve_closes_loop_no_ack_needed() {
+  bold "Case 49: Resolve Closes Loop (No Ack Needed)"
+  local repo; repo="$(mk_repo)"
+  trap '[[ -n "${repo:-}" ]] && rm -rf "$repo"' RETURN
+
+  local out_a_claim out_b1 out_b_post out_a_resolve out_a_release out_b2 out_b3
+
+  # A grabs a broad claim, blocking B's file-level edit.
+  out_a_claim="$(run_cli "$repo" "A" claim --path src/ --ttl 15m)"
+
+  # B hits the conflict and should be prompted to ping A.
+  out_b1="$(run_cli "$repo" "B" check --path src/app.txt)"
+  expect_contains "$out_b1" "\"decision\""
+  expect_contains "$out_b1" "\"warn\""
+  expect_contains "$out_b1" "claimed_by_other"
+  expect_contains "$out_b1" "\"blocking_agents\""
+  expect_contains "$out_b1" "\"A\""
+  expect_contains "$out_b1" "\"action_plan\""
+  expect_contains "$out_b1" "@A:"
+  expect_contains "$out_b1" "Are you working on it?"
+
+  # Miscommunication repair loop: B asks, A explicitly resolves and releases.
+  out_b_post="$(run_cli "$repo" "B" post "@A: I'm only changing src/app.txt; are you?")"
+  out_a_resolve="$(run_cli "$repo" "A" post "ERW_CASE49_RESOLVE: @B: resolve: not touching src/app.txt; releasing src/ claim now.")"
+  out_a_release="$(run_cli "$repo" "A" release --path src/)"
+
+  # After the release, B should be unblocked and should see A's resolve message as an unread relevant update.
+  out_b2="$(run_cli "$repo" "B" check --path src/app.txt)"
+  expect_contains "$out_b2" "\"decision\""
+  expect_contains "$out_b2" "\"allow\""
+  expect_contains "$out_b2" "\"blocking_agents\":[]"
+  expect_contains "$out_b2" "\"unread_relevant_updates\""
+  expect_contains "$out_b2" "ERW_CASE49_RESOLVE"
+
+  # Closure semantics: a "resolve:" is explicit closure, so do not suggest acking it back.
+  expect_contains "$out_b2" "\"action_plan\""
+  expect_not_contains "$out_b2" "@A: ack:"
+
+  # And the original blocker-ping should not appear once there are no blockers.
+  expect_not_contains "$out_b2" "Are you working on it?"
+
+  # Anti-spam: once surfaced, the update should not repeat.
+  out_b3="$(run_cli "$repo" "B" check --path src/app.txt)"
+  expect_not_contains "$out_b3" "ERW_CASE49_RESOLVE"
+}
+
+case_58_paren_resolve_is_closure_no_ack_needed() {
+  bold "Case 58: Parenthesized Resolve Is Closure (No Ack Needed)"
+  local repo; repo="$(mk_repo)"
+  trap '[[ -n "${repo:-}" ]] && rm -rf "$repo"' RETURN
+
+  local out_a_claim out_b1 out_b_post out_a_resolve out_a_release out_b2 out_b3
+
+  # A grabs a broad claim, blocking B's file-level edit.
+  out_a_claim="$(run_cli "$repo" "A" claim --path src/ --ttl 15m)"
+
+  # B hits the conflict and should be prompted to ping A.
+  out_b1="$(run_cli "$repo" "B" check --path src/app.txt)"
+  expect_contains "$out_b1" "\"decision\""
+  expect_contains "$out_b1" "\"warn\""
+  expect_contains "$out_b1" "claimed_by_other"
+  expect_contains "$out_b1" "\"blocking_agents\""
+  expect_contains "$out_b1" "\"A\""
+  expect_contains "$out_b1" "\"action_plan\""
+  expect_contains "$out_b1" "@A:"
+  expect_contains "$out_b1" "Are you working on it?"
+
+  # Miscommunication repair loop: B asks, A explicitly resolves (common parenthetical aside) and releases.
+  out_b_post="$(run_cli "$repo" "B" post "@A: I'm only changing src/app.txt; are you?")"
+  out_a_resolve="$(run_cli "$repo" "A" post "ERW_CASE58_PAREN_RESOLVE: (@B: resolve: not touching src/app.txt; releasing src/ claim now.)")"
+  out_a_release="$(run_cli "$repo" "A" release --path src/)"
+
+  # After the release, B should be unblocked and should see A's resolve message as an unread relevant update.
+  out_b2="$(run_cli "$repo" "B" check --path src/app.txt)"
+  expect_contains "$out_b2" "\"decision\""
+  expect_contains "$out_b2" "\"allow\""
+  expect_contains "$out_b2" "\"blocking_agents\":[]"
+  expect_contains "$out_b2" "\"unread_relevant_updates\""
+  expect_contains "$out_b2" "ERW_CASE58_PAREN_RESOLVE"
+
+  # Closure semantics: parenthesized `resolve:` directed at B is still explicit closure, so do not suggest acking it back.
+  expect_contains "$out_b2" "\"action_plan\""
+  expect_not_contains "$out_b2" "@A: ack:"
+
+  # Anti-spam: once surfaced, the update should not repeat.
+  out_b3="$(run_cli "$repo" "B" check --path src/app.txt)"
+  expect_not_contains "$out_b3" "ERW_CASE58_PAREN_RESOLVE"
+}
+
+case_60_resolved_dot_is_closure_no_ack_needed() {
+  bold "Case 60: Resolved With Punctuation Is Closure (No Ack Needed)"
+  local repo; repo="$(mk_repo)"
+  trap '[[ -n "${repo:-}" ]] && rm -rf "$repo"' RETURN
+
+  local out_a_claim out_b1 out_b_post out_a_resolved out_a_release out_b2 out_b3
+
+  # A grabs a broad claim, blocking B's file-level edit.
+  out_a_claim="$(run_cli "$repo" "A" claim --path src/ --ttl 15m)"
+
+  # B hits the conflict and should be prompted to ping A.
+  out_b1="$(run_cli "$repo" "B" check --path src/app.txt)"
+  expect_contains "$out_b1" "\"decision\""
+  expect_contains "$out_b1" "\"warn\""
+  expect_contains "$out_b1" "claimed_by_other"
+  expect_contains "$out_b1" "\"blocking_agents\""
+  expect_contains "$out_b1" "\"A\""
+  expect_contains "$out_b1" "\"action_plan\""
+  expect_contains "$out_b1" "@A:"
+  expect_contains "$out_b1" "Are you working on it?"
+
+  # Miscommunication repair loop: B asks, A explicitly resolves (with punctuation) and releases.
+  out_b_post="$(run_cli "$repo" "B" post "@A: I'm only changing src/app.txt; are you?")"
+  out_a_resolved="$(run_cli "$repo" "A" post "ERW_CASE60_RESOLVED_DOT: @B: resolved. Not touching src/app.txt; releasing src/ claim now.")"
+  out_a_release="$(run_cli "$repo" "A" release --path src/)"
+
+  # After the release, B should be unblocked and should see A's message as an unread relevant update.
+  out_b2="$(run_cli "$repo" "B" check --path src/app.txt)"
+  expect_contains "$out_b2" "\"decision\""
+  expect_contains "$out_b2" "\"allow\""
+  expect_contains "$out_b2" "\"blocking_agents\":[]"
+  expect_contains "$out_b2" "\"unread_relevant_updates\""
+  expect_contains "$out_b2" "ERW_CASE60_RESOLVED_DOT"
+
+  # Closure semantics: `resolved.` directed at B is explicit closure; do not suggest acking it back.
+  expect_contains "$out_b2" "\"action_plan\""
+  expect_not_contains "$out_b2" "@A: ack:"
+
+  # Anti-spam: once surfaced, the update should not repeat.
+  out_b3="$(run_cli "$repo" "B" check --path src/app.txt)"
+  expect_not_contains "$out_b3" "ERW_CASE60_RESOLVED_DOT"
+}
+
+case_68_resolved_without_punctuation_is_closure_no_ack_needed() {
+  bold "Case 68: Resolved Without Punctuation Is Closure (No Ack Needed)"
+  local repo; repo="$(mk_repo)"
+  trap '[[ -n "${repo:-}" ]] && rm -rf "$repo"' RETURN
+
+  local out_a_claim out_b1 out_b_post out_a_resolved out_a_release out_b2 out_b3
+
+  # A grabs a broad claim, blocking B's file-level edit.
+  out_a_claim="$(run_cli "$repo" "A" claim --path src/ --ttl 15m)"
+
+  # B hits the conflict and should be prompted to ping A.
+  out_b1="$(run_cli "$repo" "B" check --path src/app.txt)"
+  expect_contains "$out_b1" "\"decision\""
+  expect_contains "$out_b1" "\"warn\""
+  expect_contains "$out_b1" "claimed_by_other"
+  expect_contains "$out_b1" "\"blocking_agents\""
+  expect_contains "$out_b1" "\"A\""
+  expect_contains "$out_b1" "\"action_plan\""
+  expect_contains "$out_b1" "@A:"
+  expect_contains "$out_b1" "Are you working on it?"
+
+  # Miscommunication repair loop: B asks, A explicitly resolves (no punctuation) and releases.
+  out_b_post="$(run_cli "$repo" "B" post "@A: I'm only changing src/app.txt; are you?")"
+  out_a_resolved="$(run_cli "$repo" "A" post "ERW_CASE68_RESOLVED_BARE: @B: resolved Not touching src/app.txt; releasing src/ claim now.")"
+  out_a_release="$(run_cli "$repo" "A" release --path src/)"
+
+  # After the release, B should be unblocked and should see A's message as an unread relevant update.
+  out_b2="$(run_cli "$repo" "B" check --path src/app.txt)"
+  expect_contains "$out_b2" "\"decision\""
+  expect_contains "$out_b2" "\"allow\""
+  expect_contains "$out_b2" "\"blocking_agents\":[]"
+  expect_contains "$out_b2" "\"unread_relevant_updates\""
+  expect_contains "$out_b2" "ERW_CASE68_RESOLVED_BARE"
+
+  # Closure semantics: bare `resolved` directed at B is explicit closure; do not suggest acking it back.
+  expect_contains "$out_b2" "\"action_plan\""
+  expect_not_contains "$out_b2" "@A: ack:"
+
+  # Anti-spam: once surfaced, the update should not repeat.
+  out_b3="$(run_cli "$repo" "B" check --path src/app.txt)"
+  expect_not_contains "$out_b3" "ERW_CASE68_RESOLVED_BARE"
+}
+
+case_73_released_is_closure_no_ack_needed() {
+  bold "Case 73: Released Is Closure (No Ack Needed)"
+  local repo; repo="$(mk_repo)"
+  trap '[[ -n "${repo:-}" ]] && rm -rf "$repo"' RETURN
+
+  local out_a_claim out_b1 out_b_post out_a_released out_a_release out_b2 out_b3
+
+  # A grabs a broad claim, blocking B's file-level edit.
+  out_a_claim="$(run_cli "$repo" "A" claim --path src/ --ttl 15m)"
+
+  # B hits the conflict and should be prompted to ping A.
+  out_b1="$(run_cli "$repo" "B" check --path src/app.txt)"
+  expect_contains "$out_b1" "\"decision\""
+  expect_contains "$out_b1" "\"warn\""
+  expect_contains "$out_b1" "claimed_by_other"
+  expect_contains "$out_b1" "\"blocking_agents\""
+  expect_contains "$out_b1" "\"A\""
+  expect_contains "$out_b1" "\"action_plan\""
+  expect_contains "$out_b1" "@A:"
+  expect_contains "$out_b1" "Are you working on it?"
+
+  # Miscommunication repair loop: B asks, A confirms they already released and then releases the claim.
+  out_b_post="$(run_cli "$repo" "B" post "@A: I'm only changing src/app.txt; are you?")"
+  out_a_released="$(run_cli "$repo" "A" post "ERW_CASE73_RELEASED: @B: released Not touching src/app.txt; releasing src/ claim now.")"
+  out_a_release="$(run_cli "$repo" "A" release --path src/)"
+
+  # After the release, B should be unblocked and should see A's message as an unread relevant update.
+  out_b2="$(run_cli "$repo" "B" check --path src/app.txt)"
+  expect_contains "$out_b2" "\"decision\""
+  expect_contains "$out_b2" "\"allow\""
+  expect_contains "$out_b2" "\"blocking_agents\":[]"
+  expect_contains "$out_b2" "\"unread_relevant_updates\""
+  expect_contains "$out_b2" "ERW_CASE73_RELEASED"
+
+  # Closure semantics: bare `released` directed at B is explicit closure; do not suggest acking it back.
+  expect_contains "$out_b2" "\"action_plan\""
+  expect_not_contains "$out_b2" "@A: ack:"
+
+  # Anti-spam: once surfaced, the update should not repeat.
+  out_b3="$(run_cli "$repo" "B" check --path src/app.txt)"
+  expect_not_contains "$out_b3" "ERW_CASE73_RELEASED"
+}
+
+case_69_inline_code_resolve_is_closure_no_ack_needed() {
+  bold "Case 69: Inline-Code Resolve Is Closure (No Ack Needed)"
+  local repo; repo="$(mk_repo)"
+  trap '[[ -n "${repo:-}" ]] && rm -rf "$repo"' RETURN
+
+  local out_a_claim out_b1 out_b_post out_a_resolve out_a_release out_b2 out_b3
+
+  # A grabs a broad claim, blocking B's file-level edit.
+  out_a_claim="$(run_cli "$repo" "A" claim --path src/ --ttl 15m)"
+
+  # B hits the conflict and should be prompted to ping A.
+  out_b1="$(run_cli "$repo" "B" check --path src/app.txt)"
+  expect_contains "$out_b1" "\"decision\""
+  expect_contains "$out_b1" "\"warn\""
+  expect_contains "$out_b1" "claimed_by_other"
+  expect_contains "$out_b1" "\"blocking_agents\""
+  expect_contains "$out_b1" "\"A\""
+  expect_contains "$out_b1" "\"action_plan\""
+  expect_contains "$out_b1" "@A:"
+  expect_contains "$out_b1" "Are you working on it?"
+
+  # Miscommunication repair loop: B asks, A explicitly resolves using inline-code formatting and releases.
+  out_b_post="$(run_cli "$repo" "B" post "@A: I'm only changing src/app.txt; are you?")"
+  out_a_resolve="$(run_cli "$repo" "A" post $'ERW_CASE69_INLINE_CODE_RESOLVE: reply checklist:\n- `@B: resolve:` not touching src/app.txt; releasing src/ claim now.')"
+  out_a_release="$(run_cli "$repo" "A" release --path src/)"
+
+  # After the release, B should be unblocked and should see A's message as an unread relevant update.
+  out_b2="$(run_cli "$repo" "B" check --path src/app.txt)"
+  expect_contains "$out_b2" "\"decision\""
+  expect_contains "$out_b2" "\"allow\""
+  expect_contains "$out_b2" "\"blocking_agents\":[]"
+  expect_contains "$out_b2" "\"unread_relevant_updates\""
+  expect_contains "$out_b2" "ERW_CASE69_INLINE_CODE_RESOLVE"
+
+  # Closure semantics: an inline-code `@B: resolve:` is still explicit closure; do not suggest acking it back.
+  expect_contains "$out_b2" "\"action_plan\""
+  expect_not_contains "$out_b2" "@A: ack:"
+
+  # Anti-spam: once surfaced, the update should not repeat.
+  out_b3="$(run_cli "$repo" "B" check --path src/app.txt)"
+  expect_not_contains "$out_b3" "ERW_CASE69_INLINE_CODE_RESOLVE"
+}
+
+case_66_resolved_question_mark_is_not_closure() {
+  bold "Case 66: Resolved Question Mark Is Not Closure (Still Needs Ack)"
+  local repo; repo="$(mk_repo)"
+  trap '[[ -n "${repo:-}" ]] && rm -rf "$repo"' RETURN
+
+  local out_a_claim out_b1 out_b_post out_a_resolved_q out_a_release out_b2 out_b3
+
+  # A grabs a broad claim, blocking B's file-level edit.
+  out_a_claim="$(run_cli "$repo" "A" claim --path src/ --ttl 15m)"
+
+  # B hits the conflict and should be prompted to ping A.
+  out_b1="$(run_cli "$repo" "B" check --path src/app.txt)"
+  expect_contains "$out_b1" "\"decision\""
+  expect_contains "$out_b1" "\"warn\""
+  expect_contains "$out_b1" "claimed_by_other"
+  expect_contains "$out_b1" "\"blocking_agents\""
+  expect_contains "$out_b1" "\"A\""
+  expect_contains "$out_b1" "\"action_plan\""
+  expect_contains "$out_b1" "@A:"
+  expect_contains "$out_b1" "Are you working on it?"
+
+  # B asks; A replies with a question-form "resolved?" and releases.
+  out_b_post="$(run_cli "$repo" "B" post "@A: I'm only changing src/app.txt; are you?")"
+  out_a_resolved_q="$(run_cli "$repo" "A" post "ERW_CASE66_RESOLVED_QMARK: @B: resolved? I think I'm done, can you take over src/app.txt? Releasing src/ claim now.")"
+  out_a_release="$(run_cli "$repo" "A" release --path src/)"
+
+  # After the release, B should be unblocked and should see A's message as an unread relevant update.
+  out_b2="$(run_cli "$repo" "B" check --path src/app.txt)"
+  expect_contains "$out_b2" "\"decision\""
+  expect_contains "$out_b2" "\"allow\""
+  expect_contains "$out_b2" "\"blocking_agents\":[]"
+  expect_contains "$out_b2" "\"unread_relevant_updates\""
+  expect_contains "$out_b2" "ERW_CASE66_RESOLVED_QMARK"
+
+  # Closure semantics: `resolved?` is often a question; do not treat it as explicit closure.
+  # Suggest acking the update to close the loop.
+  expect_contains "$out_b2" "\"action_plan\""
+  expect_contains "$out_b2" "@A: ack:"
+
+  # Anti-spam: once surfaced, the update should not repeat.
+  out_b3="$(run_cli "$repo" "B" check --path src/app.txt)"
+  expect_not_contains "$out_b3" "ERW_CASE66_RESOLVED_QMARK"
+}
+
+case_50_quoted_resolve_is_not_closure() {
+  bold "Case 50: Quoted Resolve Is Not Closure (Still Needs Ack)"
+  local repo; repo="$(mk_repo)"
+  trap '[[ -n "${repo:-}" ]] && rm -rf "$repo"' RETURN
+
+  local out_a_post out_b1
+
+  # Humans often quote prior messages. Quoted `@B: resolve:` should NOT be treated as explicit
+  # closure directed at B; it is just text, and B should still be prompted to ack the update.
+  out_a_post="$(run_cli "$repo" "A" post "ERW_CASE50_QUOTED: quoting: \"@B: resolve: go ahead\". Real update: src/app.txt needs a follow-up test before EOD.")"
+
+  out_b1="$(run_cli "$repo" "B" check --path src/app.txt)"
+  expect_contains "$out_b1" "\"decision\""
+  expect_contains "$out_b1" "\"allow\""
+  expect_contains "$out_b1" "\"unread_relevant_updates\""
+  expect_contains "$out_b1" "ERW_CASE50_QUOTED"
+
+  # Coordination usefulness: suggest an explicit ack to close the loop.
+  expect_contains "$out_b1" "\"action_plan\""
+  expect_contains "$out_b1" "@A: ack:"
+}
+
+case_51_quoted_then_resolve_is_closure() {
+  bold "Case 51: Quoted Then Resolve Is Closure (No Ack Needed)"
+  local repo; repo="$(mk_repo)"
+  trap '[[ -n "${repo:-}" ]] && rm -rf "$repo"' RETURN
+
+  local out_a_post out_b1
+
+  # Humans often quote prior messages and then add the real directed closure on the next line.
+  # The *actual* `@B: resolve:` should still be treated as explicit closure (no ack needed),
+  # even if an earlier line contains a quoted resolve snippet.
+  out_a_post="$(run_cli "$repo" "A" post $'ERW_CASE51_QUOTE_THEN_RESOLVE: quoting:\n> @B: resolve: go ahead\n@B: resolve: not touching src/app.txt; you are unblocked.')"
+
+  out_b1="$(run_cli "$repo" "B" check --path src/app.txt)"
+  expect_contains "$out_b1" "\"decision\""
+  expect_contains "$out_b1" "\"allow\""
+  expect_contains "$out_b1" "\"unread_relevant_updates\""
+  expect_contains "$out_b1" "ERW_CASE51_QUOTE_THEN_RESOLVE"
+
+  # Closure semantics: `resolve:` directed at B should close the loop; do not suggest acking it back.
+  expect_contains "$out_b1" "\"action_plan\""
+  expect_not_contains "$out_b1" "@A: ack:"
+}
+
+case_52_codeblock_resolve_is_not_closure() {
+  bold "Case 52: Code Block Resolve Is Not Closure (Still Needs Ack)"
+  local repo; repo="$(mk_repo)"
+  trap '[[ -n "${repo:-}" ]] && rm -rf "$repo"' RETURN
+
+  local out_a_post out_b1
+
+  # Humans often paste prior context in fenced code blocks. A resolve snippet inside a code block
+  # should NOT be treated as explicit closure directed at B; B should still be prompted to ack.
+  out_a_post="$(run_cli "$repo" "A" post $'ERW_CASE52_CODEBLOCK: prior context:\n```text\n@B: resolve: go ahead\n```\nReal update: src/app.txt needs a follow-up test before EOD.')"
+
+  out_b1="$(run_cli "$repo" "B" check --path src/app.txt)"
+  expect_contains "$out_b1" "\"decision\""
+  expect_contains "$out_b1" "\"allow\""
+  expect_contains "$out_b1" "\"unread_relevant_updates\""
+  expect_contains "$out_b1" "ERW_CASE52_CODEBLOCK"
+
+  # Coordination usefulness: suggest an explicit ack to close the loop (code-block resolve is not closure).
+  expect_contains "$out_b1" "\"action_plan\""
+  expect_contains "$out_b1" "@A: ack:"
+}
+
+case_61_indented_resolve_is_not_closure() {
+  bold "Case 61: Indented Resolve Is Not Closure (Still Needs Ack)"
+  local repo; repo="$(mk_repo)"
+  trap '[[ -n "${repo:-}" ]] && rm -rf "$repo"' RETURN
+
+  local out_a_post out_b1
+
+  # Humans often paste prior context as an indented block (Markdown "indented code block" style).
+  # An indented `@B: resolve:` snippet should NOT be treated as explicit closure directed at B.
+  out_a_post="$(run_cli "$repo" "A" post $'ERW_CASE61_INDENTED: prior context:\n    @B: resolve: go ahead\nReal update: src/app.txt needs a follow-up test before EOD.')"
+
+  out_b1="$(run_cli "$repo" "B" check --path src/app.txt)"
+  expect_contains "$out_b1" "\"decision\""
+  expect_contains "$out_b1" "\"allow\""
+  expect_contains "$out_b1" "\"unread_relevant_updates\""
+  expect_contains "$out_b1" "ERW_CASE61_INDENTED"
+
+  # Coordination usefulness: suggest an explicit ack to close the loop (indented resolve is not closure).
+  expect_contains "$out_b1" "\"action_plan\""
+  expect_contains "$out_b1" "@A: ack:"
+}
+
+case_62_indented_ack_is_not_closure() {
+  bold "Case 62: Indented Ack Is Not Closure (Still Needs Ack)"
+  local repo; repo="$(mk_repo)"
+  trap '[[ -n "${repo:-}" ]] && rm -rf "$repo"' RETURN
+
+  local out_a_post out_b1
+
+  # Humans also paste prior context as indented blocks. An indented `@B: ack:` snippet should NOT
+  # be treated as explicit closure directed at B; B should still be prompted to ack the real update.
+  out_a_post="$(run_cli "$repo" "A" post $'ERW_CASE62_INDENTED_ACK: prior context:\n    @B: ack: yup, understood\nReal update: src/app.txt needs a follow-up test before EOD.')"
+
+  out_b1="$(run_cli "$repo" "B" check --path src/app.txt)"
+  expect_contains "$out_b1" "\"decision\""
+  expect_contains "$out_b1" "\"allow\""
+  expect_contains "$out_b1" "\"unread_relevant_updates\""
+  expect_contains "$out_b1" "ERW_CASE62_INDENTED_ACK"
+
+  # Coordination usefulness: suggest an explicit ack to close the loop (indented ack is not closure).
+  expect_contains "$out_b1" "\"action_plan\""
+  expect_contains "$out_b1" "@A: ack:"
+}
+
+case_63_comma_ack_is_closure() {
+  bold "Case 63: Comma Ack Is Closure (No Ack Ping-Pong)"
+  local repo; repo="$(mk_repo)"
+  trap '[[ -n "${repo:-}" ]] && rm -rf "$repo"' RETURN
+
+  local out_a_post out_b1
+
+  # Humans often write "ack, ..." (comma) instead of the stricter "ack:".
+  # This is still explicit closure directed at B, so B should not be prompted to acknowledge it back.
+  out_a_post="$(run_cli "$repo" "A" post $'ERW_CASE63_COMMA_ACK: reply checklist:\n@B: ack, yep, saw your ping.\nFYI: src/app.txt needs a follow-up test before EOD.')"
+
+  out_b1="$(run_cli "$repo" "B" check --path src/app.txt)"
+  expect_contains "$out_b1" "\"decision\""
+  expect_contains "$out_b1" "\"allow\""
+  expect_contains "$out_b1" "\"unread_relevant_updates\""
+  expect_contains "$out_b1" "ERW_CASE63_COMMA_ACK"
+
+  # Closure semantics: don't suggest acking it back.
+  expect_contains "$out_b1" "\"action_plan\""
+  expect_not_contains "$out_b1" "@A: ack:"
+}
+
+case_70_bare_ack_is_closure() {
+  bold "Case 70: Bare Ack Is Closure (No Ack Ping-Pong)"
+  local repo; repo="$(mk_repo)"
+  trap '[[ -n "${repo:-}" ]] && rm -rf "$repo"' RETURN
+
+  local out_a_post out_b1
+
+  # Humans often write a minimal "@B: ack" without the trailing colon or punctuation.
+  # This is still explicit closure directed at B, so B should not be prompted to acknowledge it back.
+  out_a_post="$(run_cli "$repo" "A" post $'ERW_CASE70_BARE_ACK: reply checklist:\n@B: ack\nFYI: src/app.txt needs a follow-up test before EOD.')"
+
+  out_b1="$(run_cli "$repo" "B" check --path src/app.txt)"
+  expect_contains "$out_b1" "\"decision\""
+  expect_contains "$out_b1" "\"allow\""
+  expect_contains "$out_b1" "\"unread_relevant_updates\""
+  expect_contains "$out_b1" "ERW_CASE70_BARE_ACK"
+
+  # Closure semantics: don't suggest acking it back.
+  expect_contains "$out_b1" "\"action_plan\""
+  expect_not_contains "$out_b1" "@A: ack:"
+}
+
+case_64_bolded_resolve_is_closure() {
+  bold "Case 64: Bolded Resolve Is Closure (Markdown Emphasis)"
+  local repo; repo="$(mk_repo)"
+  trap '[[ -n "${repo:-}" ]] && rm -rf "$repo"' RETURN
+
+  local out_a_claim out_b1 out_b_post out_a_resolve out_a_release out_b2 out_b3
+
+  # A grabs a broad claim, blocking B's file-level edit.
+  out_a_claim="$(run_cli "$repo" "A" claim --path src/ --ttl 15m)"
+
+  # B hits the conflict and should be prompted to ping A.
+  out_b1="$(run_cli "$repo" "B" check --path src/app.txt)"
+  expect_contains "$out_b1" "\"decision\""
+  expect_contains "$out_b1" "\"warn\""
+  expect_contains "$out_b1" "claimed_by_other"
+  expect_contains "$out_b1" "\"blocking_agents\""
+  expect_contains "$out_b1" "\"A\""
+  expect_contains "$out_b1" "\"action_plan\""
+  expect_contains "$out_b1" "@A:"
+  expect_contains "$out_b1" "Are you working on it?"
+
+  # Miscommunication repair loop: B asks, A explicitly resolves in common "reply checklist" style and releases.
+  out_b_post="$(run_cli "$repo" "B" post "@A: I'm only changing src/app.txt; are you?")"
+  out_a_resolve="$(run_cli "$repo" "A" post $'ERW_CASE64_BOLDED_RESOLVE: reply checklist:\n- **@B: resolve:** not touching src/app.txt; releasing src/ claim now.')"
+  out_a_release="$(run_cli "$repo" "A" release --path src/)"
+
+  # After the release, B should be unblocked and should see A's message as an unread relevant update.
+  out_b2="$(run_cli "$repo" "B" check --path src/app.txt)"
+  expect_contains "$out_b2" "\"decision\""
+  expect_contains "$out_b2" "\"allow\""
+  expect_contains "$out_b2" "\"blocking_agents\":[]"
+  expect_contains "$out_b2" "\"unread_relevant_updates\""
+  expect_contains "$out_b2" "ERW_CASE64_BOLDED_RESOLVE"
+
+  # Closure semantics: a bolded/list-prefixed `resolve:` is explicit closure; do not suggest acking it back.
+  expect_contains "$out_b2" "\"action_plan\""
+  expect_not_contains "$out_b2" "@A: ack:"
+
+  # And the original blocker-ping should not appear once there are no blockers.
+  expect_not_contains "$out_b2" "Are you working on it?"
+
+  # Anti-spam: once surfaced, the update should not repeat.
+  out_b3="$(run_cli "$repo" "B" check --path src/app.txt)"
+  expect_not_contains "$out_b3" "ERW_CASE64_BOLDED_RESOLVE"
+}
+
+case_65_mixed_unread_updates_per_author_closure_filtering() {
+  bold "Case 65: Mixed Unread Updates (Per-Author Closure Filtering)"
+  local repo; repo="$(mk_repo)"
+  trap '[[ -n "${repo:-}" ]] && rm -rf "$repo"' RETURN
+
+  local out_a_post out_c_post out_b1
+
+  # Realistic coordination: multiple agents may post updates about the same path. If one of those
+  # updates is explicit closure directed at the requester (e.g. `@B: resolve:`), `check --path`
+  # should only suggest acks for the *other* authors that still need closed-loop acknowledgement.
+  out_a_post="$(run_cli "$repo" "A" post $'ERW_CASE65_RESOLVE:\n@B: resolve: not touching src/app.txt; you are unblocked.')"
+  out_c_post="$(run_cli "$repo" "C" post "ERW_CASE65_NOTE: FYI I may touch src/app.txt after lunch")"
+
+  out_b1="$(run_cli "$repo" "B" check --path src/app.txt)"
+  expect_contains "$out_b1" "\"decision\""
+  expect_contains "$out_b1" "\"allow\""
+  expect_contains "$out_b1" "\"unread_relevant_updates\""
+  expect_contains "$out_b1" "ERW_CASE65_RESOLVE"
+  expect_contains "$out_b1" "ERW_CASE65_NOTE"
+
+  # Closure semantics: don't suggest acking A's explicit `resolve:` back, but do suggest acking C.
+  expect_contains "$out_b1" "\"action_plan\""
+  expect_contains "$out_b1" "@C: ack:"
+  expect_not_contains "$out_b1" "@A: ack:"
+}
+
+case_53_bulleted_ack_is_closure() {
+  bold "Case 53: Bulleted Ack Is Closure (No Ack Ping-Pong)"
+  local repo; repo="$(mk_repo)"
+  trap '[[ -n "${repo:-}" ]] && rm -rf "$repo"' RETURN
+
+  local out_a_post out_b1
+
+  # Humans often respond with a checklist format. A bulleted `@B: ack:` is still explicit closure
+  # directed at B, so B should not be prompted to acknowledge the message back.
+  out_a_post="$(run_cli "$repo" "A" post $'ERW_CASE53_BULLET_ACK: reply checklist:\n- @B: ack: yep, I saw your ping.\nFYI: src/app.txt needs a follow-up test before EOD.')"
+
+  out_b1="$(run_cli "$repo" "B" check --path src/app.txt)"
+  expect_contains "$out_b1" "\"decision\""
+  expect_contains "$out_b1" "\"allow\""
+  expect_contains "$out_b1" "\"unread_relevant_updates\""
+  expect_contains "$out_b1" "ERW_CASE53_BULLET_ACK"
+
+  # Closure semantics: don't suggest acking it back.
+  expect_contains "$out_b1" "\"action_plan\""
+  expect_not_contains "$out_b1" "@A: ack:"
+}
+
+case_54_tasklist_ack_is_closure() {
+  bold "Case 54: Tasklist Ack Is Closure (No Ack Ping-Pong)"
+  local repo; repo="$(mk_repo)"
+  trap '[[ -n "${repo:-}" ]] && rm -rf "$repo"' RETURN
+
+  local out_a_post out_b1
+
+  # Humans often respond with GitHub-style task lists. A tasklist `- [x] @B: ack:` should still
+  # be treated as explicit closure directed at B, so B should not be prompted to ack it back.
+  out_a_post="$(run_cli "$repo" "A" post $'ERW_CASE54_TASKLIST_ACK: reply checklist:\n- [x] @B: ack: yep, I saw your ping.\nFYI: src/app.txt needs a follow-up test before EOD.')"
+
+  out_b1="$(run_cli "$repo" "B" check --path src/app.txt)"
+  expect_contains "$out_b1" "\"decision\""
+  expect_contains "$out_b1" "\"allow\""
+  expect_contains "$out_b1" "\"unread_relevant_updates\""
+  expect_contains "$out_b1" "ERW_CASE54_TASKLIST_ACK"
+
+  # Closure semantics: don't suggest acking it back.
+  expect_contains "$out_b1" "\"action_plan\""
+  expect_not_contains "$out_b1" "@A: ack:"
+}
+
+case_55_bulleted_ack_counts_as_ack_sent() {
+  bold "Case 55: Bulleted Ack Counts As Ack Sent (Stops Repeat Ack Suggestion)"
+  local repo; repo="$(mk_repo)"
+  trap '[[ -n "${repo:-}" ]] && rm -rf "$repo"' RETURN
+
+  local out_a_claim out_a_note out_b1 out_b_post out_b2
+
+  out_a_claim="$(run_cli "$repo" "A" claim --path src/app.txt --ttl 15m)"
+  out_a_note="$(run_cli "$repo" "A" post "ERW_CASE55_BLOCKER_NOTE: I'm actively working on src/app.txt; will release when done.")"
+
+  out_b1="$(run_cli "$repo" "B" check --path src/app.txt)"
+  expect_contains "$out_b1" "\"decision\""
+  expect_contains "$out_b1" "\"warn\""
+  expect_contains "$out_b1" "\"blocking_agents\""
+  expect_contains "$out_b1" "\"A\""
+  expect_contains "$out_b1" "\"unread_relevant_updates\""
+  expect_contains "$out_b1" "ERW_CASE55_BLOCKER_NOTE"
+  expect_contains "$out_b1" "\"action_plan\""
+  expect_contains "$out_b1" "@A: ack:"
+  expect_not_contains "$out_b1" "Are you working on it?"
+
+  # Requester acks using common checklist formatting (should count as a real ack).
+  out_b_post="$(run_cli "$repo" "B" post $'- @A: ack: saw your update re src/app.txt.')"
+
+  out_b2="$(run_cli "$repo" "B" check --path src/app.txt)"
+  expect_contains "$out_b2" "\"decision\""
+  expect_contains "$out_b2" "\"warn\""
+  expect_not_contains "$out_b2" "@A: ack:"
+  expect_not_contains "$out_b2" "Are you working on it?"
+}
+
+case_59_ack_mention_missing_colon_counts_as_ack_sent() {
+  bold "Case 59: Ack @Mention Missing Colon (Stops Repeat Ack Suggestion)"
+  local repo; repo="$(mk_repo)"
+  trap '[[ -n "${repo:-}" ]] && rm -rf "$repo"' RETURN
+
+  local out_a_claim out_a_note out_b1 out_b_post out_b2
+
+  out_a_claim="$(run_cli "$repo" "A" claim --path src/app.txt --ttl 15m)"
+  out_a_note="$(run_cli "$repo" "A" post "ERW_CASE59_BLOCKER_NOTE: I'm actively working on src/app.txt; will release when done.")"
+
+  out_b1="$(run_cli "$repo" "B" check --path src/app.txt)"
+  expect_contains "$out_b1" "\"decision\""
+  expect_contains "$out_b1" "\"warn\""
+  expect_contains "$out_b1" "\"blocking_agents\""
+  expect_contains "$out_b1" "\"A\""
+  expect_contains "$out_b1" "\"unread_relevant_updates\""
+  expect_contains "$out_b1" "ERW_CASE59_BLOCKER_NOTE"
+  expect_contains "$out_b1" "\"action_plan\""
+  expect_contains "$out_b1" "@A: ack:"
+  expect_not_contains "$out_b1" "Are you working on it?"
+
+  # Humans often omit the colon after @mention: treat `@A ack:` as a real ack and stop suggesting it.
+  out_b_post="$(run_cli "$repo" "B" post $'- @A ack: saw your update re src/app.txt.')"
+
+  out_b2="$(run_cli "$repo" "B" check --path src/app.txt)"
+  expect_contains "$out_b2" "\"decision\""
+  expect_contains "$out_b2" "\"warn\""
+  expect_not_contains "$out_b2" "@A: ack:"
+  expect_not_contains "$out_b2" "Are you working on it?"
+}
+
+case_67_acknowledged_counts_as_ack_sent() {
+  bold "Case 67: Acknowledged Counts As Ack Sent (Stops Repeat Ack Suggestion)"
+  local repo; repo="$(mk_repo)"
+  trap '[[ -n "${repo:-}" ]] && rm -rf "$repo"' RETURN
+
+  local out_a_claim out_a_note out_b1 out_b_post out_b2
+
+  out_a_claim="$(run_cli "$repo" "A" claim --path src/app.txt --ttl 15m)"
+  out_a_note="$(run_cli "$repo" "A" post "ERW_CASE67_BLOCKER_NOTE: I'm actively working on src/app.txt; will release when done.")"
+
+  out_b1="$(run_cli "$repo" "B" check --path src/app.txt)"
+  expect_contains "$out_b1" "\"decision\""
+  expect_contains "$out_b1" "\"warn\""
+  expect_contains "$out_b1" "\"blocking_agents\""
+  expect_contains "$out_b1" "\"A\""
+  expect_contains "$out_b1" "\"unread_relevant_updates\""
+  expect_contains "$out_b1" "ERW_CASE67_BLOCKER_NOTE"
+  expect_contains "$out_b1" "\"action_plan\""
+  expect_contains "$out_b1" "@A: ack:"
+  expect_not_contains "$out_b1" "Are you working on it?"
+
+  # Realistic wording variant: treat `@A: acknowledged.` as a real ack and stop suggesting `@A: ack:`.
+  out_b_post="$(run_cli "$repo" "B" post $'- @A: acknowledged. saw your update re src/app.txt.')"
+
+  out_b2="$(run_cli "$repo" "B" check --path src/app.txt)"
+  expect_contains "$out_b2" "\"decision\""
+  expect_contains "$out_b2" "\"warn\""
+  expect_not_contains "$out_b2" "@A: ack:"
+  expect_not_contains "$out_b2" "Are you working on it?"
+}
+
+case_71_thanks_counts_as_ack_sent() {
+  bold "Case 71: Thanks Counts As Ack Sent (Stops Repeat Ack Suggestion)"
+  local repo; repo="$(mk_repo)"
+  trap '[[ -n "${repo:-}" ]] && rm -rf "$repo"' RETURN
+
+  local out_a_claim out_a_note out_b1 out_b_post out_b2
+
+  out_a_claim="$(run_cli "$repo" "A" claim --path src/app.txt --ttl 15m)"
+  out_a_note="$(run_cli "$repo" "A" post "ERW_CASE71_BLOCKER_NOTE: I'm actively working on src/app.txt; will release when done.")"
+
+  out_b1="$(run_cli "$repo" "B" check --path src/app.txt)"
+  expect_contains "$out_b1" "\"decision\""
+  expect_contains "$out_b1" "\"warn\""
+  expect_contains "$out_b1" "\"blocking_agents\""
+  expect_contains "$out_b1" "\"A\""
+  expect_contains "$out_b1" "\"unread_relevant_updates\""
+  expect_contains "$out_b1" "ERW_CASE71_BLOCKER_NOTE"
+  expect_contains "$out_b1" "\"action_plan\""
+  expect_contains "$out_b1" "@A: ack:"
+  expect_not_contains "$out_b1" "Are you working on it?"
+
+  # Realistic acknowledgement variant: treat `@A: thanks!` as closure and stop suggesting `@A: ack:`.
+  out_b_post="$(run_cli "$repo" "B" post $'- @A: thanks! will wait on src/app.txt.')"
+
+  out_b2="$(run_cli "$repo" "B" check --path src/app.txt)"
+  expect_contains "$out_b2" "\"decision\""
+  expect_contains "$out_b2" "\"warn\""
+  expect_not_contains "$out_b2" "@A: ack:"
+  expect_not_contains "$out_b2" "Are you working on it?"
+}
+
+case_72_got_it_counts_as_ack_sent() {
+  bold "Case 72: Got It Counts As Ack Sent (Stops Repeat Ack Suggestion)"
+  local repo; repo="$(mk_repo)"
+  trap '[[ -n "${repo:-}" ]] && rm -rf "$repo"' RETURN
+
+  local out_a_claim out_a_note out_b1 out_b_post out_b2
+
+  out_a_claim="$(run_cli "$repo" "A" claim --path src/app.txt --ttl 15m)"
+  out_a_note="$(run_cli "$repo" "A" post "ERW_CASE72_BLOCKER_NOTE: I'm actively working on src/app.txt; will release when done.")"
+
+  out_b1="$(run_cli "$repo" "B" check --path src/app.txt)"
+  expect_contains "$out_b1" "\"decision\""
+  expect_contains "$out_b1" "\"warn\""
+  expect_contains "$out_b1" "\"blocking_agents\""
+  expect_contains "$out_b1" "\"A\""
+  expect_contains "$out_b1" "\"unread_relevant_updates\""
+  expect_contains "$out_b1" "ERW_CASE72_BLOCKER_NOTE"
+  expect_contains "$out_b1" "\"action_plan\""
+  expect_contains "$out_b1" "@A: ack:"
+  expect_not_contains "$out_b1" "Are you working on it?"
+
+  # Realistic acknowledgement variant: treat `@A: got it.` as closure and stop suggesting `@A: ack:`.
+  out_b_post="$(run_cli "$repo" "B" post $'- @A: got it. will wait on src/app.txt.')"
+
+  out_b2="$(run_cli "$repo" "B" check --path src/app.txt)"
+  expect_contains "$out_b2" "\"decision\""
+  expect_contains "$out_b2" "\"warn\""
+  expect_not_contains "$out_b2" "@A: ack:"
+  expect_not_contains "$out_b2" "Are you working on it?"
+}
+
+case_56_nested_numbered_ack_is_closure() {
+  bold "Case 56: Nested Numbered Ack Is Closure (No Ack Ping-Pong)"
+  local repo; repo="$(mk_repo)"
+  trap '[[ -n "${repo:-}" ]] && rm -rf "$repo"' RETURN
+
+  local out_a_post out_b1
+
+  # Humans often respond with nested markdown lists. A nested ordered-list `@B: ack:` is still
+  # explicit closure directed at B, so B should not be prompted to acknowledge the message back.
+  out_a_post="$(run_cli "$repo" "A" post $'ERW_CASE56_NESTED_NUMBER_ACK: reply checklist:\n- 1. @B: ack: yep, I saw your ping.\nFYI: src/app.txt needs a follow-up test before EOD.')"
+
+  out_b1="$(run_cli "$repo" "B" check --path src/app.txt)"
+  expect_contains "$out_b1" "\"decision\""
+  expect_contains "$out_b1" "\"allow\""
+  expect_contains "$out_b1" "\"unread_relevant_updates\""
+  expect_contains "$out_b1" "ERW_CASE56_NESTED_NUMBER_ACK"
+
+  # Closure semantics: don't suggest acking it back.
+  expect_contains "$out_b1" "\"action_plan\""
+  expect_not_contains "$out_b1" "@A: ack:"
+}
+
+case_57_bolded_ack_is_closure() {
+  bold "Case 57: Bolded Ack Is Closure (Markdown Emphasis)"
+  local repo; repo="$(mk_repo)"
+  trap '[[ -n "${repo:-}" ]] && rm -rf "$repo"' RETURN
+
+  local out_a_post out_b1
+
+  # Humans sometimes bold the ack prefix for readability. A leading "**@B: ack:**" is still explicit
+  # closure directed at B, so B should not be prompted to acknowledge the message back.
+  out_a_post="$(run_cli "$repo" "A" post $'ERW_CASE57_BOLDED_ACK: reply checklist:\n- **@B: ack:** yep, I saw your ping.\nFYI: src/app.txt needs a follow-up test before EOD.')"
+
+  out_b1="$(run_cli "$repo" "B" check --path src/app.txt)"
+  expect_contains "$out_b1" "\"decision\""
+  expect_contains "$out_b1" "\"allow\""
+  expect_contains "$out_b1" "\"unread_relevant_updates\""
+  expect_contains "$out_b1" "ERW_CASE57_BOLDED_ACK"
+
+  # Closure semantics: don't suggest acking it back.
+  expect_contains "$out_b1" "\"action_plan\""
+  expect_not_contains "$out_b1" "@A: ack:"
+}
+
+case_45_blocker_note_suppresses_redundant_ping() {
+  bold "Case 45: Blocker Note Suppresses Redundant Ping (Ack Instead)"
+  local repo; repo="$(mk_repo)"
+  trap '[[ -n "${repo:-}" ]] && rm -rf "$repo"' RETURN
+
+  local out_a_claim out_a_note out_b
+
+  out_a_claim="$(run_cli "$repo" "A" claim --path src/app.txt --ttl 15m)"
+  out_a_note="$(run_cli "$repo" "A" post "ERW_CASE45_BLOCKER_NOTE: I'm actively working on src/app.txt; will release when done.")"
+
+  out_b="$(run_cli "$repo" "B" check --path src/app.txt)"
+  expect_contains "$out_b" "\"decision\""
+  expect_contains "$out_b" "\"warn\""
+  expect_contains "$out_b" "claimed_by_other"
+  expect_contains "$out_b" "\"blocking_agents\""
+  expect_contains "$out_b" "\"A\""
+
+  # Blocker already communicated. Surface it as an unread relevant update.
+  expect_contains "$out_b" "\"unread_relevant_updates\""
+  expect_contains "$out_b" "ERW_CASE45_BLOCKER_NOTE"
+
+  # Coordination usefulness: don't suggest the redundant "Are you working on it?" ping.
+  expect_not_contains "$out_b" "Are you working on it?"
+
+  # Closure semantics: suggest a concrete ack back to the blocker to close the loop.
+  expect_contains "$out_b" "\"action_plan\""
+  expect_contains "$out_b" "@A: ack:"
+}
+
+case_44_suppress_repeat_blocker_ping_after_posted() {
+  bold "Case 44: Suppress Repeat Blocker Ping (After Posted)"
+  local repo; repo="$(mk_repo)"
+  trap '[[ -n "${repo:-}" ]] && rm -rf "$repo"' RETURN
+
+  local out_a_claim out_b1 out_b_post out_b2
+
+  out_a_claim="$(run_cli "$repo" "A" claim --path src/app.txt --ttl 15m)"
+
+  # First check should suggest pinging the blocker.
+  out_b1="$(run_cli "$repo" "B" check --path src/app.txt)"
+  expect_contains "$out_b1" "\"decision\""
+  expect_contains "$out_b1" "\"warn\""
+  expect_contains "$out_b1" "\"blocking_agents\""
+  expect_contains "$out_b1" "\"A\""
+  expect_contains "$out_b1" "\"action_plan\""
+  expect_contains "$out_b1" "@A:"
+  expect_contains "$out_b1" "Are you working on it?"
+
+  # After B actually pings A, a second check should not keep suggesting the same ping (anti-spam).
+  out_b_post="$(run_cli "$repo" "B" post "@A: I'm about to edit src/app.txt. Are you working on it?")"
+
+  out_b2="$(run_cli "$repo" "B" check --path src/app.txt)"
+  expect_contains "$out_b2" "\"decision\""
+  expect_contains "$out_b2" "\"warn\""
+  expect_contains "$out_b2" "--agent-id B read"
+  expect_contains "$out_b2" "check --path src/app.txt"
+  expect_not_contains "$out_b2" "Are you working on it?"
+}
+
+case_42_ack_loop_suppression_auto_ack() {
+  bold "Case 42: Ack Loop Suppression (Don't Ack the Auto-Ack)"
+  local repo; repo="$(mk_repo)"
+  trap '[[ -n "${repo:-}" ]] && rm -rf "$repo"' RETURN
+
+  local out_a_post out_b1 out_b_post out_a1
+
+  # A posts a coordination note mentioning a file. B checks and should be prompted
+  # to explicitly ack it (closed-loop coordination).
+  out_a_post="$(run_cli "$repo" "A" post "ERW_CASE42_NOTE: Heads up, src/app.txt has a tricky edge-case")"
+
+  out_b1="$(run_cli "$repo" "B" check --path src/app.txt)"
+  expect_contains "$out_b1" "\"decision\""
+  expect_contains "$out_b1" "\"allow\""
+  expect_contains "$out_b1" "\"unread_relevant_updates\""
+  expect_contains "$out_b1" "ERW_CASE42_NOTE"
+  expect_contains "$out_b1" "\"action_plan\""
+  expect_contains "$out_b1" "@A: ack:"
+
+  # Coordination usefulness: for allow decisions, the action plan should not include a redundant re-check.
+  expect_not_contains "$out_b1" "--agent-id B check --path src/app.txt"
+
+  # B follows the suggestion (exact auto-ack template).
+  out_b_post="$(run_cli "$repo" "B" post "@A: ack: saw your update re src/app.txt.")"
+
+  # A sees B's ack as an unread relevant update, but should NOT be prompted to ack the auto-ack back.
+  out_a1="$(run_cli "$repo" "A" check --path src/app.txt)"
+  expect_contains "$out_a1" "\"decision\""
+  expect_contains "$out_a1" "\"allow\""
+  expect_contains "$out_a1" "\"unread_relevant_updates\""
+  expect_contains "$out_a1" "saw your update re src/app.txt"
+  expect_not_contains "$out_a1" "@B: ack:"
+}
+
+case_47_ack_loop_suppression_case_insensitive_ack_prefix() {
+  bold "Case 47: Ack Loop Suppression (Case-Insensitive Ack:)"
+  local repo; repo="$(mk_repo)"
+  trap '[[ -n "${repo:-}" ]] && rm -rf "$repo"' RETURN
+
+  local out_a_post out_b1 out_b_post out_a1
+
+  out_a_post="$(run_cli "$repo" "A" post "ERW_CASE47_NOTE: src/app.txt coordination note (case-insensitive ack test)")"
+
+  out_b1="$(run_cli "$repo" "B" check --path src/app.txt)"
+  expect_contains "$out_b1" "\"decision\""
+  expect_contains "$out_b1" "\"allow\""
+  expect_contains "$out_b1" "\"unread_relevant_updates\""
+  expect_contains "$out_b1" "ERW_CASE47_NOTE"
+  expect_contains "$out_b1" "\"action_plan\""
+  expect_contains "$out_b1" "@A: ack:"
+
+  # B posts an ack variant with different capitalization. A should not be prompted to ack it back.
+  out_b_post="$(run_cli "$repo" "B" post "@A: Ack: ERW_CASE47_CAPS_ACK saw your update re src/app.txt.")"
+
+  out_a1="$(run_cli "$repo" "A" check --path src/app.txt)"
+  expect_contains "$out_a1" "\"decision\""
+  expect_contains "$out_a1" "\"allow\""
+  expect_contains "$out_a1" "\"unread_relevant_updates\""
+  expect_contains "$out_a1" "ERW_CASE47_CAPS_ACK"
+  expect_not_contains "$out_a1" "@B: ack:"
+}
+
+case_48_blocker_note_persistence_no_reping_after_read() {
+  bold "Case 48: Blocker Note Persistence (Don't Re-Ping After Read)"
+  local repo; repo="$(mk_repo)"
+  trap '[[ -n "${repo:-}" ]] && rm -rf "$repo"' RETURN
+
+  local out_a_claim out_a_note out_b1 out_b2 out_b_ack out_b3
+
+  out_a_claim="$(run_cli "$repo" "A" claim --path src/app.txt --ttl 15m)"
+  out_a_note="$(run_cli "$repo" "A" post "@B: FYI I'm working on src/app.txt; will release when tests pass")"
+
+  # First check: surfaces the note and suggests ack; should not suggest the generic ping.
+  out_b1="$(run_cli "$repo" "B" check --path src/app.txt)"
+  expect_contains "$out_b1" "\"decision\""
+  expect_contains "$out_b1" "\"warn\""
+  expect_contains "$out_b1" "\"blocking_agents\""
+  expect_contains "$out_b1" "\"A\""
+  expect_contains "$out_b1" "\"unread_relevant_updates\""
+  expect_contains "$out_b1" "working on src/app.txt"
+  expect_contains "$out_b1" "@A: ack:"
+  expect_not_contains "$out_b1" "Are you working on it?"
+
+  # Second check: cursor advanced (no unread updates), but do not re-suggest the generic ping.
+  # Keep suggesting ack until B actually posts it.
+  out_b2="$(run_cli "$repo" "B" check --path src/app.txt)"
+  expect_contains "$out_b2" "\"decision\""
+  expect_contains "$out_b2" "\"warn\""
+  expect_not_contains "$out_b2" "Are you working on it?"
+  expect_contains "$out_b2" "@A: ack:"
+
+  # After the explicit ack, stop suggesting ack (and still don't suggest the generic ping).
+  out_b_ack="$(run_cli "$repo" "B" post "@A: ack: saw your update re src/app.txt.")"
+  out_b3="$(run_cli "$repo" "B" check --path src/app.txt)"
+  expect_contains "$out_b3" "\"decision\""
+  expect_contains "$out_b3" "\"warn\""
+  expect_not_contains "$out_b3" "Are you working on it?"
+  expect_not_contains "$out_b3" "@A: ack:"
+}
+
+case_43_unread_updates_avoid_path_substring_false_positives() {
+  bold "Case 43: Unread Updates (Avoid Path Substring False Positives)"
+  local repo; repo="$(mk_repo)"
+  trap '[[ -n "${repo:-}" ]] && rm -rf "$repo"' RETURN
+
+  local out_a_fp out_b1 out_a_true out_b2
+
+  # Realistic failure mode: substring matches create coordination noise.
+  # A mentions a different file that happens to contain the checked path as a prefix.
+  out_a_fp="$(run_cli "$repo" "A" post "ERW_CASE43_FP: I am only touching src/app.txt.bak (backup file)")"
+
+  out_b1="$(run_cli "$repo" "B" check --path src/app.txt)"
+  expect_contains "$out_b1" "\"decision\""
+  expect_contains "$out_b1" "\"allow\""
+  expect_contains "$out_b1" "\"unread_relevant_updates\""
+  expect_not_contains "$out_b1" "ERW_CASE43_FP"
+  expect_not_contains "$out_b1" "@A: ack:"
+
+  # When the exact path is mentioned, it should surface and suggest closure.
+  out_a_true="$(run_cli "$repo" "A" post "ERW_CASE43_TRUE: also reviewing src/app.txt (actual file)")"
+
+  out_b2="$(run_cli "$repo" "B" check --path src/app.txt)"
+  expect_contains "$out_b2" "\"unread_relevant_updates\""
+  expect_contains "$out_b2" "ERW_CASE43_TRUE"
+  expect_contains "$out_b2" "@A: ack:"
+}
+
+case_46_ack_dedupe_multiple_updates_same_author() {
+  bold "Case 46: Ack Dedupe (Multiple Updates, Same Author)"
+  local repo; repo="$(mk_repo)"
+  trap '[[ -n "${repo:-}" ]] && rm -rf "$repo"' RETURN
+
+  local out_a1 out_a2 out_b1 out_b2
+
+  out_a1="$(run_cli "$repo" "A" post "ERW_CASE46_NOTE1: FYI I may touch src/app.txt after lunch")"
+  out_a2="$(run_cli "$repo" "A" post "ERW_CASE46_NOTE2: also reviewing src/app.txt for follow-ups")"
+
+  out_b1="$(run_cli "$repo" "B" check --path src/app.txt)"
+  expect_contains "$out_b1" "\"decision\""
+  expect_contains "$out_b1" "\"unread_relevant_updates\""
+  expect_contains "$out_b1" "ERW_CASE46_NOTE1"
+  expect_contains "$out_b1" "ERW_CASE46_NOTE2"
+
+  # Only one ack should be suggested per author, even if they posted multiple relevant updates.
+  python3 -c '
+import json, sys
+v = json.loads(sys.stdin.read())
+ups = v.get("unread_relevant_updates") or []
+assert isinstance(ups, list) and len(ups) == 2, f"expected 2 unread updates, got {len(ups)}"
+ap = v.get("action_plan") or []
+assert isinstance(ap, list)
+acks = [x for x in ap if isinstance(x, str) and "@A: ack:" in x]
+assert len(acks) == 1, f"expected 1 ack to A, got {len(acks)}: {acks}"
+' <<<"$out_b1"
+
+  # Anti-spam: the cursor should advance so a follow-up check does not repeat the same ack suggestion.
+  out_b2="$(run_cli "$repo" "B" check --path src/app.txt)"
+  expect_not_contains "$out_b2" "ERW_CASE46_NOTE1"
+  expect_not_contains "$out_b2" "ERW_CASE46_NOTE2"
+  expect_not_contains "$out_b2" "@A: ack:"
+}
+
 case_38_check_includes_blocking_agent_status_plan_snapshot() {
   bold "Case 38: Check Includes Blocking Agent Status/Plan Snapshot"
   local repo; repo="$(mk_repo)"
@@ -1514,22 +2588,77 @@ main() {
     case_35_status_plan_ttl_staleness_surfaced
     case_36_check_unread_relevant_updates_cursor_advances
     case_37_check_unread_updates_parent_dir_overlap
-    case_39_ack_unread_updates_closure_semantics
-    case_38_check_includes_blocking_agent_status_plan_snapshot
-  )
+	    case_39_ack_unread_updates_closure_semantics
+	    case_40_strict_deny_ack_unread_updates_nonblocker
+		    case_41_miscommunication_repair_release_and_ack
+	    case_49_resolve_closes_loop_no_ack_needed
+    case_58_paren_resolve_is_closure_no_ack_needed
+	    case_60_resolved_dot_is_closure_no_ack_needed
+	    case_68_resolved_without_punctuation_is_closure_no_ack_needed
+	    case_73_released_is_closure_no_ack_needed
+	    case_69_inline_code_resolve_is_closure_no_ack_needed
+	    case_66_resolved_question_mark_is_not_closure
+	    case_50_quoted_resolve_is_not_closure
+	    case_51_quoted_then_resolve_is_closure
+	    case_52_codeblock_resolve_is_not_closure
+	    case_61_indented_resolve_is_not_closure
+    case_62_indented_ack_is_not_closure
+	    case_63_comma_ack_is_closure
+	    case_70_bare_ack_is_closure
+	    case_64_bolded_resolve_is_closure
+	    case_65_mixed_unread_updates_per_author_closure_filtering
+	    case_53_bulleted_ack_is_closure
+	    case_54_tasklist_ack_is_closure
+	    case_55_bulleted_ack_counts_as_ack_sent
+		    case_59_ack_mention_missing_colon_counts_as_ack_sent
+		    case_67_acknowledged_counts_as_ack_sent
+		    case_71_thanks_counts_as_ack_sent
+		    case_72_got_it_counts_as_ack_sent
+		    case_56_nested_numbered_ack_is_closure
+		    case_57_bolded_ack_is_closure
+		    case_45_blocker_note_suppresses_redundant_ping
+	    case_44_suppress_repeat_blocker_ping_after_posted
+	    case_42_ack_loop_suppression_auto_ack
+	    case_47_ack_loop_suppression_case_insensitive_ack_prefix
+	    case_48_blocker_note_persistence_no_reping_after_read
+	    case_46_ack_dedupe_multiple_updates_same_author
+	    case_43_unread_updates_avoid_path_substring_false_positives
+	    case_38_check_includes_blocking_agent_status_plan_snapshot
+	  )
 
   local overall_failed=0 t
+
+  # Optional case filtering for faster iteration.
+  # - HARNESS_ONLY=case_name
+  # - HARNESS_CASE_FILTER=regex (bash ERE)
+  local only="${HARNESS_ONLY:-}"
+  local filter="${HARNESS_CASE_FILTER:-}"
+  local fail_fast="${HARNESS_FAIL_FAST:-0}"
+
   for ((t = 1; t <= trials; t++)); do
     CURRENT_TRIAL="$t"
     local trial_failed=0
     bold "Trial $t/$trials"
     local c
     for c in "${cases[@]}"; do
+      # Case selection (faster iteration)
+      if [[ -n "$only" && "$c" != "$only" ]]; then
+        continue
+      fi
+      if [[ -n "$filter" ]]; then
+        if ! [[ "$c" =~ $filter ]]; then
+          continue
+        fi
+      fi
+
       CURRENT_CASE="$c"
       HARNESS_CASE_FAILED=0
       "$c" || true
       if [[ "$HARNESS_CASE_FAILED" -ne 0 ]]; then
         trial_failed=1
+        if [[ "$fail_fast" != "0" ]]; then
+          break
+        fi
       fi
     done
 
