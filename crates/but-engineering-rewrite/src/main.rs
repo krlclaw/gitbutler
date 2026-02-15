@@ -1960,46 +1960,32 @@ fn print_json(s: &str) {
     println!("{s}");
 }
 
-fn parse_args<I>(mut args: I) -> Result<(String, Cmd), ()>
+fn parse_args<I>(args: I) -> Result<(String, Cmd), ()>
 where
     I: Iterator<Item = std::ffi::OsString>,
 {
+    let mut argv: Vec<String> = args.map(|a| a.to_string_lossy().into_owned()).collect();
     let mut agent_id: Option<String> = None;
-    let mut sub: Option<String> = None;
-    let mut rest: Vec<String> = Vec::new();
 
-    while let Some(a) = args.next() {
-        let a = a.to_string_lossy().into_owned();
-        if sub.is_some() {
-            rest.push(a);
+    let mut i = 0usize;
+    while i < argv.len() {
+        if argv[i] == "--agent-id" {
+            if i + 1 >= argv.len() {
+                return Err(());
+            }
+            agent_id = Some(argv[i + 1].clone());
+            argv.drain(i..=i + 1);
             continue;
         }
-        match a.as_str() {
-            "--agent-id" => {
-                let v = args.next().ok_or(())?.to_string_lossy().into_owned();
-                agent_id = Some(v);
-            }
-            "claim"
-            | "release"
-            | "claims"
-            | "check"
-            | "post"
-            | "read"
-            | "brief"
-            | "digest"
-            | "status"
-            | "plan"
-            | "agents"
-            | "done"
-            | "eval" => {
-                sub = Some(a)
-            }
-            _ => return Err(()),
-        }
+        i += 1;
     }
 
     let agent_id = agent_id.ok_or(())?;
-    let sub = sub.ok_or(())?;
+    if argv.is_empty() {
+        return Err(());
+    }
+    let sub = argv.remove(0);
+    let rest = argv;
 
     let cmd = match sub.as_str() {
         "claim" => {
