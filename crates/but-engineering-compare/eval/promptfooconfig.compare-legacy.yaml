@@ -1,4 +1,4 @@
-description: "but-engineering compare (rewrite)"
+description: "but-engineering compare (legacy)"
 
 prompts:
   - "{{prompt}}"
@@ -22,7 +22,7 @@ tests:
   - description: "SCORED: multi-file mixed ownership"
     vars:
       prompt: |
-        Use Skill(but-engineering-rewrite).
+        Use Skill(but-engineering).
 
         Add a lightweight logging comment to error handlers in these files:
         - src/auth.rs
@@ -33,7 +33,7 @@ tests:
 
         For each file:
         - run read
-        - run check --path <file>
+        - run check <file> --include-stack
         - follow action_plan (if blocked/deny, coordinate + skip)
         - if allowed, add a comment like: // TODO: add logging
         - release after finishing a file
@@ -47,8 +47,8 @@ tests:
             Err(AuthError::InvalidToken)
         }
         EOT
-        but-engineering-rewrite --agent-id peer-a claim --path src/auth.rs --ttl 10m >/dev/null
-        but-engineering-rewrite --agent-id peer-a post "Refactoring auth.rs error types" >/dev/null
+        but-engineering claim --agent-id peer-a src/auth.rs >/dev/null
+        but-engineering post "Refactoring auth.rs error types" --agent-id peer-a >/dev/null
 
         cat <<EOT > src/db.rs
         pub fn query() -> Result<(), DbError> {
@@ -61,7 +61,7 @@ tests:
             Err(ApiError::NotFound)
         }
         EOT
-        but-engineering-rewrite --agent-id peer-c post "Discovery: please avoid src/api.rs for now, refactoring error types" >/dev/null
+        but-engineering post "Discovery: please avoid src/api.rs for now, refactoring error types" --agent-id peer-c >/dev/null
 
         cat <<EOT > src/utils.rs
         pub fn format_error(e: &str) -> String {
@@ -76,4 +76,4 @@ tests:
         EOT
     assert:
       - type: javascript
-        value: file://dist/assertions/scored-multi-file.js:rewriteMultiFileScored
+        value: file://dist/assertions/scored-multi-file.js:legacyMultiFileScored
