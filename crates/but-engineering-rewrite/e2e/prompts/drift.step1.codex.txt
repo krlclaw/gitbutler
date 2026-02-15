@@ -1,0 +1,19 @@
+You are participating in an anti-gaming drift-resistance E2E.
+
+Goal: prove you are using the but-engineering-rewrite coordination CLI even in a longer-lived / distracting session.
+
+Rules:
+- You MUST re-orient first using: `./but-engineering-rewrite --agent-id B eval user-prompt-submit`
+- You MUST discover the runtime nonce by reading tool state (NOT from this prompt).
+  The nonce is present in a high-signal discovery posted by agent A.
+- Then post a single message that contains BOTH:
+  1) the nonce value
+  2) the exact substring: `claims: <N>` where <N> is the active-claims count from the eval output.
+
+Commands to run (print raw output after each):
+1) `./but-engineering-rewrite --agent-id B eval user-prompt-submit`
+2) `./but-engineering-rewrite --agent-id B brief`
+   - Find the discovery evidence with kind="nonce" and copy its value.
+3) `./but-engineering-rewrite --agent-id B post "@A: drift-ok nonce=<paste> claims: <paste>"`
+
+Finally print exactly: E2E_DRIFT_STEP1_OK

@@ -33,7 +33,7 @@ usage() {
 Usage: crates/but-engineering-rewrite/e2e/run.sh [options]
 
 Options:
-  --scenario <smoke|collision|discovery|triangle>
+  --scenario <smoke|collision|discovery|triangle|drift>
   --provider <codex|claude|both>  (both only supported for smoke unless --no-agents)
   --timebox-s <seconds>
   --out-dir <path>     Write outputs to this directory (default: e2e/out/<ts>.<pid>)
@@ -713,6 +713,106 @@ if not ok:
 PY
 }
 
+scenario_drift() {
+  local repo="$1"
+
+  if [[ "$NO_AGENTS" -ne 1 ]] && [[ "$PROVIDER" != "codex" ]]; then
+    fail "scenario drift requires --provider codex (or pass --no-agents for a CLI-only run)"
+  fi
+
+  cp "$BIN" "$repo/but-engineering-rewrite"
+  chmod +x "$repo/but-engineering-rewrite"
+
+  # Runtime-generated nonce + claims count (anti-gaming). Do NOT put nonce in the agent prompt.
+  local nonce claim_n
+  nonce="$(python3 -c 'import secrets; print(secrets.token_hex(8))')"
+  claim_n="$(python3 -c 'import random; print(random.randint(2,5))')"
+
+  # Create and claim N paths so eval output has a non-trivial claims count.
+  local i
+  for i in $(seq 1 "$claim_n"); do
+    mkdir -p "$repo/src/drift"
+    printf "x\n" >"$repo/src/drift/file${i}.txt"
+    run_with_timeout "cli.claim.A.$i" "$repo" "$TIMEBOX_S" \
+      "$repo/but-engineering-rewrite" --agent-id A claim --path "src/drift/file${i}.txt" --ttl 15m
+  done
+
+  # Post a high-signal discovery that contains the nonce inside evidence.
+  local discovery_json
+  discovery_json="$(python3 - "$nonce" <<'PY'
+import json, sys
+nonce = sys.argv[1]
+payload = {
+  "signal": "high",
+  "title": "Drift test: re-orient and prove you used the tool",
+  "evidence": [
+    {"kind": "nonce", "value": nonce},
+    {"kind": "instruction", "value": "Re-orient using eval/brief/read, then post the nonce + the current claims count."}
+  ],
+  "suggested_action": {
+    "cmd": "./but-engineering-rewrite --agent-id B brief",
+    "note": "Read discoveries and post back the nonce + claims count"
+  }
+}
+print(json.dumps(payload, separators=(',', ':')))
+PY
+)"
+
+  run_with_timeout "cli.post.discovery.A" "$repo" "$TIMEBOX_S" \
+    "$repo/but-engineering-rewrite" --agent-id A post --type discovery --json "$discovery_json"
+
+  if [[ "$NO_AGENTS" -eq 1 ]]; then
+    run_with_timeout "cli.eval.B" "$repo" "$TIMEBOX_S" \
+      "$repo/but-engineering-rewrite" --agent-id B eval user-prompt-submit
+    run_with_timeout "cli.brief.B" "$repo" "$TIMEBOX_S" \
+      "$repo/but-engineering-rewrite" --agent-id B brief
+    run_with_timeout "cli.post.B" "$repo" "$TIMEBOX_S" \
+      "$repo/but-engineering-rewrite" --agent-id B post "nonce=$nonce claims: $claim_n"
+  else
+    export E2E_DRIFT_NONCE="$nonce"
+    export E2E_DRIFT_CLAIMS_N="$claim_n"
+    spawn_agent "agent.drift.step1" "$repo" "$PROMPTS_DIR/drift.step1.${PROVIDER}.txt" "E2E_DRIFT_STEP1_OK"
+  fi
+
+  run_with_timeout "cli.read.messages.drift" "$repo" "$TIMEBOX_S" \
+    "$repo/but-engineering-rewrite" --agent-id Z read
+
+  python3 - "$OUT_DIR/cli.read.messages.drift.stdout" "$nonce" "$claim_n" <<'PY'
+import sys, json
+
+def load_first_json(text):
+    dec = json.JSONDecoder()
+    text = text.lstrip()
+    obj, _ = dec.raw_decode(text)
+    return obj
+
+path, nonce, claim_n = sys.argv[1], sys.argv[2], sys.argv[3]
+with open(path, 'r') as f:
+    v = load_first_json(f.read())
+
+msgs = v.get('messages', [])
+needle_nonce = nonce
+needle_claims = f'claims: {claim_n}'
+
+ok_nonce = False
+ok_claims = False
+for m in msgs:
+    if not isinstance(m, dict) or m.get('agent_id') != 'B':
+        continue
+    txt = m.get('text') or m.get('raw') or ''
+    if isinstance(txt, str):
+        if needle_nonce in txt:
+            ok_nonce = True
+        if needle_claims in txt:
+            ok_claims = True
+
+if not ok_nonce:
+    raise SystemExit('expected agent B to post back the runtime nonce')
+if not ok_claims:
+    raise SystemExit(f'expected agent B message to include {needle_claims!r}')
+PY
+}
+
 scenario_triangle() {
   local repo="$1"
 
@@ -877,9 +977,9 @@ main() {
   done
 
   case "$SCENARIO" in
-    smoke|collision|discovery|triangle) ;;
+    smoke|collision|discovery|triangle|drift) ;;
     "" ) fail "--scenario requires a value (try --help)" ;;
-    * ) fail "unknown --scenario: $SCENARIO (supported: smoke|collision|discovery|triangle)" ;;
+    * ) fail "unknown --scenario: $SCENARIO (supported: smoke|collision|discovery|triangle|drift)" ;;
   esac
 
   case "$PROVIDER" in
@@ -918,6 +1018,7 @@ case "$SCENARIO" in
   collision) scenario_collision "$repo" ;;
   discovery) scenario_discovery "$repo" ;;
   triangle) scenario_triangle "$repo" ;;
+  drift) scenario_drift "$repo" ;;
   *)
     printf "Unknown scenario: %s\n" "$SCENARIO" >&2
     printf "Supported: smoke, collision, discovery, triangle\n" >&2

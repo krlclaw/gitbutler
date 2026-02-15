@@ -1106,6 +1106,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "but-engineering-rewrite"
+version = "0.0.0"
+dependencies = [
+ "rusqlite",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "but-error"
 version = "0.0.0"
 dependencies = [

@@ -10,20 +10,13 @@ Progress only counts when either:
 - an E2E (real-agent) test is added/improved and becomes stable enough to run regularly.
 
 ## Immediate priorities (next 1–2 iterations)
-1) **Get the harness green and checkpoint**
-   - Fix current failing harness case(s).
+1) **Keep the harness green and checkpoint**
    - Run: `./crates/but-engineering-rewrite/harness/run.sh` until EXIT 0.
    - Commit once with proof in the message (harness tail + git status).
 
-2) **Add the E2E “real agent” test scaffold (opt-in, slow suite)**
-   - Create: `crates/but-engineering-rewrite/e2e/run.sh`
-   - Requirements:
-     - Creates a temp git repo (like harness).
-     - Invokes the real CLI (`but-engineering-rewrite`).
-     - Spawns **real** `codex` and/or `claude` processes with a pinned prompt.
-     - Enforces a strict timebox and captures transcripts + a structured trace.
-     - Produces a deterministic pass/fail verdict.
-   - Must be runnable locally on macOS where `codex` / `claude` are installed.
+2) **Harden the E2E “real agent” test runner (opt-in slow suite)**
+   - Runner exists: `crates/but-engineering-rewrite/e2e/run.sh` (scenarios: `smoke`/`collision`/`discovery`/`triangle`).
+   - Next: keep adding deterministic scenarios that stress coordination signal/noise, and keep agent-spawn paths pinned and verdictable (Codex-only until Claude has a tool-executing mode wired in).
 
 ## High-value real-agent E2E tests (start with 2–3)
 

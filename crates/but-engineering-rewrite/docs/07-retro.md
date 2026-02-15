@@ -2,15 +2,39 @@
 
 ## 2026-02-15
 
-- Extended the E2E scaffold with a minimal E2E-02 slice (`--scenario discovery`) that posts a valid structured discovery, asserts it appears in `brief`/`digest`, and ensures the suggested action is executed (posts an ack): `crates/but-engineering-rewrite/e2e/run.sh`.
-- Added a pinned Codex prompt for the discovery scenario to keep the real-agent path deterministic and verdictable via a sentinel token: `crates/but-engineering-rewrite/e2e/prompts/discovery.step1.codex.txt`.
-- Re-ran the fast harness after the E2E changes to ensure no regressions before checkpointing: `./crates/but-engineering-rewrite/harness/run.sh`.
-- Grew the harness into a more realistic "closed-loop coordination" suite by adding cases around unread relevant updates, ack suggestions (dedupe + anti-ping-pong), and suppressing redundant blocker pings: `crates/but-engineering-rewrite/harness/run.sh`, `crates/but-engineering-rewrite/harness/cases/`.
-- Kept Rust and the harness stub in parity by mirroring the coordination heuristics (closure/ack parsing, unread relevance matching, and action plan shaping) in both implementations: `crates/but-engineering-rewrite/src/main.rs`, `crates/but-engineering-rewrite/harness/bin/but-engineering-rewrite`.
-- Added an opt-in E2E scaffold with a deterministic CLI smoke scenario plus optional real-agent spawn (Codex/Claude), with timeboxing, transcripts, and a structured JSONL trace: `crates/but-engineering-rewrite/e2e/run.sh`, `crates/but-engineering-rewrite/e2e/prompts/`.
-- Extended the E2E scaffold with a minimal E2E-01 “collision -> read/ack -> release -> proceed” slice (`--scenario collision`), including pinned Codex prompts and a per-scenario sentinel token for deterministic verdicts: `crates/but-engineering-rewrite/e2e/run.sh`, `crates/but-engineering-rewrite/e2e/prompts/collision.step*.codex.txt`.
-- Captured the working priorities in a living backlog doc so the next slices are obvious: `crates/but-engineering-rewrite/docs/08-backlog.md`.
-- Harness remained green after the above changes, making this a safe checkpoint: `./crates/but-engineering-rewrite/harness/run.sh`.
+- Hardened E2E runner auto-build diagnostics: `cargo build` (when auto-building the default `target/debug/...` binary) is now executed via `run_with_timeout`, producing `cargo.build.{stdout,stderr}` artifacts plus a trace entry for post-mortem debugging: `crates/but-engineering-rewrite/e2e/run.sh`.
+- Increased reliability of “slow suite” failures by making build timeouts less likely (minimum 600s timebox for the build step, independent of per-step CLI timeboxes): `crates/but-engineering-rewrite/e2e/run.sh`.
+- No Rust/stub behavior changes; fast harness re-run remained green after the runner-only tweak: `./crates/but-engineering-rewrite/harness/run.sh`.
+
+- Hardened E2E artifacts: `meta.json` now records the resolved `BIN` actually used (real vs stub), plus a best-effort `bin_sha256` so runs are replayable/auditable even when binaries change: `crates/but-engineering-rewrite/e2e/run.sh`.
+- Reduced a `BIN=...` footgun: the runner now only auto-`cargo build` when `BIN` is the default `target/debug/...`; custom `BIN` paths fail fast with a clearer error (or can fall back via `--allow-stub`): `crates/but-engineering-rewrite/e2e/run.sh`.
+- Verified the runner change with an offline smoke (`--no-agents`) and kept the fast harness green (no Rust/stub behavior changes): `./crates/but-engineering-rewrite/e2e/run.sh --scenario smoke --no-agents --allow-stub`, `./crates/but-engineering-rewrite/harness/run.sh`.
+
+- Fixed an E2E runner `--only-step` footgun: `run_with_timeout` no longer `exit 0`s mid-run, so deterministic assertions still run and `verdict.json` still gets written: `crates/but-engineering-rewrite/e2e/run.sh`.
+- Verified the new behavior via an offline smoke run that stops at `cli.check.B` while still producing artifacts: `./crates/but-engineering-rewrite/e2e/run.sh --scenario smoke --no-agents --allow-stub --only-step cli.check.B`.
+- Harness stayed green after the runner-only change (no Rust/stub behavior changes): `./crates/but-engineering-rewrite/harness/run.sh`.
+- Hardened E2E agent spawning determinism by snapshotting the exact prompt text into the run output dir and using that snapshot as the subprocess stdin/input (makes runs replayable even if prompt files change later): `crates/but-engineering-rewrite/e2e/run.sh`.
+- Hardened E2E-01 `collision` determinism by asserting the initial `check` output includes a `read` step in `action_plan` (models “read before ping” and avoids relying solely on agent behavior): `crates/but-engineering-rewrite/e2e/run.sh`.
+- No Rust/stub behavior changes; harness re-run stayed green after the runner-only hardening: `./crates/but-engineering-rewrite/harness/run.sh`.
+- Implemented the previously-advertised `--only-step` option in the opt-in E2E runner: it now runs up to the first matching step label (prefix match) and stops early while still writing `trace.jsonl` and `verdict.json`: `crates/but-engineering-rewrite/e2e/run.sh`.
+- Updated `--help` to match the new `--only-step` behavior and fail fast when the label matches no steps (exit 2): `crates/but-engineering-rewrite/e2e/run.sh`.
+- No Rust/stub behavior changes; harness re-run remained green after the runner-only tweak: `./crates/but-engineering-rewrite/harness/run.sh`.
+- Hardened the opt-in E2E runner ergonomics: `--provider both` is now allowed for non-`smoke` scenarios when `--no-agents` is set (provider is irrelevant in offline mode), reducing footguns in CI/local invocations: `crates/but-engineering-rewrite/e2e/run.sh`.
+- Clarified `--help` text for the `both` provider constraint (now explicitly conditioned on `--no-agents`): `crates/but-engineering-rewrite/e2e/run.sh`.
+- No Rust/stub behavior changes; harness remained green after the runner-only tweak: `./crates/but-engineering-rewrite/harness/run.sh`.
+- Hardened the opt-in E2E runner CLI ergonomics by adding `--out-dir` (lets CI/local runs put artifacts in a known path rather than relying on timestamp discovery): `crates/but-engineering-rewrite/e2e/run.sh`.
+- Added early validation for `--scenario`, `--provider`, and `--timebox-s` to fail fast with actionable errors (less time wasted debugging silent fallthroughs): `crates/but-engineering-rewrite/e2e/run.sh`.
+- No Rust/stub behavior changes; harness remained green after the runner-only change: `./crates/but-engineering-rewrite/harness/run.sh`.
+- Added E2E-03 `triangle` to the opt-in slow runner (mirrors harness Case 05i: 3-agent claim conflict + dependency-hint noise control): `crates/but-engineering-rewrite/e2e/run.sh`.
+- Made `triangle` deterministic with JSON-shape assertions (B warn/deny, blocker sets, exactly-one provider-A hint, and no provider-C hint; C receives no hints): `crates/but-engineering-rewrite/e2e/run.sh`.
+- Added a pinned Codex prompt + sentinel token so the runner can optionally spawn a real agent and still yield a deterministic verdict: `crates/but-engineering-rewrite/e2e/prompts/triangle.step1.codex.txt`, `crates/but-engineering-rewrite/e2e/run.sh`.
+- Improved E2E artifacts with `meta.json` (git/tool versions) and `verdict.json` (pass/fail + exit code), and fixed Codex stdin piping so pinned prompts are reliably consumed: `crates/but-engineering-rewrite/e2e/run.sh`.
+- Hardened the E2E runner failure mode for agent prompts: missing prompt files now produce a trace entry and a clear error (easier debugging vs a generic subprocess failure): `crates/but-engineering-rewrite/e2e/run.sh`.
+- Patched E2E artifacts to include `repo_path` in `meta.json` and `verdict.json` (and `trace_path` in verdict) so failures can be mapped back to the temp repo quickly: `crates/but-engineering-rewrite/e2e/run.sh`.
+- Harness stayed green (no Rust/stub behavior changes): `./crates/but-engineering-rewrite/harness/run.sh`.
+- Hardened E2E `smoke` determinism by asserting `claimed_by_other` collisions include a `read` step in `action_plan` (models “read before ping” coordination): `crates/but-engineering-rewrite/e2e/run.sh`.
+- Synced the backlog’s scenario list with the runner’s current supported scenarios (includes `triangle`): `crates/but-engineering-rewrite/docs/08-backlog.md`.
+- Harness re-run stayed green after the E2E assertion change (no Rust/stub behavior changes): `./crates/but-engineering-rewrite/harness/run.sh`.
 
 ## 2026-02-14
 

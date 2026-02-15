@@ -1386,8 +1386,8 @@ try:
                 # **@B: ack:** ...
                 # *@B: ack:* ...
                 #
-                # Keep this intentionally narrow: only strip leading '*' / '_' when they are
-                # immediately followed by '@'.
+                # Keep this intentionally narrow: only strip leading * / _ when they are
+                # immediately followed by @.
                 try:
                     s = s or ""
                     i = 0
@@ -1772,8 +1772,8 @@ try:
             # **@B: ack:** ...
             # *@B: ack:* ...
             #
-            # Keep this intentionally narrow: only strip leading '*' / '_' when they are
-            # immediately followed by '@'.
+            # Keep this intentionally narrow: only strip leading * / _ when they are
+            # immediately followed by @.
             try:
                 s = s or ""
                 i = 0
