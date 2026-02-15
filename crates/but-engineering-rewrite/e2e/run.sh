@@ -51,6 +51,7 @@ Notes:
   - collision: minimal E2E-01 slice (two-agent collision -> read/ack -> release -> proceed). Provider=codex.
   - discovery: minimal E2E-02 slice (A posts discovery -> B brief/digest surfaces -> B executes suggested_action.cmd).
   - triangle: minimal E2E-03 slice (3-agent triangle conflict + dependency hints noise control). Provider=codex.
+  - drift: anti-gaming drift-resistance slice (B must re-orient using eval + fetch a runtime nonce from brief).
 EOF
 }
 
@@ -761,24 +762,58 @@ PY
   run_with_timeout "cli.post.discovery.A" "$repo" "$TIMEBOX_S" \
     "$repo/but-engineering-rewrite" --agent-id A post --type discovery --json "$discovery_json"
 
+  # Capture live values via the same surfaces the agent is supposed to use.
+  run_with_timeout "cli.eval.B" "$repo" "$TIMEBOX_S" \
+    "$repo/but-engineering-rewrite" --agent-id B eval user-prompt-submit
+  run_with_timeout "cli.brief.B" "$repo" "$TIMEBOX_S" \
+    "$repo/but-engineering-rewrite" --agent-id B brief
+  python3 - "$OUT_DIR/cli.eval.B.stdout" "$OUT_DIR/cli.brief.B.stdout" "$nonce" >"$OUT_DIR/drift.expected.txt" <<'PY'
+import json, re, sys
+
+eval_path, brief_path, nonce = sys.argv[1], sys.argv[2], sys.argv[3]
+
+txt = open(eval_path, "r", encoding="utf-8", errors="replace").read()
+m = re.search(r"(?m)^claims:\\s*(\\d+)\\s*$", txt)
+if not m:
+    raise SystemExit("expected eval output to contain a line like: claims: <N>")
+claims_n = m.group(1)
+
+v = json.load(open(brief_path, "r", encoding="utf-8"))
+ds = v.get("discoveries") or []
+ok = False
+for d in ds:
+    if not isinstance(d, dict):
+        continue
+    for ev in (d.get("evidence") or []):
+        if isinstance(ev, dict) and ev.get("kind") == "nonce" and ev.get("value") == nonce:
+            ok = True
+            break
+    if ok:
+        break
+if not ok:
+    raise SystemExit("expected brief to surface the discovery evidence kind=nonce with the seeded value")
+
+print(f"{nonce}\\n{claims_n}")
+PY
+
   if [[ "$NO_AGENTS" -eq 1 ]]; then
-    run_with_timeout "cli.eval.B" "$repo" "$TIMEBOX_S" \
-      "$repo/but-engineering-rewrite" --agent-id B eval user-prompt-submit
-    run_with_timeout "cli.brief.B" "$repo" "$TIMEBOX_S" \
-      "$repo/but-engineering-rewrite" --agent-id B brief
     run_with_timeout "cli.post.B" "$repo" "$TIMEBOX_S" \
-      "$repo/but-engineering-rewrite" --agent-id B post "nonce=$nonce claims: $claim_n"
+      "$repo/but-engineering-rewrite" --agent-id B post "$(python3 - "$OUT_DIR/drift.expected.txt" <<'PY'
+import sys
+
+nonce, claims_n = [x.strip() for x in open(sys.argv[1], "r", encoding="utf-8").read().splitlines()[:2]]
+print(f"@A: ack: drift-ok nonce={nonce} claims: {claims_n}")
+PY
+)"
   else
-    export E2E_DRIFT_NONCE="$nonce"
-    export E2E_DRIFT_CLAIMS_N="$claim_n"
     spawn_agent "agent.drift.step1" "$repo" "$PROMPTS_DIR/drift.step1.${PROVIDER}.txt" "E2E_DRIFT_STEP1_OK"
   fi
 
   run_with_timeout "cli.read.messages.drift" "$repo" "$TIMEBOX_S" \
     "$repo/but-engineering-rewrite" --agent-id Z read
 
-  python3 - "$OUT_DIR/cli.read.messages.drift.stdout" "$nonce" "$claim_n" <<'PY'
-import sys, json
+  python3 - "$OUT_DIR/cli.read.messages.drift.stdout" "$OUT_DIR/drift.expected.txt" <<'PY'
+import json, re, sys
 
 def load_first_json(text):
     dec = json.JSONDecoder()
@@ -786,30 +821,28 @@ def load_first_json(text):
     obj, _ = dec.raw_decode(text)
     return obj
 
-path, nonce, claim_n = sys.argv[1], sys.argv[2], sys.argv[3]
+path, expected_path = sys.argv[1], sys.argv[2]
+nonce, claims_n = [x.strip() for x in open(expected_path, "r", encoding="utf-8").read().splitlines()[:2]]
 with open(path, 'r') as f:
     v = load_first_json(f.read())
 
 msgs = v.get('messages', [])
-needle_nonce = nonce
-needle_claims = f'claims: {claim_n}'
+needle_nonce = f"nonce={nonce}"
+claims_re = re.compile(rf"\\bclaims:\\s*{re.escape(claims_n)}\\b")
 
-ok_nonce = False
-ok_claims = False
+ok = False
 for m in msgs:
     if not isinstance(m, dict) or m.get('agent_id') != 'B':
         continue
     txt = m.get('text') or m.get('raw') or ''
-    if isinstance(txt, str):
-        if needle_nonce in txt:
-            ok_nonce = True
-        if needle_claims in txt:
-            ok_claims = True
+    if not isinstance(txt, str):
+        continue
+    if needle_nonce in txt and claims_re.search(txt):
+        ok = True
+        break
 
-if not ok_nonce:
-    raise SystemExit('expected agent B to post back the runtime nonce')
-if not ok_claims:
-    raise SystemExit(f'expected agent B message to include {needle_claims!r}')
+if not ok:
+    raise SystemExit(f"expected B message containing {needle_nonce!r} and claims: {claims_n}")
 PY
 }
 
