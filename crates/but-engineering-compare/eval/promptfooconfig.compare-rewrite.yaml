@@ -76,4 +76,4 @@ tests:
         EOT
     assert:
       - type: javascript
-        value: file://dist/assertions/scored-multi-file.js:rewriteMultiFileScored
+        value: file://dist/assertions/scored-multi-file-full.js:rewriteMultiFileScoredFull
