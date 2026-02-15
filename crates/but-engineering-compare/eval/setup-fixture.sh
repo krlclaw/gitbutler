@@ -72,13 +72,13 @@ if ! E2E_TEST_APP_DATA_DIR="$APP_DATA_DIR" "$BUT_BIN" -C "$FIXTURE_DIR" status -
 fi
 
 # Install skills for Claude/Codex
-mkdir -p "$FIXTURE_DIR/.claude/skills/$MODE"
-mkdir -p "$FIXTURE_DIR/.codex/skills/$MODE"
+mkdir -p "$FIXTURE_DIR/.claude/skills/but-engineering-rewrite"
+mkdir -p "$FIXTURE_DIR/.codex/skills/but-engineering-rewrite"
 mkdir -p "$FIXTURE_DIR/.claude/skills/gitbutler"
 mkdir -p "$FIXTURE_DIR/.codex/skills/gitbutler"
 
-cp "$SKILL_SOURCE" "$FIXTURE_DIR/.claude/skills/$MODE/SKILL.md"
-cp "$SKILL_SOURCE" "$FIXTURE_DIR/.codex/skills/$MODE/SKILL.md"
+cp "$SKILL_SOURCE" "$FIXTURE_DIR/.claude/skills/but-engineering-rewrite/SKILL.md"
+cp "$SKILL_SOURCE" "$FIXTURE_DIR/.codex/skills/but-engineering-rewrite/SKILL.md"
 cp "$BUT_SKILL_SOURCE" "$FIXTURE_DIR/.claude/skills/gitbutler/SKILL.md"
 cp "$BUT_SKILL_SOURCE" "$FIXTURE_DIR/.codex/skills/gitbutler/SKILL.md"
 
