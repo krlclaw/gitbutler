@@ -26,6 +26,7 @@ ALLOW_STUB=0
 NO_AGENTS=0
 KEEP_REPO=0
 OUT_DIR_OVERRIDE=""
+ONLY_STEP=""
 
 usage() {
   cat <<'EOF'
@@ -36,6 +37,7 @@ Options:
   --provider <codex|claude|both>  (both only supported for smoke unless --no-agents)
   --timebox-s <seconds>
   --out-dir <path>     Write outputs to this directory (default: e2e/out/<ts>.<pid>)
+  --only-step <label> Run only a single step label (prefix match), skipping others.
   --allow-stub        Allow using the harness stub binary if the real binary isn't available.
   --no-agents         Skip spawning codex/claude (useful for offline smoke checks).
   --keep-repo         Keep the temp git repo (prints its path at end).
@@ -234,7 +236,6 @@ run_with_timeout() {
   shift 1
   local -a args=("$@")
   local args_json; args_json="$(json_array "${args[@]}")"
-
   local stdout_file="$OUT_DIR/$label.stdout"
   local stderr_file="$OUT_DIR/$label.stderr"
   : >"$stdout_file"
@@ -273,6 +274,11 @@ PY
   stderr="$(cat "$stderr_file" 2>/dev/null || true)"
 
   trace_emit "$label" "$cwd" "$ec" "$cmd" "$args_json" "$stdout" "$stderr" "$stdin_file"
+
+  if [[ -n "${ONLY_STEP:-}" ]] && [[ "$label" == "$ONLY_STEP"* ]]; then
+    bold "Stopping after step: $label"
+    exit 0
+  fi
   return "$ec"
 }
 
@@ -861,6 +867,7 @@ main() {
       --provider) PROVIDER="${2:-}"; shift 2 ;;
       --timebox-s) TIMEBOX_S="${2:-}"; shift 2 ;;
       --out-dir) OUT_DIR_OVERRIDE="${2:-}"; shift 2 ;;
+      --only-step) ONLY_STEP="${2:-}"; shift 2 ;;
       --allow-stub) ALLOW_STUB=1; shift 1 ;;
       --no-agents) NO_AGENTS=1; shift 1 ;;
       --keep-repo) KEEP_REPO=1; shift 1 ;;
