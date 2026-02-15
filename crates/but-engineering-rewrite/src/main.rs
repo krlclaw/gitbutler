@@ -9,13 +9,17 @@
 //!   - eval user-prompt-submit
 //! - Repo-scoped SQLite DB at: .git/gitbutler/but-engineering-rewrite.db
 
+use std::collections::HashSet;
 use std::path::PathBuf;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
-use std::{collections::HashSet};
 
-use rusqlite::{params, Connection, OptionalExtension};
-use serde_json::json;
+use rusqlite::{Connection, OptionalExtension, params};
 use serde_json::Value;
+use serde_json::json;
+use time::OffsetDateTime;
+use time::format_description::well_known::Rfc3339;
+
+const OBSERVER_AGENT_ID: &str = "tier4-observer";
 
 #[derive(Debug)]
 enum Cmd {
@@ -25,7 +29,7 @@ enum Cmd {
     Check { path: String, strict: bool },
     Post { message: String },
     PostTyped { kind: String, json: String },
-    Read { kind: Option<String> },
+    Read { kind: Option<String>, since: Option<i64> },
     Brief { kind: Option<String>, all: bool },
     Digest { kind: Option<String>, all: bool },
     Status { value: Option<String> },
@@ -33,6 +37,27 @@ enum Cmd {
     Agents,
     Done { summary: String },
     EvalUserPromptSubmit,
+}
+
+#[derive(Clone, Debug)]
+struct DiscoveryBlocker {
+    agent_id: String,
+    created_at_ms: i64,
+    kind: String,
+    body: Value,
+    text: String,
+}
+
+impl DiscoveryBlocker {
+    fn as_value(&self) -> Value {
+        let mut obj = serde_json::Map::new();
+        obj.insert("agent_id".to_owned(), Value::String(self.agent_id.clone()));
+        obj.insert("created_at_ms".to_owned(), Value::Number(self.created_at_ms.into()));
+        obj.insert("kind".to_owned(), Value::String(self.kind.clone()));
+        obj.insert("body".to_owned(), self.body.clone());
+        obj.insert("text".to_owned(), Value::String(self.text.clone()));
+        Value::Object(obj)
+    }
 }
 
 fn is_path_token_byte(b: u8) -> bool {
@@ -124,18 +149,13 @@ fn last_relevant_update_from_agent(
         .map_err(|_| ())?;
     let rows = stmt
         .query_map(params![from_agent_id], |row| {
-            Ok((
-                row.get::<_, i64>(0)?,
-                row.get::<_, i64>(1)?,
-                row.get::<_, String>(2)?,
-            ))
+            Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?, row.get::<_, String>(2)?))
         })
         .map_err(|_| ())?;
 
     for r in rows {
         let (id, created_at_ms, body_json) = r.map_err(|_| ())?;
-        let body_v: Value =
-            serde_json::from_str(&body_json).unwrap_or(Value::String(body_json.clone()));
+        let body_v: Value = serde_json::from_str(&body_json).unwrap_or(Value::String(body_json.clone()));
         let txt = extract_message_text(&body_v, &body_json);
         if needles.iter().any(|n| contains_path_token(&txt, n)) {
             return Ok(Some((id, created_at_ms, txt)));
@@ -149,6 +169,7 @@ fn requester_has_acked_since(
     requester_agent_id: &str,
     target_agent_id: &str,
     since_created_at_ms: i64,
+    path_needles: &[String],
 ) -> Result<bool, ()> {
     // Humans often omit the colon after the @mention. Treat both as equivalent, but still require
     // a near-start direct mention to avoid mid-sentence false positives.
@@ -183,14 +204,18 @@ fn requester_has_acked_since(
         )
         .map_err(|_| ())?;
     let rows = stmt
-        .query_map(params![requester_agent_id, since_created_at_ms], |row| row.get::<_, String>(0))
+        .query_map(params![requester_agent_id, since_created_at_ms], |row| {
+            row.get::<_, String>(0)
+        })
         .map_err(|_| ())?;
 
     for r in rows {
         let body_json = r.map_err(|_| ())?;
-        let body_v: Value =
-            serde_json::from_str(&body_json).unwrap_or(Value::String(body_json.clone()));
+        let body_v: Value = serde_json::from_str(&body_json).unwrap_or(Value::String(body_json.clone()));
         let txt = extract_message_text(&body_v, &body_json);
+        if !path_needles.is_empty() && !path_needles.iter().any(|n| contains_path_token(&txt, n)) {
+            continue;
+        }
         let mut scanned_bytes: usize = 0;
         let mut in_fenced_code_block = false;
         for line in txt.lines().take(16) {
@@ -222,6 +247,94 @@ fn requester_has_acked_since(
         }
     }
     Ok(false)
+}
+
+fn discovery_block_window_ms() -> i64 {
+    let default_s: i64 = 10 * 60;
+    let s = std::env::var("DISCOVERY_BLOCK_SECONDS")
+        .ok()
+        .and_then(|v| v.trim().parse::<i64>().ok())
+        .filter(|v| *v >= 0)
+        .unwrap_or(default_s);
+    s.saturating_mul(1000)
+}
+
+fn is_discovery_block_text(txt: &str) -> bool {
+    let lower = txt.to_ascii_lowercase();
+    const KEYWORDS: [&str; 10] = [
+        "please avoid",
+        "avoid ",
+        "avoid.",
+        "avoid!",
+        "blocked",
+        "blocking",
+        "do not",
+        "don't touch",
+        "skip",
+        "refactor",
+    ];
+    KEYWORDS.iter().any(|k| lower.contains(k))
+}
+
+fn discovery_blockers_for_path(
+    conn: &Connection,
+    agent_id: &str,
+    path: &str,
+    now_ms: i64,
+) -> Result<Vec<DiscoveryBlocker>, ()> {
+    let window_ms = discovery_block_window_ms();
+    if window_ms <= 0 {
+        return Ok(Vec::new());
+    }
+    let since_ms = now_ms.saturating_sub(window_ms);
+    let needles = relevant_needles_for_path(path);
+    if needles.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let mut stmt = conn
+        .prepare(
+            "SELECT id, created_at_ms, agent_id, kind, body_json FROM messages \
+             WHERE agent_id <> ?1 AND created_at_ms >= ?2 AND kind IN ('message','discovery') \
+             ORDER BY id DESC \
+             LIMIT 200",
+        )
+        .map_err(|_| ())?;
+    let rows = stmt
+        .query_map(params![agent_id, since_ms], |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, i64>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, String>(3)?,
+                row.get::<_, String>(4)?,
+            ))
+        })
+        .map_err(|_| ())?;
+
+    let mut blockers: Vec<DiscoveryBlocker> = Vec::new();
+    for r in rows {
+        let (_id, created_at_ms, from_agent, kind, body_json) = r.map_err(|_| ())?;
+        let body_v: Value = serde_json::from_str(&body_json).unwrap_or(Value::String(body_json.clone()));
+        let txt = extract_message_text(&body_v, &body_json);
+        if !needles.iter().any(|n| contains_path_token(&txt, n)) {
+            continue;
+        }
+        if !is_discovery_block_text(&txt) {
+            continue;
+        }
+        blockers.push(DiscoveryBlocker {
+            agent_id: from_agent,
+            created_at_ms,
+            kind,
+            body: body_v,
+            text: txt,
+        });
+        if blockers.len() >= 10 {
+            break;
+        }
+    }
+    Ok(blockers)
 }
 
 fn strip_common_list_prefix(line: &str) -> &str {
@@ -384,8 +497,7 @@ fn is_explicit_closure_to_me(
     released_to_me_prefix_lower: &str,
 ) -> bool {
     let ack_to_me_prefix_lower = ack_to_me_prefix.to_ascii_lowercase();
-    let ack_to_me_prefix_space_lower =
-        ack_to_me_prefix_lower.replacen(": ack:", " ack:", 1);
+    let ack_to_me_prefix_space_lower = ack_to_me_prefix_lower.replacen(": ack:", " ack:", 1);
     let mut ack_needles_lower: Vec<String> = Vec::with_capacity(12);
     let mut ack_bare_lower: Vec<String> = Vec::with_capacity(4);
     for n in [
@@ -529,21 +641,12 @@ fn is_explicit_closure_to_me(
                     }
                     if idx > 0 {
                         let prev = c_raw.as_bytes().get(idx - 1).copied().unwrap_or(b' ');
-                        if prev != b' '
-                            && prev != b':'
-                            && prev != b'('
-                            && prev != b'['
-                            && prev != b'{'
-                        {
+                        if prev != b' ' && prev != b':' && prev != b'(' && prev != b'[' && prev != b'{' {
                             continue;
                         }
                     }
                     let prefix = &c_raw[..idx];
-                    if prefix.contains('"')
-                        || prefix.contains('\'')
-                        || prefix.contains('`')
-                        || prefix.contains('>')
-                    {
+                    if prefix.contains('"') || prefix.contains('\'') || prefix.contains('`') || prefix.contains('>') {
                         continue;
                     }
                     return true;
@@ -556,21 +659,12 @@ fn is_explicit_closure_to_me(
                     }
                     if idx > 0 {
                         let prev = c_raw.as_bytes().get(idx - 1).copied().unwrap_or(b' ');
-                        if prev != b' '
-                            && prev != b':'
-                            && prev != b'('
-                            && prev != b'['
-                            && prev != b'{'
-                        {
+                        if prev != b' ' && prev != b':' && prev != b'(' && prev != b'[' && prev != b'{' {
                             continue;
                         }
                     }
                     let prefix = &c_raw[..idx];
-                    if prefix.contains('"')
-                        || prefix.contains('\'')
-                        || prefix.contains('`')
-                        || prefix.contains('>')
-                    {
+                    if prefix.contains('"') || prefix.contains('\'') || prefix.contains('`') || prefix.contains('>') {
                         continue;
                     }
                     let after = c_raw.as_bytes().get(idx + needle.len()).copied();
@@ -670,11 +764,9 @@ fn run() -> Result<(), ()> {
             }
 
             let rows = if let Some(prefix) = &path_prefix {
-                stmt.query_map(params![now_ms, prefix], map_row)
-                    .map_err(|_| ())?
+                stmt.query_map(params![now_ms, prefix], map_row).map_err(|_| ())?
             } else {
-                stmt.query_map(params![now_ms], map_row)
-                    .map_err(|_| ())?
+                stmt.query_map(params![now_ms], map_row).map_err(|_| ())?
             };
 
             let mut claims: Vec<Value> = Vec::new();
@@ -687,14 +779,12 @@ fn run() -> Result<(), ()> {
                 }));
             }
 
-            let out = json!({
-                "ok": true,
-                "claims": claims,
-            });
+            let out = Value::Array(claims);
             print_json(&out.to_string());
         }
         Cmd::Check { path, strict } => {
             let path = normalize_claim_path(&path);
+            let path_needles = relevant_needles_for_path(&path);
             let now_ms = now_unix_ms()?;
             // Detect self-claim freshness for this path so wrappers/agents don't accidentally
             // rely on a long-expired lease ("stale self-claim" edge case).
@@ -769,16 +859,14 @@ fn run() -> Result<(), ()> {
             let mut blocking_agents = Vec::<String>::new();
             // Keep a deterministic, actionable representative claim path per blocker:
             // prefer the most specific (longest) overlapping claim; tie-break on expiry then path.
-            let mut blocking_claim_path_by_agent =
-                std::collections::BTreeMap::<String, (String, i64)>::new();
+            let mut blocking_claim_path_by_agent = std::collections::BTreeMap::<String, (String, i64)>::new();
             for (blocker, claim_path, expires_at_ms) in blocking_claims_raw {
                 if seen.insert(blocker.clone()) {
                     blocking_agents.push(blocker.clone());
                 }
                 match blocking_claim_path_by_agent.get_mut(&blocker) {
                     None => {
-                        blocking_claim_path_by_agent
-                            .insert(blocker, (claim_path, expires_at_ms));
+                        blocking_claim_path_by_agent.insert(blocker, (claim_path, expires_at_ms));
                     }
                     Some((best_path, best_exp)) => {
                         let better = claim_path.len() > best_path.len()
@@ -792,12 +880,32 @@ fn run() -> Result<(), ()> {
                     }
                 }
             }
+            let has_claim_blockers = !blocking_agents.is_empty();
+
+            let discovery_blockers_all = discovery_blockers_for_path(&conn, &agent_id, &path, now_ms)?;
+            let mut discovery_blocker_agents: HashSet<String> = HashSet::new();
+            for b in &discovery_blockers_all {
+                if discovery_blocker_agents.insert(b.agent_id.clone()) {
+                    if seen.insert(b.agent_id.clone()) {
+                        blocking_agents.push(b.agent_id.clone());
+                    }
+                    blocking_claim_path_by_agent
+                        .entry(b.agent_id.clone())
+                        .or_insert_with(|| (path.clone(), b.created_at_ms));
+                }
+            }
+
             // Preserve the old low-noise behavior: cap the list.
             if blocking_agents.len() > 5 {
                 blocking_agents.truncate(5);
             }
             let kept_blockers: HashSet<String> = blocking_agents.iter().cloned().collect();
             blocking_claim_path_by_agent.retain(|k, _| kept_blockers.contains(k));
+            let discovery_blockers: Vec<DiscoveryBlocker> = discovery_blockers_all
+                .into_iter()
+                .filter(|b| kept_blockers.contains(&b.agent_id))
+                .collect();
+            discovery_blocker_agents.retain(|a| kept_blockers.contains(a));
 
             // Expose all overlapping claim paths per blocker for actionable coordination.
             // This is intentionally redundant with `blocking_agents`: consumers can show both.
@@ -830,17 +938,22 @@ fn run() -> Result<(), ()> {
                         }));
                     }
                     if !paths_for_blocker.is_empty() {
-                        blocking_claim_paths_by_agent
-                            .insert(blocker.to_owned(), Value::from(paths_for_blocker));
+                        blocking_claim_paths_by_agent.insert(blocker.to_owned(), Value::from(paths_for_blocker));
                     }
                 }
             }
 
-            let (decision, reason_code) = if !blocking_agents.is_empty() {
+            let (decision, reason_code) = if has_claim_blockers && !blocking_agents.is_empty() {
                 if strict {
                     ("deny", "claimed_by_other")
                 } else {
                     ("warn", "claimed_by_other")
+                }
+            } else if !discovery_blocker_agents.is_empty() {
+                if strict {
+                    ("deny", "discovery_block")
+                } else {
+                    ("warn", "discovery_block")
                 }
             } else {
                 ("allow", "no_conflict")
@@ -871,9 +984,7 @@ fn run() -> Result<(), ()> {
             let mut blockers_with_any_relevant_update: HashSet<String> = HashSet::new();
             let mut pending_ack_blockers: HashSet<String> = HashSet::new();
             for blocker in &blocking_agents {
-                if let Some((_id, created_at_ms, txt)) =
-                    last_relevant_update_from_agent(&conn, blocker, &path)?
-                {
+                if let Some((_id, created_at_ms, txt)) = last_relevant_update_from_agent(&conn, blocker, &path)? {
                     blockers_with_any_relevant_update.insert(blocker.to_owned());
                     if is_explicit_closure_to_me(
                         &txt,
@@ -884,7 +995,7 @@ fn run() -> Result<(), ()> {
                     ) {
                         continue;
                     }
-                    if !requester_has_acked_since(&conn, &agent_id, blocker, created_at_ms)? {
+                    if !requester_has_acked_since(&conn, &agent_id, blocker, created_at_ms, &path_needles)? {
                         pending_ack_blockers.insert(blocker.to_owned());
                     }
                 }
@@ -897,14 +1008,15 @@ fn run() -> Result<(), ()> {
                 let mut plan = Vec::<String>::new();
                 plan.push(format!("but-engineering-rewrite --agent-id {agent_id} read"));
                 for blocker in &blocking_agents {
-                    if blockers_with_any_relevant_update.contains(blocker)
-                        || blockers_with_unread_update.contains(blocker)
+                    let is_discovery_blocker = discovery_blocker_agents.contains(blocker);
+                    if !is_discovery_blocker
+                        && (blockers_with_any_relevant_update.contains(blocker)
+                            || blockers_with_unread_update.contains(blocker))
                     {
                         continue;
                     }
                     // Anti-spam: if the requester already pinged this blocker about this path using
-                    // the standard "Are you working on it?" template, don't keep suggesting the same
-                    // @mention on every subsequent `check` poll.
+                    // the standard coordination template, don't keep suggesting the same @mention.
                     if requester_already_pinged_blocker(&conn, &agent_id, blocker, &path)? {
                         continue;
                     }
@@ -912,10 +1024,20 @@ fn run() -> Result<(), ()> {
                         .get(blocker)
                         .map(|(p, _)| p.as_str())
                         .unwrap_or(path.as_str());
-                    plan.push(format!(
-                        "but-engineering-rewrite --agent-id {agent_id} post \"@{blocker}: blocked on {path} (overlaps your claim {overlap_claim_path}). Skipping {path} for now; please reply with ETA or release if you're not working on it.\""
-                    ));
+                    let message = if is_discovery_blocker {
+                        format!(
+                            "but-engineering-rewrite --agent-id {agent_id} post \"@{blocker}: ack: saw your update re {path}. Skipping {path} for now; please reply with ETA or mark it safe when refactor wraps.\""
+                        )
+                    } else {
+                        format!(
+                            "but-engineering-rewrite --agent-id {agent_id} post \"@{blocker}: blocked on {path} (overlaps your claim {overlap_claim_path}). Skipping {path} for now; please reply with ETA or release if you're not working on it.\""
+                        )
+                    };
+                    plan.push(message);
                     pinged_blockers.insert(blocker.to_owned());
+                    if is_discovery_blocker {
+                        pending_ack_blockers.remove(blocker);
+                    }
                 }
                 plan.push(format!(
                     "but-engineering-rewrite --agent-id {agent_id} check --path {path}{}",
@@ -959,16 +1081,30 @@ fn run() -> Result<(), ()> {
                 }
 
                 if let Some((claim_path, _)) = blocking_claim_path_by_agent.get(&a) {
-                    action_plan_by_agent.insert(
-                        a.clone(),
-                        Value::from(vec![
-                            format!("but-engineering-rewrite --agent-id {a} read"),
-                            format!(
-                                "but-engineering-rewrite --agent-id {a} post \"@{agent_id}: I'm holding a claim on {claim_path} (overlaps {path}). ETA update soon.\""
-                            ),
-                            format!("but-engineering-rewrite --agent-id {a} release --path {claim_path}"),
-                        ]),
-                    );
+                    if discovery_blocker_agents.contains(&a) {
+                        action_plan_by_agent.insert(
+                            a.clone(),
+                            Value::from(vec![
+                                format!("but-engineering-rewrite --agent-id {a} read"),
+                                format!(
+                                    "but-engineering-rewrite --agent-id {a} post \"@{agent_id}: still wrapping work on {path}. Will shout when it's safe.\""
+                                ),
+                            ]),
+                        );
+                    } else {
+                        action_plan_by_agent.insert(
+                            a.clone(),
+                            Value::from(vec![
+                                format!("but-engineering-rewrite --agent-id {a} read"),
+                                format!(
+                                    "but-engineering-rewrite --agent-id {a} post \"@{agent_id}: I'm holding a claim on {claim_path} (overlaps {path}). ETA update soon.\""
+                                ),
+                                format!(
+                                    "but-engineering-rewrite --agent-id {a} release --path {claim_path}"
+                                ),
+                            ]),
+                        );
+                    }
                     continue;
                 }
 
@@ -1053,10 +1189,7 @@ fn run() -> Result<(), ()> {
                         "but-engineering-rewrite --agent-id {agent_id} post \"@{a}: ack: saw your update re {path}.\""
                     );
                     // Insert before a trailing re-check if present, to keep the plan "read/ack/check".
-                    if action_plan
-                        .last()
-                        .is_some_and(|s| s.contains(" check --path "))
-                    {
+                    if action_plan.last().is_some_and(|s| s.contains(" check --path ")) {
                         let idx = action_plan.len().saturating_sub(1);
                         action_plan.insert(idx, cmd);
                     } else {
@@ -1071,22 +1204,14 @@ fn run() -> Result<(), ()> {
             );
 
             let dependency_hints = dependency_hints_for_check(&conn, &agent_id)?;
-            let stale_agents = stale_agents_for_blockers(
-                &conn,
-                &agent_id,
-                &blocking_agents,
-                &path,
-                now_ms,
-            )?;
+            let stale_agents = stale_agents_for_blockers(&conn, &agent_id, &blocking_agents, &path, now_ms)?;
 
             // Coordination usefulness: include the current status/plan of blocking agents
             // so callers don't need an extra `agents` round-trip when they hit a conflict.
             let mut blocking_agents_state: Vec<Value> = Vec::new();
             if !blocking_agents.is_empty() {
                 let mut stmt = conn
-                    .prepare(
-                        "SELECT status, plan, updated_at_ms FROM agent_state WHERE agent_id = ?1",
-                    )
+                    .prepare("SELECT status, plan, updated_at_ms FROM agent_state WHERE agent_id = ?1")
                     .map_err(|_| ())?;
                 for blocker in &blocking_agents {
                     let row: Option<(Option<String>, Option<String>, i64)> = stmt
@@ -1127,6 +1252,7 @@ fn run() -> Result<(), ()> {
                 "blocking_agents_state": blocking_agents_state,
                 "action_plan": action_plan,
                 "action_plan_by_agent": Value::Object(action_plan_by_agent),
+                "discovery_blockers": discovery_blockers.iter().map(DiscoveryBlocker::as_value).collect::<Vec<_>>(),
                 "dependency_hints": dependency_hints,
                 "stale_agents": stale_agents,
                 "unread_relevant_updates_label": "unread relevant updates since last seen",
@@ -1169,109 +1295,115 @@ fn run() -> Result<(), ()> {
             .map_err(|_| ())?;
             print_json(r#"{"ok":true}"#);
         }
-        Cmd::Read { kind } => {
-            // Default `read` to the shared channel transcript: it's the most common
-            // operation and keeps the CLI ergonomic (no need to remember `--type message`).
-            let kind = kind.unwrap_or_else(|| "message".to_owned());
-            if kind == "discovery" || kind == "all" {
-                let mut discoveries: Vec<Value> = Vec::new();
-                let mut next_steps: Vec<Value> = Vec::new();
+        Cmd::Read { kind, since } => {
+            if let Some(since_ms) = since {
+                let messages = load_messages_since(&conn, kind.as_deref(), since_ms)?;
+                let out = Value::Array(messages);
+                print_json(&out.to_string());
+            } else {
+                // Default `read` to the shared channel transcript: it's the most common
+                // operation and keeps the CLI ergonomic (no need to remember `--type message`).
+                let kind = kind.unwrap_or_else(|| "message".to_owned());
+                if kind == "discovery" || kind == "all" {
+                    let mut discoveries: Vec<Value> = Vec::new();
+                    let mut next_steps: Vec<Value> = Vec::new();
 
-                let mut stmt = conn
+                    let mut stmt = conn
                     .prepare(
                         "SELECT created_at_ms, agent_id, body_json FROM messages WHERE kind = 'discovery' ORDER BY id ASC",
                     )
                     .map_err(|_| ())?;
-                let rows = stmt
-                    .query_map([], |row| {
-                        Ok((
-                            row.get::<_, i64>(0)?,
-                            row.get::<_, String>(1)?,
-                            row.get::<_, String>(2)?,
-                        ))
-                    })
-                    .map_err(|_| ())?;
+                    let rows = stmt
+                        .query_map([], |row| {
+                            Ok((
+                                row.get::<_, i64>(0)?,
+                                row.get::<_, String>(1)?,
+                                row.get::<_, String>(2)?,
+                            ))
+                        })
+                        .map_err(|_| ())?;
 
-                for r in rows {
-                    let (created_at_ms, agent, body_json) = r.map_err(|_| ())?;
-                    let parsed: Value =
-                        serde_json::from_str(&body_json).unwrap_or(Value::String(body_json));
-                    let mut obj = match parsed {
-                        Value::Object(m) => Value::Object(m),
-                        other => json!({ "raw": other }),
-                    };
+                    for r in rows {
+                        let (created_at_ms, agent, body_json) = r.map_err(|_| ())?;
+                        let parsed: Value = serde_json::from_str(&body_json).unwrap_or(Value::String(body_json));
+                        let mut obj = match parsed {
+                            Value::Object(m) => Value::Object(m),
+                            other => json!({ "raw": other }),
+                        };
 
-                    // Attach provenance.
-                    if let Value::Object(m) = &mut obj {
-                        m.insert("agent_id".to_owned(), Value::String(agent));
-                        m.insert("created_at_ms".to_owned(), Value::from(created_at_ms));
+                        // Attach provenance.
+                        if let Value::Object(m) = &mut obj {
+                            m.insert("agent_id".to_owned(), Value::String(agent));
+                            m.insert("created_at_ms".to_owned(), Value::from(created_at_ms));
+                            m.insert("kind".to_owned(), Value::String("discovery".to_owned()));
+                        }
+
+                        // Derive a minimal actionable step, if present.
+                        if let Some(cmd) = obj
+                            .get("suggested_action")
+                            .and_then(|sa| sa.get("cmd"))
+                            .and_then(|c| c.as_str())
+                        {
+                            next_steps.push(json!({"kind":"run","cmd":cmd}));
+                        }
+
+                        discoveries.push(obj);
                     }
 
-                    // Derive a minimal actionable step, if present.
-                    if let Some(cmd) = obj
-                        .get("suggested_action")
-                        .and_then(|sa| sa.get("cmd"))
-                        .and_then(|c| c.as_str())
-                    {
-                        next_steps.push(json!({"kind":"run","cmd":cmd}));
+                    let out = json!({
+                        "ok": true,
+                        "kind": kind,
+                        "discoveries": discoveries,
+                        "next_steps": next_steps,
+                    });
+                    print_json(&out.to_string());
+                } else if kind == "declaration" || kind == "intent" || kind == "message" || kind == "block" {
+                    // Minimal inspection/debug surface: list stored structured payloads with provenance.
+                    let mut stmt = conn
+                        .prepare(
+                            "SELECT created_at_ms, agent_id, body_json FROM messages WHERE kind = ?1 ORDER BY id ASC",
+                        )
+                        .map_err(|_| ())?;
+                    let rows = stmt
+                        .query_map(params![kind], |row| {
+                            Ok((
+                                row.get::<_, i64>(0)?,
+                                row.get::<_, String>(1)?,
+                                row.get::<_, String>(2)?,
+                            ))
+                        })
+                        .map_err(|_| ())?;
+
+                    let mut messages: Vec<Value> = Vec::new();
+                    for r in rows {
+                        let (created_at_ms, agent, body_json) = r.map_err(|_| ())?;
+                        let parsed: Value = serde_json::from_str(&body_json).unwrap_or(Value::String(body_json));
+                        let mut obj = match parsed {
+                            Value::Object(m) => Value::Object(m),
+                            other => json!({ "raw": other }),
+                        };
+                        if let Value::Object(m) = &mut obj {
+                            m.insert("agent_id".to_owned(), Value::String(agent));
+                            m.insert("created_at_ms".to_owned(), Value::from(created_at_ms));
+                            m.insert("kind".to_owned(), Value::String(kind.clone()));
+                        }
+                        messages.push(obj);
                     }
 
-                    discoveries.push(obj);
+                    let out = json!({
+                        "ok": true,
+                        "kind": kind,
+                        "messages": messages,
+                    });
+                    print_json(&out.to_string());
+                } else {
+                    let out = json!({
+                        "ok": true,
+                        "kind": kind,
+                        "messages": [],
+                    });
+                    print_json(&out.to_string());
                 }
-
-                let out = json!({
-                    "ok": true,
-                    "kind": kind,
-                    "discoveries": discoveries,
-                    "next_steps": next_steps,
-                });
-                print_json(&out.to_string());
-            } else if kind == "declaration" || kind == "intent" || kind == "message" || kind == "block" {
-                // Minimal inspection/debug surface: list stored structured payloads with provenance.
-                let mut stmt = conn
-                    .prepare(
-                        "SELECT created_at_ms, agent_id, body_json FROM messages WHERE kind = ?1 ORDER BY id ASC",
-                    )
-                    .map_err(|_| ())?;
-                let rows = stmt
-                    .query_map(params![kind], |row| {
-                        Ok((
-                            row.get::<_, i64>(0)?,
-                            row.get::<_, String>(1)?,
-                            row.get::<_, String>(2)?,
-                        ))
-                    })
-                    .map_err(|_| ())?;
-
-                let mut messages: Vec<Value> = Vec::new();
-                for r in rows {
-                    let (created_at_ms, agent, body_json) = r.map_err(|_| ())?;
-                    let parsed: Value =
-                        serde_json::from_str(&body_json).unwrap_or(Value::String(body_json));
-                    let mut obj = match parsed {
-                        Value::Object(m) => Value::Object(m),
-                        other => json!({ "raw": other }),
-                    };
-                    if let Value::Object(m) = &mut obj {
-                        m.insert("agent_id".to_owned(), Value::String(agent));
-                        m.insert("created_at_ms".to_owned(), Value::from(created_at_ms));
-                    }
-                    messages.push(obj);
-                }
-
-                let out = json!({
-                    "ok": true,
-                    "kind": kind,
-                    "messages": messages,
-                });
-                print_json(&out.to_string());
-            } else {
-                let out = json!({
-                    "ok": true,
-                    "kind": kind,
-                    "messages": [],
-                });
-                print_json(&out.to_string());
             }
         }
         Cmd::Brief { kind, all } => {
@@ -1339,9 +1471,7 @@ fn run() -> Result<(), ()> {
         }
         Cmd::Agents => {
             let mut stmt = conn
-                .prepare(
-                    "SELECT agent_id, status, plan, updated_at_ms FROM agent_state ORDER BY agent_id ASC",
-                )
+                .prepare("SELECT agent_id, status, plan, updated_at_ms FROM agent_state ORDER BY agent_id ASC")
                 .map_err(|_| ())?;
             let rows = stmt
                 .query_map([], |row| {
@@ -1365,10 +1495,7 @@ fn run() -> Result<(), ()> {
                 }));
             }
 
-            let out = json!({
-                "ok": true,
-                "agents": agents,
-            });
+            let out = Value::Array(agents);
             print_json(&out.to_string());
         }
         Cmd::Done { summary } => {
@@ -1462,11 +1589,7 @@ fn normalize_claim_path(s: &str) -> String {
     parts.join("/")
 }
 
-fn load_discoveries_and_next_steps(
-    conn: &Connection,
-    kind: &str,
-    all: bool,
-) -> Result<(Vec<Value>, Vec<Value>), ()> {
+fn load_discoveries_and_next_steps(conn: &Connection, kind: &str, all: bool) -> Result<(Vec<Value>, Vec<Value>), ()> {
     let mut discoveries: Vec<Value> = Vec::new();
     let mut next_steps: Vec<Value> = Vec::new();
 
@@ -1602,10 +1725,7 @@ fn dependency_hints_for_check(conn: &Connection, agent_id: &str) -> Result<Vec<V
         return Ok(Vec::new());
     };
     let intent_v: Value = serde_json::from_str(&intent_json).map_err(|_| ())?;
-    let intent_scope = intent_v
-        .get("scope")
-        .and_then(|s| s.as_str())
-        .map(|s| s.to_owned());
+    let intent_scope = intent_v.get("scope").and_then(|s| s.as_str()).map(|s| s.to_owned());
     let intent_surface: Vec<String> = intent_v
         .get("surface")
         .and_then(|s| s.as_array())
@@ -1622,7 +1742,9 @@ fn dependency_hints_for_check(conn: &Connection, agent_id: &str) -> Result<Vec<V
         )
         .map_err(|_| ())?;
     let rows = stmt
-        .query_map(params![agent_id], |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)))
+        .query_map(params![agent_id], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })
         .map_err(|_| ())?;
 
     let mut hints: Vec<Value> = Vec::new();
@@ -1901,8 +2023,7 @@ fn unread_relevant_updates_for_check(
         let (id, created_at_ms, from_agent, kind, body_json) = r.map_err(|_| ())?;
         max_id = max_id.max(id);
 
-        let body_v: Value =
-            serde_json::from_str(&body_json).unwrap_or(Value::String(body_json.clone()));
+        let body_v: Value = serde_json::from_str(&body_json).unwrap_or(Value::String(body_json.clone()));
 
         let txt = extract_message_text(&body_v, &body_json);
         if !needles.iter().any(|n| contains_path_token(&txt, n)) {
@@ -1980,11 +2101,15 @@ where
         i += 1;
     }
 
-    let agent_id = agent_id.ok_or(())?;
     if argv.is_empty() {
         return Err(());
     }
     let sub = argv.remove(0);
+    let agent_id = match agent_id {
+        Some(id) => id,
+        None if matches!(sub.as_str(), "agents" | "claims") => OBSERVER_AGENT_ID.to_owned(),
+        None => return Err(()),
+    };
     let rest = argv;
 
     let cmd = match sub.as_str() {
@@ -2020,8 +2145,8 @@ where
             }
         }
         "read" => {
-            let kind = parse_read_args(&rest)?;
-            Cmd::Read { kind }
+            let (kind, since) = parse_read_args(&rest)?;
+            Cmd::Read { kind, since }
         }
         "brief" => {
             let (kind, all) = parse_brief_digest_args(&rest)?;
@@ -2170,11 +2295,12 @@ fn parse_post_structured_args(args: &[String]) -> Result<(String, String), ()> {
     Ok((kind.ok_or(())?, body_json.ok_or(())?))
 }
 
-fn parse_read_args(args: &[String]) -> Result<Option<String>, ()> {
+fn parse_read_args(args: &[String]) -> Result<(Option<String>, Option<i64>), ()> {
     if args.is_empty() {
-        return Ok(None);
+        return Ok((None, None));
     }
     let mut kind: Option<String> = None;
+    let mut since: Option<i64> = None;
     let mut i = 0usize;
     while i < args.len() {
         match args[i].as_str() {
@@ -2182,11 +2308,95 @@ fn parse_read_args(args: &[String]) -> Result<Option<String>, ()> {
                 i += 1;
                 kind = Some(args.get(i).ok_or(())?.clone());
             }
+            "--since" => {
+                i += 1;
+                let raw = args.get(i).ok_or(())?;
+                since = Some(parse_since_timestamp(raw)?);
+            }
             _ => return Err(()),
         }
         i += 1;
     }
-    Ok(kind)
+    Ok((kind, since))
+}
+
+fn parse_since_timestamp(raw: &str) -> Result<i64, ()> {
+    if let Ok(ms) = raw.trim().parse::<i64>() {
+        return Ok(ms);
+    }
+    let dt = OffsetDateTime::parse(raw.trim(), &Rfc3339).map_err(|_| ())?;
+    let nanos = dt.unix_timestamp_nanos();
+    let ms = nanos
+        .checked_div(1_000_000)
+        .and_then(|n| i64::try_from(n).ok())
+        .ok_or(())?;
+    Ok(ms)
+}
+
+fn load_messages_since(conn: &Connection, kind: Option<&str>, since_ms: i64) -> Result<Vec<Value>, ()> {
+    let mut messages: Vec<Value> = Vec::new();
+    let kind = kind.filter(|k| !k.is_empty());
+    if let Some(kind_filter) = kind {
+        if kind_filter != "all" {
+            let mut stmt = conn
+                .prepare(
+                    "SELECT created_at_ms, agent_id, kind, body_json FROM messages \
+                     WHERE created_at_ms >= ?1 AND kind = ?2 \
+                     ORDER BY id ASC",
+                )
+                .map_err(|_| ())?;
+            let rows = stmt
+                .query_map(params![since_ms, kind_filter], |row| {
+                    Ok((
+                        row.get::<_, i64>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, String>(3)?,
+                    ))
+                })
+                .map_err(|_| ())?;
+            for r in rows {
+                let (created_at_ms, agent, kind, body_json) = r.map_err(|_| ())?;
+                let body_v: Value = serde_json::from_str(&body_json).unwrap_or(Value::String(body_json));
+                messages.push(json!({
+                    "created_at_ms": created_at_ms,
+                    "agent_id": agent,
+                    "kind": kind,
+                    "body": body_v,
+                }));
+            }
+            return Ok(messages);
+        }
+    }
+
+    let mut stmt = conn
+        .prepare(
+            "SELECT created_at_ms, agent_id, kind, body_json FROM messages \
+             WHERE created_at_ms >= ?1 \
+             ORDER BY id ASC",
+        )
+        .map_err(|_| ())?;
+    let rows = stmt
+        .query_map(params![since_ms], |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, String>(3)?,
+            ))
+        })
+        .map_err(|_| ())?;
+    for r in rows {
+        let (created_at_ms, agent, kind, body_json) = r.map_err(|_| ())?;
+        let body_v: Value = serde_json::from_str(&body_json).unwrap_or(Value::String(body_json));
+        messages.push(json!({
+            "created_at_ms": created_at_ms,
+            "agent_id": agent,
+            "kind": kind,
+            "body": body_v,
+        }));
+    }
+    Ok(messages)
 }
 
 fn parse_brief_digest_args(args: &[String]) -> Result<(Option<String>, bool), ()> {
