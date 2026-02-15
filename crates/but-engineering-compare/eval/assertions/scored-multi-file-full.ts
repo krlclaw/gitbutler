@@ -68,7 +68,7 @@ function score(output: unknown) {
   const o = parse(output);
 
   const files = ["src/auth.rs", "src/db.rs", "src/api.rs", "src/utils.rs", "src/config.rs"];
-  const mustSkip = new Set(["src/auth.rs", "src/api.rs"]);
+  const mustSkip = new Set(["src/auth.rs"]);
 
   const cmds = commands(o);
   const msgs = messages(o);
