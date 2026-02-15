@@ -1,0 +1,59 @@
+name: ERW Harness (Deterministic)
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - master
+    paths:
+      - 'crates/but-engineering-rewrite/**'
+      - '.github/workflows/**'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+  pull_request:
+    branches: [master]
+    paths:
+      - 'crates/but-engineering-rewrite/**'
+      - '.github/workflows/**'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+  schedule:
+    # Nightly on default branch to catch regressions even without ERW file churn.
+    - cron: '17 6 * * *'
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: full
+  HARNESS_TRIALS: '1'
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: erw-harness
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    container:
+      image: ghcr.io/gitbutlerapp/ci-base-image:latest
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+      - name: Rust Cache
+        uses: Swatinem/rust-cache@v2.8.2
+        with:
+          shared-key: erw-harness
+          save-if: ${{ github.ref == 'refs/heads/master' }}
+      - name: Run harness
+        run: ./crates/but-engineering-rewrite/harness/run.sh
+      - name: Upload harness output
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: erw-harness-out
+          path: crates/but-engineering-rewrite/harness/out
+          retention-days: 7

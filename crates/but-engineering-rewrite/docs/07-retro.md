@@ -2,6 +2,20 @@
 
 ## 2026-02-15
 
+- CI: extended the deterministic ERW E2E matrix to include `drift_v2` (the current stronger drift scenario) so CI covers it by default: `.github/workflows/test-but-engineering-rewrite-e2e.yml`.
+- Verified locally: fast harness stayed green after the workflow-only change (no Rust/stub behavior changes): `./crates/but-engineering-rewrite/harness/run.sh`.
+- What failed: nothing new; this iteration only changes CI config and relies on local harness for verification.
+
+- CI: made ERW harness + deterministic E2E runnable on demand (`workflow_dispatch`) and on a nightly schedule (catches regressions even when ERW files don’t change): `.github/workflows/test-but-engineering-rewrite-harness.yml`, `.github/workflows/test-but-engineering-rewrite-e2e.yml`.
+- CI: added explicit least-privilege permissions and job timeouts to reduce stuck-run risk and clarify intent: `.github/workflows/test-but-engineering-rewrite-harness.yml`, `.github/workflows/test-but-engineering-rewrite-e2e.yml`.
+- Verified locally: fast harness re-run stayed green after workflow-only changes; no Rust/stub behavior changes: `./crates/but-engineering-rewrite/harness/run.sh`.
+- Added deterministic GitHub Actions coverage for ERW: fast harness + E2E matrix (`--no-agents`), with output uploaded as artifacts: `.github/workflows/test-but-engineering-rewrite-harness.yml`, `.github/workflows/test-but-engineering-rewrite-e2e.yml`.
+- Tightened CI E2E invocation by dropping the redundant `--provider codex` under `--no-agents` and keeping a bounded timebox: `.github/workflows/test-but-engineering-rewrite-e2e.yml`.
+- Strengthened the drift E2E prompt with explicit “long-lived session” distraction context and a “don’t loop forever” guardrail (nudges agents to re-orient via tool state vs prompt memory): `crates/but-engineering-rewrite/e2e/prompts/drift.step1.codex.txt`.
+- Fixed the E2E runner’s unknown-scenario message to list `drift` as supported: `crates/but-engineering-rewrite/e2e/run.sh`.
+- Verified locally with `e2e/run.sh --scenario smoke --no-agents` and kept the fast harness green; no Rust/stub behavior changes: `./crates/but-engineering-rewrite/e2e/run.sh`, `./crates/but-engineering-rewrite/harness/run.sh`.
+- What failed: the fast harness doesn’t execute GitHub Actions or the slow E2E runner, so we relied on local smoke + harness coverage instead.
+
 - Hardened E2E runner auto-build diagnostics: `cargo build` (when auto-building the default `target/debug/...` binary) is now executed via `run_with_timeout`, producing `cargo.build.{stdout,stderr}` artifacts plus a trace entry for post-mortem debugging: `crates/but-engineering-rewrite/e2e/run.sh`.
 - Increased reliability of “slow suite” failures by making build timeouts less likely (minimum 600s timebox for the build step, independent of per-step CLI timeboxes): `crates/but-engineering-rewrite/e2e/run.sh`.
 - No Rust/stub behavior changes; fast harness re-run remained green after the runner-only tweak: `./crates/but-engineering-rewrite/harness/run.sh`.

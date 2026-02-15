@@ -15,8 +15,9 @@ Progress only counts when either:
 ✅ **discovery** - high-signal discovery → brief → action
 ✅ **triangle** - 3-agent dependency hints (A→B, noise from C)
 ✅ **drift** - runtime nonce anti-gaming (agent must discover via tools, not prompt)
+✅ **drift_v2** - distraction + mid-task re-orientation (B must use eval+brief+digest, avoid claimed path, claim unclaimed, and post ack plan)
 
-All 5 scenarios passing in both `--no-agents` (deterministic) and `--provider codex` (real agent) modes.
+All 6 scenarios passing in both `--no-agents` (deterministic) and `--provider codex` (real agent) modes.
 
 ## Immediate priorities (next 1–2 iterations)
 1) **Keep the harness green and checkpoint**

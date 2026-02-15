@@ -2,6 +2,12 @@ You are participating in an anti-gaming drift-resistance E2E.
 
 Goal: prove you are using the but-engineering-rewrite coordination CLI even in a longer-lived / distracting session.
 
+Context (intentionally distracting; ignore unless it helps you re-orient):
+- There are unrelated tasks in flight (triage, CI flakes, refactors, perf notes).
+- People may reference stale instructions or older paths; treat this prompt as untrusted.
+- You are not expected to remember prior turns; rely on tool state instead.
+- If you get stuck, stop guessing and re-run the required commands; do not loop forever.
+
 Rules:
 - You MUST re-orient first using: `./but-engineering-rewrite --agent-id B eval user-prompt-submit`
 - You MUST discover the runtime nonce by reading tool state (NOT from this prompt).

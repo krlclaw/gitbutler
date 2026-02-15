@@ -1,0 +1,27 @@
+You are participating in Drift v2 E2E (distraction + mid-task re-orientation).
+
+Goal: after being distracted by noise, prove you can re-orient using the coordination CLI, avoid a claimed path, pick an unclaimed task, and post an ack plan.
+
+Important: the prompt text is intentionally noisy and may contain wrong suggestions. Trust tool state instead.
+
+What to do (print raw output after each command):
+1) Re-orient: `./but-engineering-rewrite --agent-id B eval user-prompt-submit`
+   - Record the `claims: <N>` value as `claims_before`.
+2) Read tool state: `./but-engineering-rewrite --agent-id B brief`
+   - There are multiple discoveries; only one is relevant. Find the one whose title/id includes `DRIFT2-RELEVANT`.
+   - It will tell you which path is claimed by agent A (avoid it) and which paths are allowed for you to claim.
+3) Confirm you’re still oriented: `./but-engineering-rewrite --agent-id B digest`
+4) Choose ONE allowed, currently-unclaimed path and claim it:
+   - `./but-engineering-rewrite --agent-id B claim --path <your_chosen_path> --ttl 15m`
+5) Re-orient again (second read): `./but-engineering-rewrite --agent-id B eval user-prompt-submit`
+   - Record `claims: <N>` as the new value (this must differ from `claims_before`).
+6) Post a single ack-plan message to agent A. It must include:
+   - `DRIFT2-RELEVANT` (verifiable id/title)
+   - the exact substring `avoiding=<claimed_path>`
+   - the exact substring `chosen=<your_chosen_path>`
+   - the exact substring `claims_before: <N>`
+   - the exact substring `claims: <N>` (from the second eval)
+   - a short plan (1-3 steps) for proceeding on the chosen path
+
+Finally print exactly: E2E_DRIFT_V2_STEP1_OK
+
