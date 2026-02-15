@@ -462,7 +462,11 @@ print(json.dumps({"ok": True, "mode": subcmd, "kind": "discovery", "discoveries"
 '
   )"
 
-  printf '%s\n' "${payload:-{\"ok\":true,\"mode\":\"$subcmd\",\"kind\":\"discovery\",\"discoveries\":[],\"next_steps\":[]}}"
+  if [[ -z "${payload:-}" ]]; then
+    payload="{\"ok\":true,\"mode\":\"$subcmd\",\"kind\":\"discovery\",\"discoveries\":[],\"next_steps\":[]}"
+  fi
+
+  printf '%s\n' "$payload"
   exit 0
 fi
 
