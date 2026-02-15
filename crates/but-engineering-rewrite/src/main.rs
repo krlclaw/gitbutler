@@ -696,6 +696,55 @@ fn run() -> Result<(), ()> {
         Cmd::Check { path, strict } => {
             let path = normalize_claim_path(&path);
             let now_ms = now_unix_ms()?;
+            // Detect self-claim freshness for this path so wrappers/agents don't accidentally
+            // rely on a long-expired lease ("stale self-claim" edge case).
+            //
+            // Note: self-claims are not blockers, but surfacing them helps keep coordination
+            // intent fresh and reduces accidental collisions after long pauses.
+            let self_claim_active: Option<(String, i64)> = conn
+                .query_row(
+                    "SELECT path, expires_at_ms FROM claims \
+                     WHERE agent_id = ?1 AND expires_at_ms > ?2 \
+                       AND (path = ?3 OR ?3 LIKE path || '/%' OR path LIKE ?3 || '/%') \
+                     ORDER BY LENGTH(path) DESC, expires_at_ms DESC, path ASC \
+                     LIMIT 1",
+                    params![agent_id, now_ms, path],
+                    |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?)),
+                )
+                .optional()
+                .map_err(|_| ())?;
+            let self_claim_stale: Option<(String, i64)> = if self_claim_active.is_none() {
+                conn.query_row(
+                    "SELECT path, expires_at_ms FROM claims \
+                     WHERE agent_id = ?1 AND expires_at_ms <= ?2 \
+                       AND (path = ?3 OR ?3 LIKE path || '/%' OR path LIKE ?3 || '/%') \
+                     ORDER BY expires_at_ms DESC, LENGTH(path) DESC, path ASC \
+                     LIMIT 1",
+                    params![agent_id, now_ms, path],
+                    |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?)),
+                )
+                .optional()
+                .map_err(|_| ())?
+            } else {
+                None
+            };
+            let self_claim = if let Some((p, exp)) = &self_claim_active {
+                json!({
+                    "status": "active",
+                    "path": p,
+                    "expires_at_ms": exp,
+                })
+            } else if let Some((p, exp)) = &self_claim_stale {
+                json!({
+                    "status": "stale",
+                    "path": p,
+                    "expires_at_ms": exp,
+                    "stale_for_ms": now_ms.saturating_sub(*exp),
+                })
+            } else {
+                json!({ "status": "none" })
+            };
+
             let mut stmt = conn
                 .prepare(
                     "SELECT agent_id, path, expires_at_ms FROM claims \
@@ -859,8 +908,12 @@ fn run() -> Result<(), ()> {
                     if requester_already_pinged_blocker(&conn, &agent_id, blocker, &path)? {
                         continue;
                     }
+                    let overlap_claim_path = blocking_claim_path_by_agent
+                        .get(blocker)
+                        .map(|(p, _)| p.as_str())
+                        .unwrap_or(path.as_str());
                     plan.push(format!(
-                        "but-engineering-rewrite --agent-id {agent_id} post \"@{blocker}: I'm about to edit {path}. Are you working on it?\""
+                        "but-engineering-rewrite --agent-id {agent_id} post \"@{blocker}: blocked on {path} (overlaps your claim {overlap_claim_path}). Skipping {path} for now; please reply with ETA or release if you're not working on it.\""
                     ));
                     pinged_blockers.insert(blocker.to_owned());
                 }
@@ -873,6 +926,20 @@ fn run() -> Result<(), ()> {
                 // For allow decisions, `check` already happened; avoid suggesting a redundant re-check.
                 Vec::new()
             };
+
+            // If this agent previously held an overlapping claim but it's now stale, explicitly
+            // suggest renewal before editing (prevents relying on expired self-claims across long pauses).
+            if blocking_agents.is_empty() {
+                if let Some((claim_path, _exp)) = &self_claim_stale {
+                    action_plan.push(format!(
+                        "but-engineering-rewrite --agent-id {agent_id} claim --path {claim_path} --ttl 15m"
+                    ));
+                    action_plan.push(format!(
+                        "but-engineering-rewrite --agent-id {agent_id} check --path {path}{}",
+                        if strict { " --strict" } else { "" }
+                    ));
+                }
+            }
 
             // Multi-step coordination is usually a multi-agent process. Provide a low-noise,
             // per-agent action plan to help wrappers drive convergence without guesswork.
@@ -1053,6 +1120,7 @@ fn run() -> Result<(), ()> {
             let out = json!({
                 "decision": decision,
                 "reason_code": reason_code,
+                "self_claim": self_claim,
                 "blocking_agents": blocking_agents,
                 "blocking_claims": blocking_claims,
                 "blocking_claim_paths_by_agent": Value::Object(blocking_claim_paths_by_agent),
@@ -1718,10 +1786,15 @@ fn requester_already_pinged_blocker(
             .and_then(|t| t.as_str())
             .or_else(|| v.as_str())
             .unwrap_or("");
-        if text.contains(&prefix)
-            && text.contains(path)
-            && text.contains("Are you working on it?")
-        {
+        if !text.contains(&prefix) || !text.contains(path) {
+            continue;
+        }
+        // Support both the old ping template and the newer "blocked/skip" template.
+        if text.contains("Are you working on it?") {
+            return Ok(true);
+        }
+        let lower = text.to_ascii_lowercase();
+        if lower.contains("blocked") || lower.contains("skipping") || lower.contains("skip ") {
             return Ok(true);
         }
     }
