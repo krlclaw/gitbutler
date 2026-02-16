@@ -59,3 +59,32 @@ Next slices:
 4) **Add a repeat runner for scored eval**
    - `pnpm run scored:rewrite:fast --repeat N` (or a wrapper script) + aggregate mean/variance.
    - Goal: reduce flakiness + prevent regressions.
+
+## Dependency modernization track (new)
+
+Goal: reduce custom plumbing and improve reliability/maintainability in rewrite by adopting focused third-party crates where they clearly help.
+
+Priority candidates:
+1) **clap** (high)
+   - Replace custom argv parsing in `but-engineering-rewrite` with typed subcommands/options.
+   - Expected wins: fewer parse bugs (`--agent-id` ordering class), clearer help/error output, easier extension of commands.
+
+2) **thiserror + anyhow** (high)
+   - Replace opaque `internal_error` surfaces with structured errors and richer context.
+   - Expected wins: better debuggability in compare harness traces, faster iteration on failures.
+
+3) **tracing + tracing-subscriber** (medium)
+   - Add structured runtime logs (JSON in harness/eval mode).
+   - Expected wins: easier root-cause analysis when scored eval stalls/hangs.
+
+4) **serde_with / schemars** (medium)
+   - Tighten JSON output schemas for `check/read/brief/digest` and avoid ad-hoc shape drift.
+   - Expected wins: more stable assertions and less brittle eval parsing.
+
+5) **humantime / duration-str** (low)
+   - Standardize TTL/duration parsing.
+   - Expected wins: fewer edge-case parsing bugs and clearer UX.
+
+Guardrails:
+- Introduce dependencies incrementally (one slice at a time) with harness-first validation.
+- Do not rewrite everything at once; each dependency adoption must produce measurable harness/eval improvement.
