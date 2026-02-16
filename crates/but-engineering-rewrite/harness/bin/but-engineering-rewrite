@@ -1,6 +1,8 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+OBSERVER_AGENT_ID="tier4-observer"
+
 agent_id=""
 subcmd=""
 path=""
@@ -98,32 +100,63 @@ normalize_path() {
   printf "%s" "$out"
 }
 
-while [[ $# -gt 0 ]]; do
-  case "$1" in
-    --agent-id)
-      shift
-      [[ $# -gt 0 ]] || { json_err "bad_args"; exit 1; }
-      agent_id="$1"
-      shift
-      ;;
-    claim|release|check|post|read|brief|digest|eval|status|plan|agents|done)
-      subcmd="$1"
-      shift
-      break
-      ;;
-    claims)
-      subcmd="$1"
-      shift
-      break
-      ;;
-    *)
-      json_err "bad_args"
-      exit 1
-      ;;
-  esac
+# Accept `--agent-id` anywhere (including `--agent-id=...`) to match the Rust CLI.
+# This is intentionally "global": it is stripped even if it appears after the subcommand.
+declare -a argv=("$@")
+declare -a filtered=()
+idx=0
+while [[ $idx -lt ${#argv[@]} ]]; do
+  a="${argv[$idx]}"
+  if [[ "$a" == "--agent-id" ]]; then
+    idx=$((idx + 1))
+    [[ $idx -lt ${#argv[@]} ]] || { json_err "bad_args"; exit 1; }
+    agent_id="${argv[$idx]}"
+    idx=$((idx + 1))
+    continue
+  fi
+  if [[ "$a" == --agent-id=* ]]; then
+    agent_id="${a#--agent-id=}"
+    [[ -n "$agent_id" ]] || { json_err "bad_args"; exit 1; }
+    idx=$((idx + 1))
+    continue
+  fi
+  filtered+=("$a")
+  idx=$((idx + 1))
 done
 
-[[ -n "$agent_id" && -n "$subcmd" ]] || { json_err "bad_args"; exit 1; }
+[[ ${#filtered[@]} -gt 0 ]] || { json_err "bad_args"; exit 1; }
+subcmd="${filtered[0]}"
+# Shift the "argv" array without using array slicing or empty-array expansions
+# (both interact poorly with `set -u` in bash).
+declare -a rest=()
+j=1
+while [[ $j -lt ${#filtered[@]} ]]; do
+  rest+=("${filtered[$j]}")
+  j=$((j + 1))
+done
+if [[ ${#rest[@]} -gt 0 ]]; then
+  filtered=("${rest[@]}")
+else
+  filtered=()
+fi
+
+case "$subcmd" in
+  claim|release|check|post|read|brief|digest|eval|status|plan|agents|done|claims) ;;
+  *) json_err "bad_args"; exit 1 ;;
+esac
+
+if [[ -z "$agent_id" ]]; then
+  case "$subcmd" in
+    agents|claims) agent_id="$OBSERVER_AGENT_ID" ;;
+    *) json_err "bad_args"; exit 1 ;;
+  esac
+fi
+
+if [[ ${#filtered[@]} -gt 0 ]]; then
+  set -- "${filtered[@]}"
+else
+  set --
+fi
 
 db_dir=".git/gitbutler"
 db_path="$db_dir/but-engineering-rewrite.db"
@@ -614,6 +647,48 @@ blocking_claims="[]"
 blocking_claim_paths_by_agent="{}"
 action_plan="[]"
 action_plan_by_agent="{}"
+self_claim='{"status":"none"}'
+self_stale_path=""
+
+# Keep parity with the Rust CLI: detect self-claim freshness for this path.
+# Note: self-claims are not blockers, but surfacing stale self-claims helps avoid
+# accidental collisions after long pauses (agents/wrappers can renew before editing).
+self_active_row="$(
+  sqlite3 -noheader "$db_path" \
+    "SELECT path || '|' || expires_at_s FROM claims \
+     WHERE agent_id = $(sql_quote "$agent_id") AND expires_at_s > $now_s \
+       AND (path = $(sql_quote "$path") OR $(sql_quote "$path") LIKE path || '/%' OR path LIKE $(sql_quote "$path") || '/%') \
+     ORDER BY LENGTH(path) DESC, expires_at_s DESC, path ASC \
+     LIMIT 1;" \
+    2>/dev/null || true
+)"
+if [[ -n "$self_active_row" ]]; then
+  IFS='|' read -r self_p self_exp_s <<<"$self_active_row"
+  if [[ -n "${self_p:-}" ]] && [[ -n "${self_exp_s:-}" ]]; then
+    esc_self_p="$(json_escape "$self_p")"
+    self_claim="{\"status\":\"active\",\"path\":\"$esc_self_p\",\"expires_at_ms\":$((self_exp_s * 1000))}"
+  fi
+else
+  self_stale_row="$(
+    sqlite3 -noheader "$db_path" \
+      "SELECT path || '|' || expires_at_s FROM claims \
+       WHERE agent_id = $(sql_quote "$agent_id") AND expires_at_s <= $now_s \
+         AND (path = $(sql_quote "$path") OR $(sql_quote "$path") LIKE path || '/%' OR path LIKE $(sql_quote "$path") || '/%') \
+       ORDER BY expires_at_s DESC, LENGTH(path) DESC, path ASC \
+       LIMIT 1;" \
+      2>/dev/null || true
+  )"
+  if [[ -n "$self_stale_row" ]]; then
+    IFS='|' read -r self_p self_exp_s <<<"$self_stale_row"
+    if [[ -n "${self_p:-}" ]] && [[ -n "${self_exp_s:-}" ]]; then
+      esc_self_p="$(json_escape "$self_p")"
+      stale_for_ms=$(((now_s - self_exp_s) * 1000))
+      (( stale_for_ms < 0 )) && stale_for_ms=0
+      self_claim="{\"status\":\"stale\",\"path\":\"$esc_self_p\",\"expires_at_ms\":$((self_exp_s * 1000)),\"stale_for_ms\":$stale_for_ms}"
+      self_stale_path="$self_p"
+    fi
+  fi
+fi
 if [[ -n "$blockers" ]]; then
   if [[ "$strict" == "1" ]]; then
     decision="deny"
@@ -628,7 +703,6 @@ if [[ -n "$blockers" ]]; then
   # Build JSON arrays (keep stdout valid JSON; avoid jq).
   ba_items=()
   ap_items=()
-  ba_items+=("\"$esc_read\"") # placeholder; fixed below
   ap_items+=("\"$esc_read\"")
 
   # Anti-spam: if the requester already pinged a blocker about this path using the standard
@@ -691,9 +765,6 @@ for b in blockers:
     esc_post="$(json_escape "$post_cmd")"
     ap_items+=("\"$esc_post\"")
   done <<<"$blockers"
-
-  # Remove the placeholder at ba_items[0] (bash doesn't have an easy pop-front portable across shells).
-  ba_items=("${ba_items[@]:1}")
 
   retry_cmd="but-engineering-rewrite --agent-id $agent_id check --path $path"
   if [[ "$strict" == "1" ]]; then
@@ -784,18 +855,33 @@ else
   decision="allow"
   reason_code="no_conflict"
   # For allow decisions, `check` already happened; avoid suggesting a redundant re-check.
-  action_plan="[]"
+  #
+  # If this agent previously held an overlapping claim but it's now stale, explicitly suggest
+  # renewal before editing (prevents relying on expired self-claims across long pauses).
+  if [[ -n "$self_stale_path" ]]; then
+    claim_cmd="but-engineering-rewrite --agent-id $agent_id claim --path $self_stale_path --ttl 15m"
+    check_cmd="but-engineering-rewrite --agent-id $agent_id check --path $path"
+    if [[ "$strict" == "1" ]]; then
+      check_cmd="$check_cmd --strict"
+    fi
+    esc_claim="$(json_escape "$claim_cmd")"
+    esc_check="$(json_escape "$check_cmd")"
+    action_plan="[\"$esc_claim\",\"$esc_check\"]"
+  else
+    action_plan="[]"
+  fi
 fi
 
 # Per-agent action plan: help wrappers drive convergence (multi-step, multi-agent).
 action_plan_by_agent="$(
-  DB_PATH="$db_path" REQUESTER="$agent_id" TARGET_PATH="$path" STRICT="$strict" BLOCKERS="$blockers" python3 -c '
+  DB_PATH="$db_path" REQUESTER="$agent_id" TARGET_PATH="$path" STRICT="$strict" BLOCKERS="$blockers" SELF_STALE_PATH="$self_stale_path" python3 -c '
 import json, os, sqlite3, time
 db_path = os.environ["DB_PATH"]
 requester = os.environ["REQUESTER"]
 target_path = os.environ["TARGET_PATH"]
 strict = os.environ.get("STRICT","0") == "1"
 blockers = [b for b in (os.environ.get("BLOCKERS","") or "").splitlines() if b.strip()]
+self_stale_path = (os.environ.get("SELF_STALE_PATH","") or "").strip()
 
 def overlaps(a: str, b: str) -> bool:
     # Same as harness/rust: exact OR prefix + "/" on either side.
@@ -864,6 +950,17 @@ out = {}
 def requester_plan():
     if not blockers:
         # For allow decisions, `check` already happened; avoid suggesting a redundant re-check.
+        #
+        # Mirror the Rust behavior: if the requester has a stale overlapping self-claim, suggest
+        # renewing it before editing (and re-checking).
+        if self_stale_path:
+            cmd = f"but-engineering-rewrite --agent-id {requester} check --path {target_path}"
+            if strict:
+                cmd += " --strict"
+            return [
+                f"but-engineering-rewrite --agent-id {requester} claim --path {self_stale_path} --ttl 15m",
+                cmd,
+            ]
         return []
     plan = [f"but-engineering-rewrite --agent-id {requester} read"]
     for b in blockers:
@@ -982,7 +1079,7 @@ print(json.dumps(hints, separators=(",",":")))
   )"
 fi
 
-OUT_DECISION="$decision" OUT_REASON="$reason_code" OUT_BLOCKERS="$blocking_agents" OUT_BLOCKING_CLAIMS="$blocking_claims" OUT_CLAIM_PATHS_BY_AGENT="$blocking_claim_paths_by_agent" OUT_ACTION_PLAN="$action_plan" OUT_BY_AGENT="${action_plan_by_agent:-}" OUT_HINTS="$dependency_hints" DB_PATH="$db_path" REQUESTER="$agent_id" TARGET_PATH="$path" BLOCKERS="$blockers" python3 -c '
+OUT_DECISION="$decision" OUT_REASON="$reason_code" OUT_SELF_CLAIM="$self_claim" OUT_BLOCKERS="$blocking_agents" OUT_BLOCKING_CLAIMS="$blocking_claims" OUT_CLAIM_PATHS_BY_AGENT="$blocking_claim_paths_by_agent" OUT_ACTION_PLAN="$action_plan" OUT_BY_AGENT="${action_plan_by_agent:-}" OUT_HINTS="$dependency_hints" DB_PATH="$db_path" REQUESTER="$agent_id" TARGET_PATH="$path" BLOCKERS="$blockers" python3 -c '
 import json, os, sqlite3, time
 
 def load_json_env(name: str, default):
@@ -1990,14 +2087,53 @@ except Exception:
     # Keep stub behavior resilient; never fail the harness due to "nice to have" plan enrichment.
     pass
 
+next_steps = []
+try:
+    if isinstance(action_plan, list):
+        for cmd in action_plan:
+            if isinstance(cmd, str) and cmd:
+                next_steps.append({"cmd": cmd})
+except Exception:
+    next_steps = []
+
+action_plan_hints = {
+    "requires_coordination": os.environ.get("OUT_DECISION", "") != "allow",
+    "has_read_step": False,
+    "has_post_step": False,
+    "has_ack_step": False,
+    "has_retry_check_step": False,
+    "has_claim_step": False,
+}
+try:
+    if isinstance(action_plan, list):
+        for cmd in action_plan:
+            if not isinstance(cmd, str):
+                continue
+            if " read" in cmd:
+                action_plan_hints["has_read_step"] = True
+            if " post " in cmd:
+                action_plan_hints["has_post_step"] = True
+            if ": ack:" in cmd:
+                action_plan_hints["has_ack_step"] = True
+            if " check --path " in cmd:
+                action_plan_hints["has_retry_check_step"] = True
+            if " claim --path " in cmd:
+                action_plan_hints["has_claim_step"] = True
+except Exception:
+    pass
+
 out = {
+    "path": target_path,
     "decision": os.environ.get("OUT_DECISION", ""),
     "reason_code": os.environ.get("OUT_REASON", ""),
+    "self_claim": load_json_env("OUT_SELF_CLAIM", {"status": "none"}),
     "blocking_agents": blocking_agents,
     "blocking_agents_state": blocking_agents_state,
     "blocking_claims": load_json_env("OUT_BLOCKING_CLAIMS", []),
     "blocking_claim_paths_by_agent": load_json_env("OUT_CLAIM_PATHS_BY_AGENT", {}),
     "action_plan": action_plan,
+    "next_steps": next_steps,
+    "action_plan_hints": action_plan_hints,
     "action_plan_by_agent": action_plan_by_agent,
     "dependency_hints": load_json_env("OUT_HINTS", []),
     "stale_agents": stale_agents,

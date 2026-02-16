@@ -52,11 +52,12 @@ jobs:
           shared-key: erw-e2e
           save-if: ${{ github.ref == 'refs/heads/master' }}
       - name: Run E2E (no agents)
-        run: ./crates/but-engineering-rewrite/e2e/run.sh --no-agents --scenario "${{ matrix.scenario }}" --timebox-s 120
+        run: ./crates/but-engineering-rewrite/e2e/run.sh --no-agents --scenario "${{ matrix.scenario }}" --timebox-s 120 --out-dir "${{ runner.temp }}/erw-e2e-${{ matrix.scenario }}"
       - name: Upload E2E output
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: erw-e2e-out-${{ matrix.scenario }}
-          path: crates/but-engineering-rewrite/e2e/out
+          path: ${{ runner.temp }}/erw-e2e-${{ matrix.scenario }}
           retention-days: 7
+          if-no-files-found: error

@@ -27,6 +27,12 @@ NO_AGENTS=0
 KEEP_REPO=0
 OUT_DIR_OVERRIDE=""
 ONLY_STEP=""
+TRACE_SEQ=0
+REPLAY_DIR="${E2E_REPLAY_DIR:-}"
+REPLAY=0
+REPLAY_IDX=0
+REPLAY_FAILED=0
+declare -a REPLAY_LINES=()
 
 usage() {
   cat <<'EOF'
@@ -44,6 +50,7 @@ Options:
 
 Env:
   BIN=...             Path to a real but-engineering-rewrite binary (preferred).
+  E2E_REPLAY_DIR=...  Compare this run against a saved e2e/out/<timestamp>/trace.jsonl.
 
 Notes:
   - This is an opt-in slow suite. It creates a temp git repo and writes outputs under e2e/out/.
@@ -80,7 +87,7 @@ mk_out_dir() {
   : >"$TRACE_PATH"
 
   META_PATH="$OUT_DIR/meta.json"
-  python3 - "$META_PATH" "$ROOT" "$E2E_DIR" "$SCENARIO" "$PROVIDER" "$TIMEBOX_S" "$ALLOW_STUB" "$NO_AGENTS" "$KEEP_REPO" "$BIN" "$STUB_BIN" <<'PY'
+  python3 - "$META_PATH" "$ROOT" "$E2E_DIR" "$SCENARIO" "$PROVIDER" "$TIMEBOX_S" "$ALLOW_STUB" "$NO_AGENTS" "$KEEP_REPO" "$BIN" "$STUB_BIN" "$REPLAY_DIR" <<'PY'
 import json, os, shutil, subprocess, sys
 
 out_path = sys.argv[1]
@@ -94,6 +101,7 @@ no_agents = int(sys.argv[8])
 keep_repo = int(sys.argv[9])
 bin_path = sys.argv[10]
 stub_bin = sys.argv[11]
+replay_dir = sys.argv[12]
 
 def cmd_out(argv):
     try:
@@ -121,6 +129,8 @@ meta = {
     "keep_repo": bool(keep_repo),
     "bin": bin_path,
     "stub_bin": stub_bin,
+    "replay_dir": replay_dir if replay_dir else None,
+    "replay": bool(replay_dir),
     "root": root,
     "e2e_dir": e2e_dir,
     "git_head": git_head,
@@ -161,6 +171,74 @@ json_array() {
   printf "%s" "$out"
 }
 
+file_sha256() {
+  local path="${1:-}"
+  if [[ -z "$path" ]] || [[ ! -f "$path" ]]; then
+    printf ""
+    return 0
+  fi
+  python3 - "$path" <<'PY'
+import hashlib, sys
+path = sys.argv[1]
+h = hashlib.sha256()
+with open(path, "rb") as f:
+    for chunk in iter(lambda: f.read(1024 * 1024), b""):
+        h.update(chunk)
+print(h.hexdigest())
+PY
+}
+
+jsonl_event_summary_file() {
+  local path="${1:-}"
+  if [[ -z "$path" ]] || [[ ! -f "$path" ]]; then
+    printf "null"
+    return 0
+  fi
+  python3 - "$path" <<'PY'
+import json, sys
+
+path = sys.argv[1]
+types = set()
+turn_started = 0
+turn_completed = 0
+response_completed = 0
+jsonl_objects = 0
+
+with open(path, "r", encoding="utf-8", errors="replace") as f:
+    for raw in f:
+        line = raw.strip()
+        if not (line.startswith("{") and line.endswith("}")):
+            continue
+        try:
+            obj = json.loads(line)
+        except Exception:
+            continue
+        jsonl_objects += 1
+        t = obj.get("type")
+        if isinstance(t, str) and t:
+            types.add(t)
+            if t == "turn.started":
+                turn_started += 1
+            elif t == "turn.completed":
+                turn_completed += 1
+            elif t == "response.completed":
+                response_completed += 1
+
+print(
+    json.dumps(
+        {
+            "types": sorted(types),
+            "turn_started": turn_started,
+            "turn_completed": turn_completed,
+            "response_completed": response_completed,
+            "jsonl_objects": jsonl_objects,
+        },
+        separators=(",", ":"),
+    )
+)
+PY
+}
+
 trace_emit() {
   local label="$1"
   local cwd="$2"
@@ -170,21 +248,193 @@ trace_emit() {
   local stdout="$6"
   local stderr="$7"
   local stdin_file="${8:-}"
+  local agent_event_summary_json="${9:-null}"
+  local stdin_sha256
+  stdin_sha256="$(file_sha256 "$stdin_file")"
 
   local ts_ms
   ts_ms="$(now_ms)"
+  TRACE_SEQ=$((TRACE_SEQ + 1))
 
   printf '{' >>"$TRACE_PATH"
   printf '"ts_ms":%s' "$ts_ms" >>"$TRACE_PATH"
+  printf ',"invocation_id":%s' "$TRACE_SEQ" >>"$TRACE_PATH"
   printf ',"label":"%s"' "$(json_escape "$label")" >>"$TRACE_PATH"
   printf ',"cwd":"%s"' "$(json_escape "$cwd")" >>"$TRACE_PATH"
   printf ',"cmd":"%s"' "$(json_escape "$cmd")" >>"$TRACE_PATH"
   printf ',"args":%s' "$args_json" >>"$TRACE_PATH"
   printf ',"stdin_file":"%s"' "$(json_escape "$stdin_file")" >>"$TRACE_PATH"
+  printf ',"stdin_sha256":"%s"' "$(json_escape "$stdin_sha256")" >>"$TRACE_PATH"
+  printf ',"agent_event_summary":%s' "$agent_event_summary_json" >>"$TRACE_PATH"
   printf ',"exit_code":%s' "$ec" >>"$TRACE_PATH"
   printf ',"stdout":"%s"' "$(json_escape "$stdout")" >>"$TRACE_PATH"
   printf ',"stderr":"%s"' "$(json_escape "$stderr")" >>"$TRACE_PATH"
   printf '}\n' >>"$TRACE_PATH"
+}
+
+replay_init() {
+  [[ -n "$REPLAY_DIR" ]] || return 0
+  if [[ ! -d "$REPLAY_DIR" ]]; then
+    fail "E2E_REPLAY_DIR is not a directory: $REPLAY_DIR"
+  fi
+  local replay_trace="$REPLAY_DIR/trace.jsonl"
+  if [[ ! -f "$replay_trace" ]]; then
+    fail "E2E_REPLAY_DIR missing trace.jsonl: $replay_trace"
+  fi
+  REPLAY_LINES=()
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    REPLAY_LINES+=("$line")
+  done <"$replay_trace"
+  REPLAY=1
+}
+
+replay_compare() {
+  local expected_line="$1"
+  local actual_label="$2"
+  local actual_ec="$3"
+  local actual_stdout="$4"
+  local actual_stdin_file="${5:-}"
+
+  python3 - "$actual_label" "$actual_ec" "$expected_line" "$actual_stdout" "$actual_stdin_file" <<'PY'
+import json, os, sys
+
+actual_label = sys.argv[1]
+actual_ec = int(sys.argv[2])
+expected_line = sys.argv[3]
+actual_stdout = sys.argv[4]
+actual_stdin_file = sys.argv[5]
+
+try:
+    expected = json.loads(expected_line)
+except Exception as e:
+    print(f"replay: expected trace line is not JSON: {e}", file=sys.stderr)
+    sys.exit(2)
+
+exp_label = expected.get("label")
+if exp_label is None:
+    print("replay: expected trace missing label", file=sys.stderr)
+    sys.exit(2)
+if str(exp_label) != actual_label:
+    print(f"replay: label mismatch: expected {exp_label!r}, got {actual_label!r}", file=sys.stderr)
+    sys.exit(1)
+
+exp_ec = expected.get("exit_code")
+if exp_ec is None:
+    print("replay: expected trace missing exit_code", file=sys.stderr)
+    sys.exit(2)
+if int(exp_ec) != actual_ec:
+    print(f"replay: exit_code mismatch: expected {exp_ec}, got {actual_ec}", file=sys.stderr)
+    sys.exit(1)
+
+exp_stdin_file = expected.get("stdin_file", "")
+exp_stdin_sha256 = expected.get("stdin_sha256", "")
+if isinstance(exp_stdin_file, str) and exp_stdin_file:
+    if not actual_stdin_file:
+        print("replay: expected stdin_file but got empty stdin_file", file=sys.stderr)
+        sys.exit(1)
+    exp_base = os.path.basename(exp_stdin_file)
+    act_base = os.path.basename(actual_stdin_file)
+    if exp_base != act_base:
+        # Backward compatibility: older traces may reference source prompt filenames
+        # (e.g., smoke.codex.txt) while newer runs snapshot prompt stdin as
+        # <label>.prompt.txt in the output directory.
+        if not (
+            str(exp_label).startswith("agent.")
+            and act_base == f"{actual_label}.prompt.txt"
+        ):
+            print(
+                f"replay: stdin_file basename mismatch: expected {exp_base!r}, got {act_base!r}",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+    if isinstance(exp_stdin_sha256, str) and exp_stdin_sha256:
+        import hashlib
+        try:
+            h = hashlib.sha256()
+            with open(actual_stdin_file, "rb") as f:
+                for chunk in iter(lambda: f.read(1024 * 1024), b""):
+                    h.update(chunk)
+            act_stdin_sha256 = h.hexdigest()
+        except Exception as e:
+            print(f"replay: failed to hash stdin_file: {e}", file=sys.stderr)
+            sys.exit(1)
+        if act_stdin_sha256 != exp_stdin_sha256:
+            print(
+                "replay: stdin_file sha256 mismatch",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+
+exp_stdout = expected.get("stdout", "")
+try:
+    exp_stdout_json = json.loads(exp_stdout)
+except Exception:
+    exp_stdout_json = None
+
+if isinstance(exp_stdout_json, dict):
+    try:
+        act_stdout_json = json.loads(actual_stdout)
+    except Exception as e:
+        print(f"replay: stdout expected JSON but got non-JSON: {e}", file=sys.stderr)
+        sys.exit(1)
+    for k in exp_stdout_json.keys():
+        if k not in act_stdout_json:
+            print(f"replay: stdout missing required top-level key: {k}", file=sys.stderr)
+            sys.exit(1)
+
+# Provider-mode hook: if a saved agent step captured Codex JSONL events,
+# require replay runs to include the same stable event-type markers.
+if str(exp_label).startswith("agent."):
+    def jsonl_event_types(blob):
+        out = []
+        for raw in blob.splitlines():
+            line = raw.strip()
+            if not line.startswith("{") or not line.endswith("}"):
+                continue
+            try:
+                obj = json.loads(line)
+            except Exception:
+                continue
+            t = obj.get("type")
+            if isinstance(t, str) and t:
+                out.append(t)
+        return out
+
+    exp_types = jsonl_event_types(exp_stdout)
+    act_types = set(jsonl_event_types(actual_stdout))
+    stable_markers = {"turn.started", "turn.completed", "response.completed"}
+    required = [t for t in exp_types if t in stable_markers]
+    missing = sorted({t for t in required if t not in act_types})
+    if missing:
+        print(
+            f"replay: agent stdout missing expected JSONL event type(s): {missing}",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
+sys.exit(0)
+PY
+}
+
+replay_check_invocation() {
+  local label="$1"
+  local ec="$2"
+  local stdout="$3"
+  local stdin_file="${4:-}"
+  [[ "$REPLAY" -eq 1 ]] || return 0
+
+  local expected="${REPLAY_LINES[$REPLAY_IDX]:-}"
+  if [[ -z "$expected" ]]; then
+    printf "FAIL: replay: missing expected trace line for invocation %s (%s)\n" "$TRACE_SEQ" "$label" >&2
+    REPLAY_FAILED=1
+    return 1
+  fi
+  if ! replay_compare "$expected" "$label" "$ec" "$stdout" "$stdin_file"; then
+    printf "FAIL: replay mismatch at invocation %s (%s)\n" "$TRACE_SEQ" "$label" >&2
+    REPLAY_FAILED=1
+    return 1
+  fi
+  REPLAY_IDX=$((REPLAY_IDX + 1))
 }
 
 mk_repo() {
@@ -244,8 +494,47 @@ run_with_timeout() {
   : >"$stderr_file"
 
   local ec=0
-  set +e
-  python3 - "$timebox_s" "$cwd" "$stdout_file" "$stderr_file" "$stdin_file" "$cmd" "${args[@]}" <<'PY'
+  if [[ "$REPLAY" -eq 1 ]] && [[ "$label" == agent.* ]]; then
+    ec="$(python3 - "$stdout_file" "$stderr_file" "${REPLAY_LINES[$REPLAY_IDX]:-}" <<'PY'
+import json, sys
+
+stdout_path = sys.argv[1]
+stderr_path = sys.argv[2]
+expected_line = sys.argv[3]
+
+if not expected_line:
+    print("2")
+    sys.exit(0)
+
+try:
+    expected = json.loads(expected_line)
+except Exception:
+    print("2")
+    sys.exit(0)
+
+stdout = expected.get("stdout", "")
+stderr = expected.get("stderr", "")
+exit_code = expected.get("exit_code", 2)
+
+if not isinstance(stdout, str):
+    stdout = str(stdout)
+if not isinstance(stderr, str):
+    stderr = str(stderr)
+
+with open(stdout_path, "w", encoding="utf-8") as f:
+    f.write(stdout)
+with open(stderr_path, "w", encoding="utf-8") as f:
+    f.write(stderr)
+
+try:
+    print(int(exit_code))
+except Exception:
+    print("2")
+PY
+)"
+  else
+    set +e
+    python3 - "$timebox_s" "$cwd" "$stdout_file" "$stderr_file" "$stdin_file" "$cmd" "${args[@]}" <<'PY'
 import os, subprocess, sys
 
 timebox_s = int(sys.argv[1])
@@ -268,14 +557,21 @@ with open(stdout_path, "wb") as out, open(stderr_path, "wb") as err:
         if stdin_f is not None:
             stdin_f.close()
 PY
-  ec=$?
-  set -e
+    ec=$?
+    set -e
+  fi
 
   local stdout stderr
   stdout="$(cat "$stdout_file" 2>/dev/null || true)"
   stderr="$(cat "$stderr_file" 2>/dev/null || true)"
 
-  trace_emit "$label" "$cwd" "$ec" "$cmd" "$args_json" "$stdout" "$stderr" "$stdin_file"
+  local agent_event_summary_json="null"
+  if [[ "$label" == agent.* ]]; then
+    agent_event_summary_json="$(jsonl_event_summary_file "$stdout_file")"
+  fi
+
+  trace_emit "$label" "$cwd" "$ec" "$cmd" "$args_json" "$stdout" "$stderr" "$stdin_file" "$agent_event_summary_json"
+  replay_check_invocation "$label" "$ec" "$stdout" "$stdin_file" || return 1
 
   if [[ -n "${ONLY_STEP:-}" ]] && [[ "$label" == "$ONLY_STEP"* ]]; then
     bold "Stopping after step: $label"
@@ -289,16 +585,21 @@ spawn_agent() {
   local repo="$2"
   local prompt_file="$3"
   local expect_token="${4:-SMOKE_AGENT_OK}"
+  local max_turns="${5:-0}"
+  local prompt_snapshot="$OUT_DIR/$label.prompt.txt"
 
   if [[ "$NO_AGENTS" -eq 1 ]]; then
     trace_emit "$label" "$repo" 0 "(skipped)" "[]" "" "" ""
+    replay_check_invocation "$label" 0 "" || return 1
     return 0
   fi
 
   if [[ ! -f "$prompt_file" ]]; then
     trace_emit "$label" "$repo" 2 "(missing prompt)" "[]" "" "missing prompt file: $prompt_file" ""
+    replay_check_invocation "$label" 2 "" || return 1
     fail "missing prompt file: $prompt_file"
   fi
+  cp "$prompt_file" "$prompt_snapshot"
 
   # Convention: run_with_timeout writes $OUT_DIR/$label.{stdout,stderr}.
   local stdout_file="$OUT_DIR/$label.stdout"
@@ -307,20 +608,24 @@ spawn_agent() {
 
   case "$PROVIDER" in
     codex)
-      command -v codex >/dev/null 2>&1 || fail "codex not found in PATH"
+      if [[ "$REPLAY" -eq 0 ]]; then
+        command -v codex >/dev/null 2>&1 || fail "codex not found in PATH"
+      fi
       run_with_timeout "$label" "$repo" "$TIMEBOX_S" \
-        --stdin-file "$prompt_file" \
+        --stdin-file "$prompt_snapshot" \
         codex exec --ephemeral --full-auto --json -C "$repo" -
       ec=$?
       ;;
     claude)
-      command -v claude >/dev/null 2>&1 || fail "claude not found in PATH"
+      if [[ "$REPLAY" -eq 0 ]]; then
+        command -v claude >/dev/null 2>&1 || fail "claude not found in PATH"
+      fi
       # `claude -p` doesn't execute tools; this is a transcript-only smoke to validate we can spawn
       # the process and capture output deterministically. We'll iterate later with interactive/tool mode.
       run_with_timeout "$label" "$repo" "$TIMEBOX_S" \
         claude -p --no-session-persistence --output-format=text --input-format=text \
         --system-prompt "You are a software agent participating in an E2E smoke test." \
-        "$(cat "$prompt_file")"
+        "$(cat "$prompt_snapshot")"
       ec=$?
       ;;
     *)
@@ -354,6 +659,37 @@ else:
     if token not in out and token not in err:
         raise SystemExit(f"expected agent output to contain {token!r}")
 PY
+
+  # Guardrail: some scenarios (notably drift) want to ensure the agent doesn't loop forever.
+  # Codex `--json` emits JSONL events including "turn.started"; count and enforce a small cap.
+  if [[ "$PROVIDER" == "codex" ]] && [[ "$max_turns" -gt 0 ]]; then
+    python3 - "$max_turns" "$stdout_file" "$stderr_file" <<'PY'
+import json, sys
+
+max_turns = int(sys.argv[1])
+paths = sys.argv[2:]
+
+turns = 0
+for path in paths:
+    try:
+        with open(path, "r", encoding="utf-8", errors="replace") as f:
+            for line in f:
+                line = line.strip()
+                if not (line.startswith("{") and line.endswith("}")):
+                    continue
+                try:
+                    obj = json.loads(line)
+                except Exception:
+                    continue
+                if obj.get("type") == "turn.started":
+                    turns += 1
+    except FileNotFoundError:
+        continue
+
+if turns > max_turns:
+    raise SystemExit(f"too many codex turns: {turns} (max {max_turns})")
+PY
+  fi
 }
 
 meta_patch_repo() {
@@ -807,7 +1143,7 @@ print(f"@A: ack: drift-ok nonce={nonce} claims: {claims_n}")
 PY
 )"
   else
-    spawn_agent "agent.drift.step1" "$repo" "$PROMPTS_DIR/drift.step1.${PROVIDER}.txt" "E2E_DRIFT_STEP1_OK"
+    spawn_agent "agent.drift.step1" "$repo" "$PROMPTS_DIR/drift.step1.${PROVIDER}.txt" "E2E_DRIFT_STEP1_OK" 6
   fi
 
   run_with_timeout "cli.read.messages.drift" "$repo" "$TIMEBOX_S" \
@@ -995,7 +1331,7 @@ print(
 PY
 )"
   else
-    spawn_agent "agent.drift_v2.step1" "$repo" "$PROMPTS_DIR/drift_v2.step1.${PROVIDER}.txt" "E2E_DRIFT_V2_STEP1_OK"
+    spawn_agent "agent.drift_v2.step1" "$repo" "$PROMPTS_DIR/drift_v2.step1.${PROVIDER}.txt" "E2E_DRIFT_V2_STEP1_OK" 10
     # After the agent runs, capture the after-claim eval (if the agent claimed something as instructed).
     run_with_timeout "cli.eval.B.drift2.after" "$repo" "$TIMEBOX_S" \
       "$repo/but-engineering-rewrite" --agent-id Z eval user-prompt-submit
@@ -1261,8 +1597,12 @@ main() {
   fi
 
   mk_out_dir
+  replay_init
   bold "E2E out dir: $OUT_DIR"
   bold "E2E trace: $TRACE_PATH"
+  if [[ "$REPLAY" -eq 1 ]]; then
+    bold "E2E replay: $REPLAY_DIR"
+  fi
 
   ensure_bin
 
@@ -1292,6 +1632,16 @@ case "$SCENARIO" in
 esac
 local ec=$?
 set -e
+
+if [[ "$REPLAY" -eq 1 ]]; then
+  if [[ "$REPLAY_IDX" -ne "${#REPLAY_LINES[@]}" ]]; then
+    printf "FAIL: replay: expected %s invocations but consumed %s\n" "${#REPLAY_LINES[@]}" "$REPLAY_IDX" >&2
+    REPLAY_FAILED=1
+  fi
+  if [[ "$REPLAY_FAILED" -ne 0 ]]; then
+    ec=1
+  fi
+fi
 
   # Deterministic artifact so CI/local runs can consume results without parsing stdout.
   python3 - "$OUT_DIR/verdict.json" "$SCENARIO" "$PROVIDER" "$TIMEBOX_S" "$ec" "$TRACE_PATH" "$repo" "$KEEP_REPO" <<'PY'

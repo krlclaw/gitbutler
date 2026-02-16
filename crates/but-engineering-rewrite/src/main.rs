@@ -10,7 +10,9 @@
 //! - Repo-scoped SQLite DB at: .git/gitbutler/but-engineering-rewrite.db
 
 use std::collections::HashSet;
-use std::path::PathBuf;
+use std::fs::OpenOptions;
+use std::io::Write;
+use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use rusqlite::{Connection, OptionalExtension, params};
@@ -697,14 +699,18 @@ fn main() {
 fn run() -> Result<(), ()> {
     let (agent_id, cmd) = parse_args(std::env::args_os().skip(1))?;
 
-    let mut db_path = PathBuf::from(".git");
-    db_path.push("gitbutler");
-    std::fs::create_dir_all(&db_path).map_err(|_| ())?;
+    let mut data_dir = PathBuf::from(".git");
+    data_dir.push("gitbutler");
+    std::fs::create_dir_all(&data_dir).map_err(|_| ())?;
+    let mut db_path = data_dir.clone();
     db_path.push("but-engineering-rewrite.db");
+    let mut log_path = data_dir;
+    log_path.push("but-engineering-rewrite.commands.log");
 
     let conn = Connection::open(db_path).map_err(|_| ())?;
     init_db(&conn)?;
     touch_agent(&conn, &agent_id)?;
+    append_command_log(&log_path, &agent_id, cmd_name(&cmd));
 
     match cmd {
         Cmd::Claim { path, ttl } => {
@@ -1242,7 +1248,23 @@ fn run() -> Result<(), ()> {
                 }
             }
 
+            // Convenience for consumers (e.g. scored compare prompts): provide a structured form
+            // of `action_plan` as a list of command objects.
+            let next_steps: Vec<Value> = action_plan
+                .iter()
+                .map(|cmd| json!({ "cmd": cmd }))
+                .collect();
+            let action_plan_hints = json!({
+                "requires_coordination": decision != "allow",
+                "has_read_step": action_plan.iter().any(|cmd| cmd.contains(" read")),
+                "has_post_step": action_plan.iter().any(|cmd| cmd.contains(" post ")),
+                "has_ack_step": action_plan.iter().any(|cmd| cmd.contains(": ack:")),
+                "has_retry_check_step": action_plan.iter().any(|cmd| cmd.contains(" check --path ")),
+                "has_claim_step": action_plan.iter().any(|cmd| cmd.contains(" claim --path ")),
+            });
+
             let out = json!({
+                "path": path,
                 "decision": decision,
                 "reason_code": reason_code,
                 "self_claim": self_claim,
@@ -1251,6 +1273,8 @@ fn run() -> Result<(), ()> {
                 "blocking_claim_paths_by_agent": Value::Object(blocking_claim_paths_by_agent),
                 "blocking_agents_state": blocking_agents_state,
                 "action_plan": action_plan,
+                "next_steps": next_steps,
+                "action_plan_hints": action_plan_hints,
                 "action_plan_by_agent": Value::Object(action_plan_by_agent),
                 "discovery_blockers": discovery_blockers.iter().map(DiscoveryBlocker::as_value).collect::<Vec<_>>(),
                 "dependency_hints": dependency_hints,
@@ -1325,17 +1349,20 @@ fn run() -> Result<(), ()> {
 
                     for r in rows {
                         let (created_at_ms, agent, body_json) = r.map_err(|_| ())?;
-                        let parsed: Value = serde_json::from_str(&body_json).unwrap_or(Value::String(body_json));
+                        let parsed: Value =
+                            serde_json::from_str(&body_json).unwrap_or(Value::String(body_json.clone()));
                         let mut obj = match parsed {
                             Value::Object(m) => Value::Object(m),
                             other => json!({ "raw": other }),
                         };
 
                         // Attach provenance.
+                        let content = extract_message_text(&obj, &body_json);
                         if let Value::Object(m) = &mut obj {
                             m.insert("agent_id".to_owned(), Value::String(agent));
                             m.insert("created_at_ms".to_owned(), Value::from(created_at_ms));
                             m.insert("kind".to_owned(), Value::String("discovery".to_owned()));
+                            m.insert("content".to_owned(), Value::String(content));
                         }
 
                         // Derive a minimal actionable step, if present.
@@ -1377,15 +1404,18 @@ fn run() -> Result<(), ()> {
                     let mut messages: Vec<Value> = Vec::new();
                     for r in rows {
                         let (created_at_ms, agent, body_json) = r.map_err(|_| ())?;
-                        let parsed: Value = serde_json::from_str(&body_json).unwrap_or(Value::String(body_json));
+                        let parsed: Value =
+                            serde_json::from_str(&body_json).unwrap_or(Value::String(body_json.clone()));
                         let mut obj = match parsed {
                             Value::Object(m) => Value::Object(m),
                             other => json!({ "raw": other }),
                         };
+                        let content = extract_message_text(&obj, &body_json);
                         if let Value::Object(m) = &mut obj {
                             m.insert("agent_id".to_owned(), Value::String(agent));
                             m.insert("created_at_ms".to_owned(), Value::from(created_at_ms));
                             m.insert("kind".to_owned(), Value::String(kind.clone()));
+                            m.insert("content".to_owned(), Value::String(content));
                         }
                         messages.push(obj);
                     }
@@ -2098,6 +2128,14 @@ where
             argv.drain(i..=i + 1);
             continue;
         }
+        if let Some(v) = argv[i].strip_prefix("--agent-id=") {
+            if v.is_empty() {
+                return Err(());
+            }
+            agent_id = Some(v.to_owned());
+            argv.drain(i..=i);
+            continue;
+        }
         i += 1;
     }
 
@@ -2357,12 +2395,14 @@ fn load_messages_since(conn: &Connection, kind: Option<&str>, since_ms: i64) -> 
                 .map_err(|_| ())?;
             for r in rows {
                 let (created_at_ms, agent, kind, body_json) = r.map_err(|_| ())?;
-                let body_v: Value = serde_json::from_str(&body_json).unwrap_or(Value::String(body_json));
+                let body_v: Value = serde_json::from_str(&body_json).unwrap_or(Value::String(body_json.clone()));
+                let content = extract_message_text(&body_v, &body_json);
                 messages.push(json!({
                     "created_at_ms": created_at_ms,
                     "agent_id": agent,
                     "kind": kind,
                     "body": body_v,
+                    "content": content,
                 }));
             }
             return Ok(messages);
@@ -2388,15 +2428,47 @@ fn load_messages_since(conn: &Connection, kind: Option<&str>, since_ms: i64) -> 
         .map_err(|_| ())?;
     for r in rows {
         let (created_at_ms, agent, kind, body_json) = r.map_err(|_| ())?;
-        let body_v: Value = serde_json::from_str(&body_json).unwrap_or(Value::String(body_json));
+        let body_v: Value = serde_json::from_str(&body_json).unwrap_or(Value::String(body_json.clone()));
+        let content = extract_message_text(&body_v, &body_json);
         messages.push(json!({
             "created_at_ms": created_at_ms,
             "agent_id": agent,
             "kind": kind,
             "body": body_v,
+            "content": content,
         }));
     }
     Ok(messages)
+}
+
+fn cmd_name(cmd: &Cmd) -> &'static str {
+    match cmd {
+        Cmd::Claim { .. } => "claim",
+        Cmd::Release { .. } => "release",
+        Cmd::Claims { .. } => "claims",
+        Cmd::Check { .. } => "check",
+        Cmd::Post { .. } => "post",
+        Cmd::PostTyped { .. } => "post-typed",
+        Cmd::Read { .. } => "read",
+        Cmd::Brief { .. } => "brief",
+        Cmd::Digest { .. } => "digest",
+        Cmd::Status { .. } => "status",
+        Cmd::Plan { .. } => "plan",
+        Cmd::Agents => "agents",
+        Cmd::Done { .. } => "done",
+        Cmd::EvalUserPromptSubmit => "eval-user-prompt-submit",
+    }
+}
+
+fn append_command_log(path: &Path, agent_id: &str, cmd_name: &str) {
+    if let Ok(mut file) = OpenOptions::new().create(true).append(true).open(path) {
+        let entry = json!({
+            "ts": now_unix_ms().unwrap_or(0),
+            "agent_id": agent_id,
+            "cmd": cmd_name,
+        });
+        let _ = writeln!(file, "{}", entry.to_string());
+    }
 }
 
 fn parse_brief_digest_args(args: &[String]) -> Result<(Option<String>, bool), ()> {

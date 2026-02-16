@@ -39,6 +39,12 @@ tests:
         - release after finishing a file
 
         Finish with a summary.
+
+        Operational constraints:
+        - Assume the required CLIs are installed and working. Do NOT run which/--help/help, strace, netstat, strings, or repo-wide greps.
+        - If a command exits successfully, treat it as successful even if it prints nothing.
+        - Stay scoped: only use the coordination commands + read/check + minimal file edits + release + done.
+
       watch_files: "src/auth.rs,src/db.rs,src/api.rs,src/utils.rs,src/config.rs"
       setup_commands: |
         mkdir -p src

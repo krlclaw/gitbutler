@@ -252,6 +252,54 @@ run_cli() {
   fi
 }
 
+run_cli_raw() {
+  # Like run_cli, but does not automatically inject `--agent-id`.
+  # Used for arg-order robustness cases where `--agent-id` appears after the subcommand.
+  local repo="$1"
+  local agent="$2"
+  shift 2
+
+  local cmd="$BIN"
+  local -a args=("$@")
+  local args_json; args_json="$(json_array "${args[@]}")"
+
+  local stdout_file stderr_file
+  stdout_file="$(mktemp "${TMPDIR:-/tmp}/but-erw-harness.stdout.XXXXXX")"
+  stderr_file="$(mktemp "${TMPDIR:-/tmp}/but-erw-harness.stderr.XXXXXX")"
+
+  local ec=0 stdout="" stderr=""
+  set +e
+  (cd "$repo" && "$cmd" "${args[@]}") >"$stdout_file" 2>"$stderr_file"
+  ec=$?
+  set -e
+
+  stdout="$(cat "$stdout_file" 2>/dev/null || true)"
+  stderr="$(cat "$stderr_file" 2>/dev/null || true)"
+  rm -f "$stdout_file" "$stderr_file" || true
+
+  trace_emit "$repo" "$agent" "$ec" "$cmd" "$args_json" "$stdout" "$stderr"
+
+  if [[ "$REPLAY" -eq 1 ]]; then
+    local expected="${REPLAY_LINES[$REPLAY_IDX]:-}"
+    if [[ -z "$expected" ]]; then
+      printf "FAIL: replay: missing expected trace line for invocation %s\n" "$TRACE_SEQ" >&2
+      REPLAY_FAILED=1
+    else
+      if ! replay_compare "$expected" "$ec" "$stdout"; then
+        printf "FAIL: replay mismatch at invocation %s (case=%s trial=%s agent=%s)\n" "$TRACE_SEQ" "${CURRENT_CASE:-}" "${CURRENT_TRIAL:-0}" "$agent" >&2
+        REPLAY_FAILED=1
+      fi
+    fi
+    REPLAY_IDX=$((REPLAY_IDX + 1))
+  fi
+
+  if [[ -n "$stderr" ]]; then
+    printf "%s\n%s" "$stdout" "$stderr"
+  else
+    printf "%s" "$stdout"
+  fi
+}
+
 expect_contains() {
   local hay="$1"
   local needle="$2"
@@ -323,6 +371,42 @@ case_02_lease_expiry() {
   expect_contains "$out_b_check" "\"decision\""
   expect_contains "$out_b_check" "\"allow\""
   expect_contains "$out_b_check" "no_conflict"
+}
+
+case_74_agent_id_anywhere_arg_order() {
+  bold "Case 74: Agent Id Anywhere (Arg Order)"
+  local repo; repo="$(mk_repo)"
+  trap '[[ -n "${repo:-}" ]] && rm -rf "$repo"' RETURN
+
+  run_cli "$repo" "A" claim --path src/app.txt --ttl 15m >/dev/null
+
+  local out_b_end out_b_eq
+  out_b_end="$(run_cli_raw "$repo" "B" check --path src/app.txt --agent-id B)"
+  out_b_eq="$(run_cli_raw "$repo" "B" check --path src/app.txt --agent-id=B)"
+
+  expect_contains "$out_b_end" "\"decision\""
+  expect_contains "$out_b_end" "claimed_by_other"
+  expect_contains "$out_b_eq" "\"decision\""
+  expect_contains "$out_b_eq" "claimed_by_other"
+}
+
+case_75_agent_id_anywhere_more_subcommands() {
+  bold "Case 75: Agent Id Anywhere (Read/Claims/Agents)"
+  local repo; repo="$(mk_repo)"
+  trap '[[ -n "${repo:-}" ]] && rm -rf "$repo"' RETURN
+
+  run_cli "$repo" "A" post "ERW_CASE75: hello from A" >/dev/null
+
+  local out_read out_claims out_agents
+  out_read="$(run_cli_raw "$repo" "B" read --agent-id B)"
+  out_claims="$(run_cli_raw "$repo" "B" claims --agent-id=B)"
+  out_agents="$(run_cli_raw "$repo" "B" agents --agent-id B)"
+
+  expect_contains "$out_read" "\"messages\""
+  expect_contains "$out_claims" "\"ok\":true"
+  expect_contains "$out_claims" "\"claims\""
+  expect_contains "$out_agents" "\"ok\":true"
+  expect_contains "$out_agents" "\"agents\""
 }
 
 case_18_expired_claims_filtered_from_listing() {
@@ -2545,6 +2629,8 @@ main() {
     case_01_two_agent_conflict
     case_01b_two_agent_conflict_strict
     case_02_lease_expiry
+    case_74_agent_id_anywhere_arg_order
+    case_75_agent_id_anywhere_more_subcommands
     case_18_expired_claims_filtered_from_listing
     case_03_habit_formation
     case_04_high_signal_discovery

@@ -57,3 +57,4 @@ jobs:
           name: erw-harness-out
           path: crates/but-engineering-rewrite/harness/out
           retention-days: 7
+          if-no-files-found: error

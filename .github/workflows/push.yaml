@@ -20,6 +20,7 @@ jobs:
       rust: ${{ steps.filter.outputs.rust }}
       ui: ${{ steps.filter.outputs.ui }}
       docs: ${{ steps.filter.outputs.docs }}
+      erw: ${{ steps.filter.outputs.erw }}
       but_installer: ${{ steps.filter.outputs.but_installer }}
     steps:
       - uses: actions/checkout@v6
@@ -49,6 +50,8 @@ jobs:
             rust: &any-rust
               - *rust
               - 'crates/**'
+            erw:
+              - 'crates/but-engineering-rewrite/**'
             but_installer:
               - 'Cargo.lock'
               - 'Cargo.toml'
@@ -246,6 +249,69 @@ jobs:
           done
         name: Test Tauri and Check Tauri App Features
 
+  erw-e2e:
+    needs: changes
+    if: ${{ needs.changes.outputs.erw == 'true' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    container:
+      image: ghcr.io/gitbutlerapp/ci-base-image:latest
+    strategy:
+      fail-fast: false
+      matrix:
+        scenario: [smoke, collision, discovery, triangle, drift, drift_v2]
+    env:
+      CARGO_TERM_COLOR: always
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+      - name: Rust Cache
+        uses: Swatinem/rust-cache@v2.8.2
+        with:
+          shared-key: erw-e2e
+          save-if: ${{ github.ref == 'refs/heads/master' }}
+      - name: Run ERW E2E (no agents)
+        run: ./crates/but-engineering-rewrite/e2e/run.sh --no-agents --scenario "${{ matrix.scenario }}" --timebox-s 120 --out-dir "${{ runner.temp }}/erw-e2e-${{ matrix.scenario }}"
+      - name: Upload ERW E2E output
+        if: always()
+        uses: actions/upload-artifact@v6
+        with:
+          name: erw-e2e-out-${{ matrix.scenario }}
+          path: ${{ runner.temp }}/erw-e2e-${{ matrix.scenario }}
+          retention-days: 7
+          if-no-files-found: error
+
+  erw-harness:
+    needs: changes
+    if: ${{ needs.changes.outputs.erw == 'true' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    container:
+      image: ghcr.io/gitbutlerapp/ci-base-image:latest
+    env:
+      CARGO_TERM_COLOR: always
+      HARNESS_TRIALS: '1'
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+      - name: Rust Cache
+        uses: Swatinem/rust-cache@v2.8.2
+        with:
+          shared-key: erw-harness
+          save-if: ${{ github.ref == 'refs/heads/master' }}
+      - name: Run ERW harness
+        run: ./crates/but-engineering-rewrite/harness/run.sh
+      - name: Upload ERW harness output
+        if: always()
+        uses: actions/upload-artifact@v6
+        with:
+          name: erw-harness-out
+          path: crates/but-engineering-rewrite/harness/out
+          retention-days: 7
+          if-no-files-found: error
+
   check-rust-windows:
     needs: changes
     runs-on: windows-latest
@@ -364,6 +430,8 @@ jobs:
       - rust-test
       - rust-test-tauri
       - rust-lint
+      - erw-e2e
+      - erw-harness
       - cargo-doc
       - build-installer-macos
     runs-on: ubuntu-latest

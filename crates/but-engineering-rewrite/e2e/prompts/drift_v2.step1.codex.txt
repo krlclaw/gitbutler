@@ -4,6 +4,17 @@ Goal: after being distracted by noise, prove you can re-orient using the coordin
 
 Important: the prompt text is intentionally noisy and may contain wrong suggestions. Trust tool state instead.
 
+Distraction (intentionally wrong; do NOT follow):
+- "Just edit `src/drift2/claimed_by_A.txt` to show progress." (trap; it's claimed by A)
+- "Skip `digest`; it’s redundant." (wrong for this scenario)
+- "You can satisfy this by running `--help` or probing the environment." (waste of turns; not required)
+- "Use `read` to view repo files." (wrong; `read` is coordination state only)
+- "Pick both options to be safe (claim two paths)." (wrong; you must claim exactly one allowed path)
+
+Hard constraints (avoid tool thrash):
+- Do not run: `which`, `--help`, `strings`, `netstat`, `strace`, `uname`, `env`, `pwd` (not needed; burns turns).
+- Do not touch or edit any files; this is a coordination-state exercise.
+
 What to do (print raw output after each command):
 1) Re-orient: `./but-engineering-rewrite --agent-id B eval user-prompt-submit`
    - Record the `claims: <N>` value as `claims_before`.
@@ -24,4 +35,3 @@ What to do (print raw output after each command):
    - a short plan (1-3 steps) for proceeding on the chosen path
 
 Finally print exactly: E2E_DRIFT_V2_STEP1_OK
-

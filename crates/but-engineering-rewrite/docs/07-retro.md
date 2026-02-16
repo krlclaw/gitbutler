@@ -1,6 +1,108 @@
 # Retro Notes
 
+## 2026-02-16
+
+- E2E replay execution slice: in replay mode, `agent.*` steps are now short-circuited from saved `trace.jsonl` rows (reuse saved `stdout`/`stderr`/`exit_code`) instead of spawning live provider processes: `crates/but-engineering-rewrite/e2e/run.sh`.
+- Replay-mode provider checks are now conditional, so `spawn_agent` does not require `codex`/`claude` binaries when replaying recorded agent steps: `crates/but-engineering-rewrite/e2e/run.sh`.
+- Why: this closes a concrete gap in the top backlog item by making provider-run traces inspectable/replayable without re-running live agents.
+- What failed + fix: replay against older traces initially failed on `stdin_file` basename mismatch (`smoke.codex.txt` vs `agent.smoke.prompt.txt`); replay compare now allows this legacy-vs-snapshot basename pattern for `agent.*` labels while still enforcing `stdin_sha256` when present: `crates/but-engineering-rewrite/e2e/run.sh`.
+- Verified: targeted replay passes for both newer snapshot-style traces and older prompt-basename traces, and required fast harness gate remains green via `./crates/but-engineering-rewrite/harness/run.sh`.
+
+- E2E replay inspectability slice: `trace.jsonl` rows now include `agent_event_summary` for `agent.*` steps (`types`, `turn_started`, `turn_completed`, `response_completed`, `jsonl_objects`) extracted from provider stdout JSONL: `crates/but-engineering-rewrite/e2e/run.sh`.
+- Why: provider-mode traces were replayable but still tedious to inspect quickly; this adds stable, compact transcript shape metadata without requiring full transcript diffing.
+- Scope/parity: runner-only change; no Rust CLI or harness-stub coordination behavior changed (`crates/but-engineering-rewrite/src/main.rs` and `crates/but-engineering-rewrite/harness/bin/but-engineering-rewrite` untouched).
+- Verified gate: fast deterministic harness remains green after the edit via `./crates/but-engineering-rewrite/harness/run.sh`.
+- What failed/limits: replay matching semantics are unchanged in this slice (metadata is additive for debugging/auditability, not a stricter pass/fail gate yet).
+
+- E2E replay hardening (prompt integrity): trace rows now include `stdin_sha256` (computed from `stdin_file`) so replay can verify agent prompt snapshot content, not just filename shape: `crates/but-engineering-rewrite/e2e/run.sh`.
+- Replay compare now enforces `stdin_sha256` when it exists in the saved trace; older traces without this field still replay with basename-only checks for compatibility.
+- Why: basename checks alone can miss prompt-content drift; hashing keeps provider-run traces more inspectable/replayable without requiring byte-for-byte transcript determinism.
+- Scope/parity: runner-only change; no Rust CLI or harness stub coordination behavior changed (`crates/but-engineering-rewrite/src/main.rs` and `crates/but-engineering-rewrite/harness/bin/but-engineering-rewrite` untouched).
+- What failed/limits: this still validates only prompt/input integrity and stable transcript markers, not full offline re-execution of live-agent side effects.
+
+- E2E replay hardening (agent-mode provenance): replay now checks `stdin_file` for expected prompt-fed steps, requiring non-empty input and matching basename (for example `agent.step1.B.prompt.txt`) when the saved trace had one: `crates/but-engineering-rewrite/e2e/run.sh`.
+- Why: replay already validated labels/exit-codes and some stdout shape, but prompt provenance could silently drift; this keeps replay inspectable for provider runs without overfitting absolute out-dir paths.
+- Scope/parity: runner-only change; no Rust CLI coordination logic or harness stub behavior changed (`crates/but-engineering-rewrite/src/main.rs` and `crates/but-engineering-rewrite/harness/bin/but-engineering-rewrite` untouched).
+- Verified gate: fast deterministic harness re-run remains required in this loop via `./crates/but-engineering-rewrite/harness/run.sh`.
+- What failed/limits: this still does not replay live-agent side effects offline; it tightens trace comparison only when provider steps are executed.
+
+- E2E replay semantics hardening: `replay_compare` now adds an agent-mode hook for `agent.*` labels that inspects Codex-style JSONL output and requires stable event markers (`turn.started`, `turn.completed`, `response.completed`) present in the saved trace to also appear in the new run: `crates/but-engineering-rewrite/e2e/run.sh`.
+- Why: previous replay checks for provider runs were mostly label + exit-code (and JSON object key checks when applicable), which was too weak for agent transcript regressions; this improves signal while staying tolerant to non-deterministic payload content.
+- Scope/behavior: no Rust CLI or harness-stub coordination logic changed; this is runner-only and keeps parity untouched for `src/main.rs` vs `harness/bin/but-engineering-rewrite`.
+- Verified gate: fast deterministic harness remains the hard checkpoint in this loop via `./crates/but-engineering-rewrite/harness/run.sh`.
+- What failed/limits: replay still does not rehydrate agent side effects without live agent execution; this slice only strengthens transcript-shape matching for runs that do execute provider steps.
+
+- E2E replayability slice: agent prompts are now snapshotted into each run artifact directory (`$OUT_DIR/<label>.prompt.txt`) before provider execution, so traces can be inspected against the exact prompt text used at run time: `crates/but-engineering-rewrite/e2e/run.sh`.
+- E2E runner now feeds Codex from the snapshot file (via `--stdin-file`) and feeds Claude from that same snapshot content, keeping provider behavior unchanged while making artifacts self-contained for agent-mode debugging/replay.
+- Why: this is a minimal top-backlog increment toward replayable E2E traces for provider runs without changing coordination semantics or touching Rust/stub command behavior.
+- Verified locally with the fast deterministic harness gate: `./crates/but-engineering-rewrite/harness/run.sh` (green in this iteration).
+- What failed/limits: this slice does not strengthen replay matching semantics yet (it improves trace inspectability/provenance only).
+
+- E2E runner: added replayable trace mode via `E2E_REPLAY_DIR=...` so new runs can be compared against a saved `trace.jsonl` without re-running live-agent behavior blindly: `crates/but-engineering-rewrite/e2e/run.sh`.
+- Replay checks are intentionally lightweight for stability: per-invocation label + exit code must match, and when expected `stdout` is JSON object, new `stdout` must remain JSON with the same top-level keys.
+- Added `invocation_id` to E2E trace rows and replay metadata (`replay`, `replay_dir`) in `meta.json` to make replay diagnostics inspectable in artifacts.
+- Why: this is a small first slice of the current top backlog item (“replayable E2E traces for agent-mode runs”) while keeping deterministic harness CI as the hard gate.
+- What failed: first replay attempt used `mapfile` (not available in this shell’s bash) and an invalid dual-stdin redirection pattern in Python; fixed with portable `while read` loading + argv-based compare input, then validated with `--no-agents` smoke replay.
+
+- CI (ERW harness in main push workflow): made artifact upload strict with `if-no-files-found: error` so missing harness outputs fail loudly instead of passing with an empty upload: `.github/workflows/push.yaml`.
+- Why: this is a small follow-up on the top backlog CI-integration priority; deterministic ERW coverage should fail fast on missing artifacts in both standalone and main workflows.
+- Rust/stub parity: no coordination behavior change in this slice; `src/main.rs` and `harness/bin/but-engineering-rewrite` were not edited.
+- Verified locally: fast harness re-run stayed green after the workflow-only tweak: `./crates/but-engineering-rewrite/harness/run.sh`.
+- What failed: GitHub Actions cannot be executed from this environment, so validation remains local harness + workflow diff inspection.
+
+- Checkpoint: re-ran the fast harness and kept it green in this iteration (`Trial 1/1: PASS`), satisfying the top backlog priority to keep the loop healthy before taking larger slices: `./crates/but-engineering-rewrite/harness/run.sh`.
+- Why: this workspace already had substantial in-flight changes across ERW/compare/CI files, so this slice intentionally avoided broad edits and focused on a safe checkpoint-first pass.
+- Rust/stub parity: no behavior changes in this iteration; parity is preserved by leaving `src/main.rs` and `harness/bin/but-engineering-rewrite` untouched.
+- What failed: did not attempt GitHub Actions or slow real-agent E2E runs from this environment; verification remains local harness execution only.
+
+- CI (ERW harness): made harness artifact upload strict in the standalone deterministic workflow by adding `if-no-files-found: error`: `.github/workflows/test-but-engineering-rewrite-harness.yml`.
+- Why: this is a small CI-integration hardening slice from the backlog so missing harness outputs fail loudly instead of producing a misleading green artifact step.
+- Rust/stub parity: no CLI behavior changes in this iteration; Rust and harness stub remain unchanged.
+- Verified locally: fast harness stayed green after workflow-only edits: `./crates/but-engineering-rewrite/harness/run.sh`.
+- What failed: GitHub Actions cannot be executed from this environment, so validation here is local harness pass + workflow diff inspection only.
+
+- CI (ERW E2E): switched deterministic matrix runs to write artifacts to a scenario-scoped `--out-dir` under `${{ runner.temp }}` instead of the shared repo `e2e/out`, reducing cross-run artifact bleed and making each job’s output deterministic: `.github/workflows/push.yaml`, `.github/workflows/test-but-engineering-rewrite-e2e.yml`.
+- CI (ERW E2E): made artifact upload strict with `if-no-files-found: error` so silent missing-output regressions fail fast instead of producing a green job with empty artifacts: `.github/workflows/push.yaml`, `.github/workflows/test-but-engineering-rewrite-e2e.yml`.
+- Why: backlog priority is CI integration for regularly-run deterministic E2E; tightening artifact isolation and upload checks improves signal quality without touching coordination semantics.
+- Verified locally: fast harness stayed green after workflow-only changes (no Rust/stub behavior changes): `./crates/but-engineering-rewrite/harness/run.sh`.
+- What failed: GitHub Actions jobs cannot be executed end-to-end in this environment, so CI validation here is limited to workflow inspection plus local harness pass.
+
+- CI: added `erw-harness` to the main `push.yaml` workflow, gated on ERW path changes, so deterministic harness coverage runs in the same pipeline as ERW E2E: `.github/workflows/push.yaml`.
+- CI: wired `erw-harness` into `check-rust` (`alls-green`) so ERW harness regressions can’t be silently bypassed when ERW files are touched: `.github/workflows/push.yaml`.
+- Why: backlog priority is regular CI integration for the deterministic ERW suite; this keeps E2E matrix and fast harness both on the primary PR/push path.
+- Verified locally: fast harness stayed green after the workflow-only change (no Rust/stub behavior changes): `./crates/but-engineering-rewrite/harness/run.sh`.
+- What failed: GitHub Actions execution can’t be run end-to-end in this local environment, so CI validation here is limited to YAML inspection + local harness pass.
+
+- Check JSON: added `path` (normalized) plus a structured `next_steps` list (objects with `{cmd}`) to make scored consumers less string-parsey; kept Rust + harness stub in parity: `crates/but-engineering-rewrite/src/main.rs`, `crates/but-engineering-rewrite/harness/bin/but-engineering-rewrite`.
+- Why: downstream tooling/prompt code can treat `check.next_steps[*].cmd` as the canonical executable plan while preserving backwards compatibility with `action_plan`.
+- Verified locally: fast harness stayed green after the additive JSON change: `./crates/but-engineering-rewrite/harness/run.sh`.
+- What failed: nothing new; this iteration is output-shape only (additive fields) and kept existing keys stable.
+
+- Drift E2E: added a hard turn-count cap for Codex JSONL runs (counts `turn.started`) and enforce it for drift (<=6) and drift_v2 (<=10) to reduce infinite-loop risk: `crates/but-engineering-rewrite/e2e/run.sh`.
+- Drift E2E: strengthened the drift step1 Codex prompt with additional irrelevant distraction content (more "long-lived session" noise): `crates/but-engineering-rewrite/e2e/prompts/drift.step1.codex.txt`.
+- Why: the drift scenarios are meant to be anti-gaming and non-looping; a simple deterministic cap makes failures fast and debuggable instead of timebox-hanging.
+- Verified locally: fast harness stayed green (no Rust/stub behavior changes): `./crates/but-engineering-rewrite/harness/run.sh`.
+- What failed: did not run the slow agent-spawned drift/drift_v2 E2E in this iteration; relied on harness + runner change review.
+
+- Compare: added scored fast repeat runners for rewrite + legacy plus a tiny metrics helper (mean/stddev/min/max) so we can track variance across runs: `crates/but-engineering-compare/eval/package.json`, `crates/but-engineering-compare/eval/scripts/scored-repeat-metrics.mjs`.
+- Why: repeatability and variance matter more than single-run point estimates for the scored benchmark; this makes it cheap to run `--repeat` and see whether a change is actually stable.
+- Verified locally: fast harness stayed green (no Rust/stub behavior changes): `./crates/but-engineering-rewrite/harness/run.sh`.
+- What failed: did not execute the promptfoo scored repeat in this iteration (CI and local iteration stay harness-first); only added the runner plumbing.
+- Compare: tightened `Skill(but-engineering-rewrite)` used by the scored rewrite prompt to explicitly forbid environment-probing commands (e.g. `which`, `--help`) and to clarify that `read` is coordination-state only (use `sed`/`cat` for file contents): `crates/but-engineering-compare/eval/skills/but-engineering-rewrite.SKILL.md`.
+- Why: scored runs were wasting turns on tool thrash and on invalid “read the file via coordination CLI” attempts; the skill now pushes a deterministic per-file loop (check -> claim -> edit -> release).
+- Verified locally: fast harness remained green after the skill-only change (no Rust/stub behavior changes): `./crates/but-engineering-rewrite/harness/run.sh`.
+- What failed: did not re-run the scored compare suite in this iteration; this is a prompt/skill-only tweak validated via harness.
+
 ## 2026-02-15
+
+- Drift E2E: strengthened the `drift` step1 Codex prompt with extra intentionally-wrong distractions plus an explicit <=6-command budget to reduce “prompt-following” and nudge agents away from infinite loops: `crates/but-engineering-rewrite/e2e/prompts/drift.step1.codex.txt`.
+- Verified locally: fast harness stayed green after the prompt-only change (no Rust/stub behavior changes): `./crates/but-engineering-rewrite/harness/run.sh`.
+- What failed: did not run the slow E2E agent-spawned drift scenario in this iteration; relied on harness + prompt review.
+
+- CI: integrated deterministic ERW E2E into the main `push.yaml` workflow (matrix over `smoke..drift_v2`), gated on ERW file changes so it runs regularly without slowing unrelated PRs: `.github/workflows/push.yaml`.
+- CI: wired the new ERW E2E job into the `check-rust` alls-green aggregator so it can’t be silently ignored when ERW changes are present: `.github/workflows/push.yaml`.
+- Verified locally: fast harness stayed green after the workflow-only change (no Rust/stub behavior changes): `./crates/but-engineering-rewrite/harness/run.sh`.
+- What failed: local validation of GitHub Actions YAML structure is limited here (no `yq` available), so verification relies on harness + inspection.
 
 - CI: extended the deterministic ERW E2E matrix to include `drift_v2` (the current stronger drift scenario) so CI covers it by default: `.github/workflows/test-but-engineering-rewrite-e2e.yml`.
 - Verified locally: fast harness stayed green after the workflow-only change (no Rust/stub behavior changes): `./crates/but-engineering-rewrite/harness/run.sh`.
@@ -451,3 +553,39 @@
 - This is a high-value “paper cut” scenario: agents frequently copy relative paths with `./`, and missed conflicts here are both silent and costly.
 - Harness stayed green without implementation changes, which indicates the existing claim/check path handling already normalizes this prefix.
 - Next: consider expanding normalization coverage in harness (e.g. `src//app.txt`, `src/./app.txt`, and `src/../src/app.txt`) and decide what should be supported vs rejected.
+
+## 2026-02-16 (Backlog: `--agent-id` Arg Order)
+
+- Made the Rust CLI accept `--agent-id=<id>` in addition to `--agent-id <id>`, and strip it regardless of where it appears in argv: `crates/but-engineering-rewrite/src/main.rs`.
+- Updated the harness stub to accept `--agent-id` anywhere (including `--agent-id=...`) and keep behavior aligned with Rust for observer commands (`agents`/`claims`): `crates/but-engineering-rewrite/harness/bin/but-engineering-rewrite`.
+- Added harness Case 74 to lock in the behavior for `check --path ... --agent-id B` and `--agent-id=B`: `crates/but-engineering-rewrite/harness/run.sh`.
+- Fixed a few bash `set -u` footguns around empty arrays while shifting argv in the stub (so `claims` with no extra args doesn't crash).
+- Strengthened the harness contract with Case 75 so `read`, `claims`, and `agents` also accept `--agent-id` placed after the subcommand (including `--agent-id=...`): `crates/but-engineering-rewrite/harness/run.sh`.
+- No Rust/stub code changes were needed for Case 75; the harness stayed green, confirming behavior was already consistent (and now has tighter coverage).
+
+## 2026-02-16 (Scored Eval: Reduce Redundant `read`)
+
+- Tried removing `check.action_plan`'s leading `read` to reduce scored-run overhead, but harness Case 41 requires it for conflict repair guidance; reverted to keep harness behavior stable.
+- Updated the scored rewrite compare prompt to run `read` once up front and to skip redundant reads unless `action_plan` explicitly calls for it: `crates/but-engineering-compare/eval/promptfooconfig.compare-rewrite.fast.yaml`, `crates/but-engineering-compare/eval/promptfooconfig.compare-rewrite.yaml`.
+- Why: the prompt previously asked for `read` before every `check`, and `check` also suggests `read` on conflicts, causing duplicated coordination commands and worse overhead ratio.
+
+## 2026-02-16 (E2E: Strengthen Drift Prompt Noise)
+
+- Strengthened the Drift v1 agent prompt with extra “wrong suggestions” (e.g. `which`, `--help`, “run `read` first”) to better simulate longer-lived distraction without changing the required command sequence: `crates/but-engineering-rewrite/e2e/prompts/drift.step1.codex.txt`.
+- Strengthened the Drift v2 agent prompt with more explicit trap instructions (don’t claim the claimed path, don’t skip `digest`, don’t use `read` for file contents) and added a small “avoid tool thrash” guardrail list: `crates/but-engineering-rewrite/e2e/prompts/drift_v2.step1.codex.txt`.
+- Why: keep drift scenarios meaningful as the agents get better; more realistic noise should reduce “prompt gaming” and push the model to rely on tool state.
+
+## 2026-02-16 (Scored Check Output: Action Plan Hints)
+
+- Added `action_plan_hints` to `check` JSON in the Rust CLI so scored runners can detect required coordination steps (`read/post/ack/retry-check/claim`) via booleans instead of brittle command-string parsing: `crates/but-engineering-rewrite/src/main.rs`.
+- Kept Rust and harness stub in parity by adding the same `action_plan_hints` shape/derivation in the stub `check` output: `crates/but-engineering-rewrite/harness/bin/but-engineering-rewrite`.
+- Why: this is a small slice of backlog item 3 (“make check output more actionable for scoring”) without changing existing `action_plan` behavior or breaking harness expectations.
+- What failed: no scored compare run in this iteration; validation was limited to the fast harness gate.
+
+## 2026-02-16 (Checkpoint: Backlog Re-baseline)
+
+- Ran `./crates/but-engineering-rewrite/harness/run.sh` as the iteration gate; it exited 0 (green), so this checkpoint stays within the "keep harness green" top priority.
+- Re-audited CI coverage and confirmed deterministic harness/E2E workflows already exist and are wired in GitHub Actions: `.github/workflows/test-but-engineering-rewrite-harness.yml`, `.github/workflows/test-but-engineering-rewrite-e2e.yml`.
+- Updated the living backlog to mark deterministic CI integration as done and move the next immediate slice to replayable agent-mode traces: `crates/but-engineering-rewrite/docs/08-backlog.md`.
+- Why: the backlog should reflect current reality so the next coding slice targets unmet work instead of re-implementing landed items.
+- What failed: this checkpoint did not add product/harness behavior; it was a green-run + backlog alignment pass.
