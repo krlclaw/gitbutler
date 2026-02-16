@@ -46,9 +46,49 @@ function commands(o: ProviderOutput): string[] {
   return out;
 }
 
+function extractMessageFromCommand(command: string): string | null {
+  const lower = command.toLowerCase();
+  if (!(lower.includes("but-engineering") && (lower.includes(" post ") || lower.includes(" done ")))) {
+    return null;
+  }
+
+  // Extract from double-quoted strings
+  const doubleMatches = [...command.matchAll(/"([^"\\]*(?:\\.[^"\\]*)*)"/g)].map((m) => m[1]);
+  for (let i = doubleMatches.length - 1; i >= 0; i -= 1) {
+    const text = doubleMatches[i].trim();
+    if (!text) continue;
+    if (text.toLowerCase().includes("but-engineering")) continue;
+    return text;
+  }
+
+  // Extract from single-quoted strings
+  const singleMatches = [...command.matchAll(/'([^'\\]*(?:\\.[^'\\]*)*)'/g)].map((m) => m[1]);
+  for (let i = singleMatches.length - 1; i >= 0; i -= 1) {
+    const text = singleMatches[i].trim();
+    if (!text) continue;
+    if (text.toLowerCase().includes("but-engineering")) continue;
+    return text;
+  }
+
+  return null;
+}
+
 function messages(o: ProviderOutput): string[] {
-  const msgs = o.coordinationState?.messages ?? [];
-  return msgs.map((m) => asStr(m?.content)).filter((s) => s.trim().length > 0);
+  const msgs = (o.coordinationState?.messages ?? [])
+    .map((m) => asStr(m?.content))
+    .filter((s) => s.trim().length > 0);
+
+  if (msgs.length > 0) return msgs;
+
+  // Provider may omit coordinationState.messages; recover from executed post/done commands.
+  for (const c of o.commands ?? []) {
+    const cmd = asStr(c?.command);
+    if (!cmd || c?.failed === true) continue;
+    const extracted = extractMessageFromCommand(cmd);
+    if (extracted) msgs.push(extracted);
+  }
+
+  return msgs;
 }
 
 function changedFiles(o: ProviderOutput): Set<string> {
