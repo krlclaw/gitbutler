@@ -11,6 +11,7 @@ AUTH_MODE="${BUT_EVAL_AUTH_MODE:-auto}"
 API_KEY="${BUT_EVAL_ANTHROPIC_API_KEY:-${ANTHROPIC_API_KEY:-}}"
 MIN_CLAUDE_VERSION="${BUT_EVAL_MIN_CLAUDE_VERSION:-${BUT_EVAL_MIN_RUNNER_VERSION:-1.0.88}}"
 MAX_TURNS="${BUT_EVAL_MAX_TURNS:-16}"
+RUNNER_TIMEOUT_MS="${BUT_EVAL_RUNNER_TIMEOUT_MS:-0}"
 
 extract_semver() {
   local raw="$1"
@@ -73,7 +74,7 @@ for candidate in "${claude_candidates[@]}"; do
     continue
   fi
 
-  version_raw="$("$candidate" --version 2>&1 || true)"
+  version_raw="$($candidate --version 2>&1 || true)"
   version="$(extract_semver "$version_raw")"
   if [[ -z "$version" ]]; then
     CANDIDATE_SUMMARY+="$candidate: unparseable version ($version_raw)\n"
@@ -99,7 +100,6 @@ CLAUDE_BIN="$SELECTED_CLAUDE_BIN"
 
 case "$AUTH_MODE" in
   local)
-    # Force Claude Code account auth.
     unset ANTHROPIC_API_KEY
     ;;
   api)
@@ -143,4 +143,31 @@ if [[ -n "$APPEND_SYSTEM_PROMPT" ]]; then
   args+=(--append-system-prompt "$APPEND_SYSTEM_PROMPT")
 fi
 
-"$CLAUDE_BIN" "${args[@]}"
+if [[ "$RUNNER_TIMEOUT_MS" =~ ^[0-9]+$ ]] && [[ "$RUNNER_TIMEOUT_MS" -gt 0 ]]; then
+  python3 - "$RUNNER_TIMEOUT_MS" "$CLAUDE_BIN" "${args[@]}" <<'PYRUN'
+import os
+import signal
+import subprocess
+import sys
+
+if len(sys.argv) < 3:
+    print('runner wrapper requires timeout and command', file=sys.stderr)
+    sys.exit(2)
+
+timeout_ms = int(sys.argv[1])
+cmd = sys.argv[2:]
+proc = subprocess.Popen(cmd, preexec_fn=os.setsid)
+
+try:
+    sys.exit(proc.wait(timeout=timeout_ms / 1000.0))
+except subprocess.TimeoutExpired:
+    try:
+        os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+    except ProcessLookupError:
+        pass
+    print(f"Claude runner timed out after {timeout_ms}ms", file=sys.stderr)
+    sys.exit(124)
+PYRUN
+else
+  "$CLAUDE_BIN" "${args[@]}"
+fi

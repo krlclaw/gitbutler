@@ -941,6 +941,7 @@ export default class EngineeringIntegrationProvider {
                   ? minRunnerVersion
                   : process.env.BUT_EVAL_MIN_CODEX_VERSION ?? this.config.min_codex_version ?? DEFAULT_MIN_CODEX_VERSION,
               BUT_EVAL_MAX_TURNS: String(runnerMaxTurns),
+              BUT_EVAL_RUNNER_TIMEOUT_MS: String(runnerTimeoutMs),
               BUT_ENGINEERING_AGENT_ID: EVAL_AGENT_ID,
             },
           });

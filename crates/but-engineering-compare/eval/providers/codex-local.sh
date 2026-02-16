@@ -6,6 +6,7 @@ PROMPT="${BUT_EVAL_PROMPT:-}"
 MODEL="${BUT_EVAL_MODEL:-}"
 APPEND_SYSTEM_PROMPT="${BUT_EVAL_APPEND_SYSTEM_PROMPT:-}"
 MIN_CODEX_VERSION="${BUT_EVAL_MIN_CODEX_VERSION:-${BUT_EVAL_MIN_RUNNER_VERSION:-0.99.0}}"
+RUNNER_TIMEOUT_MS="${BUT_EVAL_RUNNER_TIMEOUT_MS:-0}"
 
 extract_semver() {
   local raw="$1"
@@ -50,7 +51,7 @@ if ! command -v "$CODEX_BIN" >/dev/null 2>&1; then
 fi
 
 CODEX_PATH="$(command -v "$CODEX_BIN")"
-CODEX_VERSION_RAW="$("$CODEX_BIN" --version 2>&1 || true)"
+CODEX_VERSION_RAW="$($CODEX_BIN --version 2>&1 || true)"
 CODEX_VERSION="$(extract_semver "$CODEX_VERSION_RAW")"
 if [[ -z "$CODEX_VERSION" ]]; then
   echo "Could not parse Codex CLI version from '$CODEX_VERSION_RAW' ($CODEX_PATH)." >&2
@@ -83,4 +84,31 @@ fi
 
 args+=("$full_prompt")
 
-"$CODEX_BIN" "${args[@]}"
+if [[ "$RUNNER_TIMEOUT_MS" =~ ^[0-9]+$ ]] && [[ "$RUNNER_TIMEOUT_MS" -gt 0 ]]; then
+  python3 - "$RUNNER_TIMEOUT_MS" "$CODEX_BIN" "${args[@]}" <<'PYRUN'
+import os
+import signal
+import subprocess
+import sys
+
+if len(sys.argv) < 3:
+    print('runner wrapper requires timeout and command', file=sys.stderr)
+    sys.exit(2)
+
+timeout_ms = int(sys.argv[1])
+cmd = sys.argv[2:]
+proc = subprocess.Popen(cmd, preexec_fn=os.setsid)
+
+try:
+    sys.exit(proc.wait(timeout=timeout_ms / 1000.0))
+except subprocess.TimeoutExpired:
+    try:
+        os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+    except ProcessLookupError:
+        pass
+    print(f"Codex runner timed out after {timeout_ms}ms", file=sys.stderr)
+    sys.exit(124)
+PYRUN
+else
+  "$CODEX_BIN" "${args[@]}"
+fi
