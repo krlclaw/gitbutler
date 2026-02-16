@@ -772,6 +772,8 @@ function buildPolicyPrompt(): string {
     "If commit/branch output indicates a dependency lock (for example locked to upstream commit), coordinate and align a stacked branch (`but branch new <child> -a <base>`).",
     "Do not stop after only reading files; perform the requested coordination actions.",
     "When prompted to run but-engineering check for a file, do it before editing that file.",
+    "Coordination posts must be concrete: include exact file path, status (blocked/completed), blocker reason, and next step with ETA or unblocking trigger.",
+    "Your final done/summary message must cover each requested file with status and next step.",
     `Use --agent-id ${EVAL_AGENT_ID} for but-engineering commands unless instructed otherwise.`,
   ].join("\n");
 }
