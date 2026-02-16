@@ -908,13 +908,14 @@ export default class EngineeringIntegrationProvider {
         rawAgentOutput = "";
         cliRunError = null;
         let timedOut = false;
+        const runnerExecTimeoutMs = runnerTimeoutMs + 15_000;
 
         try {
           rawAgentOutput = execFileSync("bash", [runnerScript], {
             cwd: fixtureDir,
             encoding: "utf8",
             stdio: ["ignore", "pipe", "pipe"],
-            timeout: runnerTimeoutMs,
+            timeout: runnerExecTimeoutMs,
             killSignal: "SIGKILL",
             maxBuffer: 16 * 1024 * 1024,
             env: {
@@ -960,7 +961,9 @@ export default class EngineeringIntegrationProvider {
         }
 
         events = parseJsonLines(rawAgentOutput);
-        const retryable = timedOut || (events.length === 0 && rawAgentOutput.trim().length === 0);
+        const timeoutFromRunner = rawAgentOutput.includes("runner timed out after");
+        const retryable =
+          timedOut || timeoutFromRunner || (events.length === 0 && rawAgentOutput.trim().length === 0);
         if (!retryable || attempt >= maxAttempts) {
           break;
         }

@@ -1,6 +1,14 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+# Ensure common Homebrew install prefixes are visible when invoked from non-login shells
+# (e.g. promptfoo/npm child processes).
+case ":${PATH}:" in
+  *":/opt/homebrew/bin:"*) ;;
+  *) PATH="/opt/homebrew/bin:/opt/homebrew/sbin:${PATH}" ;;
+esac
+export PATH
+
 CLAUDE_BIN="${BUT_EVAL_CLAUDE_BIN:-${BUT_EVAL_RUNNER_BIN:-claude}}"
 PROMPT="${BUT_EVAL_PROMPT:-}"
 MODEL="${BUT_EVAL_MODEL:-}"
