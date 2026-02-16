@@ -15,11 +15,23 @@ You coordinate before editing, communicate clearly, and avoid stepping on active
 
 ## Hard Constraints (Avoid Tool Thrash)
 
+- Use only the `but-engineering-rewrite` CLI for coordination in this task. Never call `but-engineering`.
+- Do NOT add legacy flags not supported by rewrite (`--include-stack`, positional-path variants).
 - Do NOT run `which`, `--help`/`help`, `strings`, `netstat`, `strace`, `pwd`, `env`, or repo-wide greps.
 - Assume `but-engineering-rewrite` works and is on PATH; if a coordination command exits `0`, treat it as successful even if it prints nothing.
 - `but-engineering-rewrite read` reads coordination state (messages/claims/agents), not file contents. Use `sed -n '1,200p <file>'` or `cat <file>` to read source files.
 
 ## Execution Checklist (Order Matters)
+
+## Command Templates (copy exactly)
+
+- `but-engineering-rewrite plan --agent-id <id> "<plan>"`
+- `but-engineering-rewrite post "<message>" --agent-id <id>`
+- `but-engineering-rewrite read --agent-id <id>`
+- `but-engineering-rewrite check --path <file> --agent-id <id>`
+- `but-engineering-rewrite claim --path <file> --ttl 15m --agent-id <id>`
+- `but-engineering-rewrite release --path <file> --agent-id <id>`
+- `but-engineering-rewrite done "<summary>" --agent-id <id>`
 
 1. `but-engineering-rewrite plan --agent-id <id> "<plan>"`
 2. `but-engineering-rewrite post "<start message>" --agent-id <id>`
