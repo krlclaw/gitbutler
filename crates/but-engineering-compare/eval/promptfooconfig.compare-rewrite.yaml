@@ -43,6 +43,11 @@ tests:
 
         Finish with a summary.
 
+        Coordination message quality requirements:
+        - For each blocked/skipped file, post a coordination message that includes: exact file path, blocker/owner reason, and the concrete next step with ETA or unblocking trigger.
+        - For each completed file, post a short update with exact file path and release status.
+        - In the final done/summary message, list each requested file with status (completed/skipped) and the next step.
+
         Operational constraints:
         - Assume the required CLIs are installed and working. DO NOT run which/--help/help, strace, netstat, strings, or repo-wide greps.
         - If a command exits successfully, treat it as successful even if it prints nothing.
