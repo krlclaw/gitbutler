@@ -6,17 +6,18 @@ prompts:
 providers:
   - id: file://dist/providers/engineering-integration.js
     config:
-      agent: "claude"
-      model: "claude-sonnet-4-5-20250929"
-      runner: "providers/claude-local.sh"
-      runner_bin: "claude"
-      runner_timeout_ms: 300000
+      agent: "codex"
+      model: "gpt-5-codex"
+      runner: "providers/codex-local.sh"
+      runner_bin: "codex"
+      runner_timeout_ms: 240000
       runner_max_turns: 30
+      runner_retries: 0
       keep_fixtures: false
 
 evaluateOptions:
   maxConcurrency: 1
-  timeoutMs: 420000
+  timeoutMs: 300000
 
 tests:
   - description: "SCORED: multi-file mixed ownership"
