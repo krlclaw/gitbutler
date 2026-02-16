@@ -1,0 +1,88 @@
+description: "but-engineering compare (rewrite) - FAST"
+
+prompts:
+  - "{{prompt}}"
+
+providers:
+  - id: file://dist/providers/engineering-integration.js
+    config:
+      agent: "claude"
+      model: "claude-sonnet-4-5-20250929"
+      runner: "providers/claude-local.sh"
+      runner_bin: "claude"
+      runner_timeout_ms: 180000
+      runner_max_turns: 22
+      runner_retries: 0
+      keep_fixtures: false
+
+evaluateOptions:
+  maxConcurrency: 1
+  timeoutMs: 240000
+
+tests:
+  - description: "SCORED: multi-file mixed ownership"
+    vars:
+      prompt: |
+        Use Skill(but-engineering-rewrite).
+
+        Add a lightweight logging comment to error handlers in these files:
+        - src/auth.rs
+        - src/db.rs
+        - src/api.rs
+        - src/utils.rs
+        - src/config.rs
+
+        Start by running `read` once to sync coordination state.
+
+        For each file:
+        - run check --path <file>
+        - if the returned action_plan suggests `read`, run it (otherwise skip redundant reads)
+        - follow action_plan (if blocked/deny, coordinate + skip)
+        - if allowed, add a comment like: // TODO: add logging
+        - release after finishing a file
+
+        Finish with a summary.
+
+        Operational constraints:
+        - Assume the required CLIs are installed and working. Do NOT run which/--help/help, strace, netstat, strings, or repo-wide greps.
+        - If a command exits successfully, treat it as successful even if it prints nothing.
+        - Stay scoped: only use the coordination commands + read/check + minimal file edits + release + done.
+
+      watch_files: "src/auth.rs,src/db.rs,src/api.rs,src/utils.rs,src/config.rs"
+      setup_commands: |
+        mkdir -p src
+        cat <<EOT > src/auth.rs
+        pub fn auth() -> Result<(), AuthError> {
+            Err(AuthError::InvalidToken)
+        }
+        EOT
+        but-engineering-rewrite --agent-id peer-a claim --path src/auth.rs --ttl 10m >/dev/null
+        but-engineering-rewrite --agent-id peer-a post "Refactoring auth.rs error types" >/dev/null
+
+        cat <<EOT > src/db.rs
+        pub fn query() -> Result<(), DbError> {
+            Err(DbError::ConnectionFailed)
+        }
+        EOT
+
+        cat <<EOT > src/api.rs
+        pub fn handle_request() -> Result<(), ApiError> {
+            Err(ApiError::NotFound)
+        }
+        EOT
+        but-engineering-rewrite --agent-id peer-c post "Discovery: please avoid src/api.rs for now, refactoring error types" >/dev/null
+
+        cat <<EOT > src/utils.rs
+        pub fn format_error(e: &str) -> String {
+            format!("Error: {}", e)
+        }
+        EOT
+
+        cat <<EOT > src/config.rs
+        pub fn load_config() -> Result<(), ConfigError> {
+            Err(ConfigError::FileNotFound)
+        }
+        EOT
+    assert:
+      - type: javascript
+        value: file://dist/assertions/scored-multi-file.js:rewriteMultiFileScored
