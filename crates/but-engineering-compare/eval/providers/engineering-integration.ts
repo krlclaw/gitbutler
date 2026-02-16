@@ -767,7 +767,7 @@ function buildPolicyPrompt(): string {
     "Execute the required shell commands from the task before finishing.",
     "You are in a multi-agent repository.",
     "Before editing files, coordinate using but-engineering commands.",
-    "Before the first file edit, set plan + post a short start message + read channel at least once.",
+    "Before the first file edit, run read once; avoid plan/start posts unless needed for blockers or handoff.",
     "When branch/stack dependencies appear, use `but` commands (status/branch/commit) rather than raw git.",
     "If commit/branch output indicates a dependency lock (for example locked to upstream commit), coordinate and align a stacked branch (`but branch new <child> -a <base>`).",
     "Do not stop after only reading files; perform the requested coordination actions.",

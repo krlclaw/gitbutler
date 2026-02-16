@@ -32,6 +32,7 @@ REPLAY_DIR="${E2E_REPLAY_DIR:-}"
 REPLAY=0
 REPLAY_IDX=0
 REPLAY_FAILED=0
+REPLAY_EXPECTED_TOTAL=0
 declare -a REPLAY_LINES=()
 
 usage() {
@@ -249,6 +250,10 @@ trace_emit() {
   local stderr="$7"
   local stdin_file="${8:-}"
   local agent_event_summary_json="${9:-null}"
+  local stdout_file="${10:-}"
+  local stderr_file="${11:-}"
+  local replay_short_circuit="${12:-0}"
+  local replay_expected_invocation_id="${13:-0}"
   local stdin_sha256
   stdin_sha256="$(file_sha256 "$stdin_file")"
 
@@ -266,6 +271,11 @@ trace_emit() {
   printf ',"stdin_file":"%s"' "$(json_escape "$stdin_file")" >>"$TRACE_PATH"
   printf ',"stdin_sha256":"%s"' "$(json_escape "$stdin_sha256")" >>"$TRACE_PATH"
   printf ',"agent_event_summary":%s' "$agent_event_summary_json" >>"$TRACE_PATH"
+  printf ',"stdout_file":"%s"' "$(json_escape "$stdout_file")" >>"$TRACE_PATH"
+  printf ',"stderr_file":"%s"' "$(json_escape "$stderr_file")" >>"$TRACE_PATH"
+  printf ',"replay_run":%s' "$([[ "$REPLAY" -eq 1 ]] && echo "true" || echo "false")" >>"$TRACE_PATH"
+  printf ',"replay_short_circuit":%s' "$([[ "$replay_short_circuit" -eq 1 ]] && echo "true" || echo "false")" >>"$TRACE_PATH"
+  printf ',"replay_expected_invocation_id":%s' "$replay_expected_invocation_id" >>"$TRACE_PATH"
   printf ',"exit_code":%s' "$ec" >>"$TRACE_PATH"
   printf ',"stdout":"%s"' "$(json_escape "$stdout")" >>"$TRACE_PATH"
   printf ',"stderr":"%s"' "$(json_escape "$stderr")" >>"$TRACE_PATH"
@@ -286,6 +296,7 @@ replay_init() {
     REPLAY_LINES+=("$line")
   done <"$replay_trace"
   REPLAY=1
+  REPLAY_EXPECTED_TOTAL="${#REPLAY_LINES[@]}"
 }
 
 replay_compare() {
@@ -492,9 +503,13 @@ run_with_timeout() {
   local stderr_file="$OUT_DIR/$label.stderr"
   : >"$stdout_file"
   : >"$stderr_file"
+  local replay_short_circuit=0
+  local replay_expected_invocation_id=0
 
   local ec=0
   if [[ "$REPLAY" -eq 1 ]] && [[ "$label" == agent.* ]]; then
+    replay_short_circuit=1
+    replay_expected_invocation_id=$((REPLAY_IDX + 1))
     ec="$(python3 - "$stdout_file" "$stderr_file" "${REPLAY_LINES[$REPLAY_IDX]:-}" <<'PY'
 import json, sys
 
@@ -570,7 +585,7 @@ PY
     agent_event_summary_json="$(jsonl_event_summary_file "$stdout_file")"
   fi
 
-  trace_emit "$label" "$cwd" "$ec" "$cmd" "$args_json" "$stdout" "$stderr" "$stdin_file" "$agent_event_summary_json"
+  trace_emit "$label" "$cwd" "$ec" "$cmd" "$args_json" "$stdout" "$stderr" "$stdin_file" "$agent_event_summary_json" "$stdout_file" "$stderr_file" "$replay_short_circuit" "$replay_expected_invocation_id"
   replay_check_invocation "$label" "$ec" "$stdout" "$stdin_file" || return 1
 
   if [[ -n "${ONLY_STEP:-}" ]] && [[ "$label" == "$ONLY_STEP"* ]]; then
@@ -694,7 +709,7 @@ PY
 
 meta_patch_repo() {
   local repo="$1"
-  python3 - "$META_PATH" "$OUT_DIR" "$TRACE_PATH" "$repo" "$KEEP_REPO" <<'PY'
+  python3 - "$META_PATH" "$OUT_DIR" "$TRACE_PATH" "$repo" "$KEEP_REPO" "$REPLAY" "$REPLAY_EXPECTED_TOTAL" "$REPLAY_IDX" "$REPLAY_FAILED" <<'PY'
 import json, sys
 
 
@@ -711,6 +726,10 @@ out_dir = sys.argv[2]
 trace_path = sys.argv[3]
 repo_path = sys.argv[4]
 keep_repo = bool(int(sys.argv[5]))
+replay = bool(int(sys.argv[6]))
+replay_expected_total = int(sys.argv[7])
+replay_consumed = int(sys.argv[8])
+replay_failed = bool(int(sys.argv[9]))
 
 with open(meta_path, "r", encoding="utf-8") as f:
     meta = json.load(f)
@@ -719,6 +738,12 @@ meta["out_dir"] = out_dir
 meta["trace_path"] = trace_path
 meta["repo_path"] = repo_path
 meta["keep_repo"] = keep_repo
+meta["replay_expected_invocations"] = replay_expected_total if replay else None
+meta["replay_consumed_invocations"] = replay_consumed if replay else None
+meta["replay_remaining_invocations"] = (
+    max(replay_expected_total - replay_consumed, 0) if replay else None
+)
+meta["replay_complete"] = (replay and replay_consumed == replay_expected_total and not replay_failed) if replay else None
 
 with open(meta_path, "w", encoding="utf-8") as f:
     json.dump(meta, f, indent=2, sort_keys=True)
@@ -1642,6 +1667,8 @@ if [[ "$REPLAY" -eq 1 ]]; then
     ec=1
   fi
 fi
+
+meta_patch_repo "$repo"
 
   # Deterministic artifact so CI/local runs can consume results without parsing stdout.
   python3 - "$OUT_DIR/verdict.json" "$SCENARIO" "$PROVIDER" "$TIMEBOX_S" "$ec" "$TRACE_PATH" "$repo" "$KEEP_REPO" <<'PY'

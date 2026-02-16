@@ -2,6 +2,18 @@
 
 ## 2026-02-16
 
+- E2E replay metadata slice: `meta.json` now records replay consumption summary (`replay_expected_invocations`, `replay_consumed_invocations`, `replay_remaining_invocations`, `replay_complete`) so provider-trace replays are auditable without manually counting `trace.jsonl` rows: `crates/but-engineering-rewrite/e2e/run.sh`.
+- Wired `replay_init` to capture the expected invocation total once and patched `meta.json` again after scenario execution, so final replay status reflects the run outcome rather than pre-scenario defaults.
+- Why: this advances the top backlog item (replayable agent-mode E2E traces) with a small inspectability improvement and no replay matching semantic changes.
+- Scope/parity: runner-only change; Rust CLI coordination logic and harness stub behavior remain untouched (`crates/but-engineering-rewrite/src/main.rs`, `crates/but-engineering-rewrite/harness/bin/but-engineering-rewrite`).
+- What failed/limits: this slice does not add stricter replay assertions or new scenario coverage; it only improves artifact-level replay diagnostics.
+
+- E2E replay trace inspectability slice: each `trace.jsonl` invocation now records `replay_run`, `replay_short_circuit`, and `replay_expected_invocation_id` so agent-mode replay artifacts show which steps were actually replayed vs live-executed: `crates/but-engineering-rewrite/e2e/run.sh`.
+- Why: the top backlog item is replayable provider-mode traces; this adds per-step provenance directly in the trace without changing replay pass/fail semantics.
+- Scope/parity: runner-only additive fields; no Rust CLI coordination logic or harness stub behavior changed (`crates/but-engineering-rewrite/src/main.rs` and `crates/but-engineering-rewrite/harness/bin/but-engineering-rewrite` untouched).
+- Verified: fast deterministic harness gate remains green after the runner change via `./crates/but-engineering-rewrite/harness/run.sh` (`Trial 1/1: PASS`).
+- What failed/limits: this slice does not tighten replay matching rules; it improves artifact auditability only.
+
 - E2E replay execution slice: in replay mode, `agent.*` steps are now short-circuited from saved `trace.jsonl` rows (reuse saved `stdout`/`stderr`/`exit_code`) instead of spawning live provider processes: `crates/but-engineering-rewrite/e2e/run.sh`.
 - Replay-mode provider checks are now conditional, so `spawn_agent` does not require `codex`/`claude` binaries when replaying recorded agent steps: `crates/but-engineering-rewrite/e2e/run.sh`.
 - Why: this closes a concrete gap in the top backlog item by making provider-run traces inspectable/replayable without re-running live agents.
@@ -589,3 +601,11 @@
 - Updated the living backlog to mark deterministic CI integration as done and move the next immediate slice to replayable agent-mode traces: `crates/but-engineering-rewrite/docs/08-backlog.md`.
 - Why: the backlog should reflect current reality so the next coding slice targets unmet work instead of re-implementing landed items.
 - What failed: this checkpoint did not add product/harness behavior; it was a green-run + backlog alignment pass.
+
+## 2026-02-16 (E2E Replay: Trace Artifact Paths)
+
+- Added `stdout_file` and `stderr_file` fields to each E2E trace row so provider-run outputs can be inspected directly from `trace.jsonl` without re-running live agents: `crates/but-engineering-rewrite/e2e/run.sh`.
+- Wired trace emission to persist those file paths from `run_with_timeout` for all CLI/agent steps while keeping existing replay checks unchanged and backward-compatible with older traces.
+- Why: this is a small slice of the “replayable E2E traces for agent-mode runs” backlog item, focused on making captured runs easier to debug and audit.
+- Validation: reran the fast harness gate (`./crates/but-engineering-rewrite/harness/run.sh`) and kept it green.
+- What failed: this iteration did not add a new E2E scenario assertion for the new trace fields; it focused on capture/inspectability only.

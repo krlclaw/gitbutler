@@ -47,6 +47,7 @@ tests:
         - For each blocked/skipped file, post a coordination message that includes: exact file path, blocker/owner reason, and the concrete next step with ETA or unblocking trigger.
         - For each completed file, post a short update with exact file path and release status.
         - In the final done/summary message, list each requested file with status (completed/skipped) and the next step.
+        - Explicitly call out edge cases: note src/db.rs claim status (claim/expired/renew decision) and src/config.rs stale-claim handling (stale/refresh/renew decision).
 
         Operational constraints:
         - Assume the required CLIs are installed and working. DO NOT run which/--help/help, strace, netstat, strings, or repo-wide greps.
