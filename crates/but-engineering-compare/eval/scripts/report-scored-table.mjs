@@ -7,7 +7,7 @@ function load(path) {
   return { res, output };
 }
 
-function compute(path, mode) {
+async function compute(path, mode) {
   const { res, output } = load(path);
   // Recompute breakdown by importing the compiled scorer and reading global.
   // We call the scorer function directly so it sets globalThis.__butScoreBreakdown.

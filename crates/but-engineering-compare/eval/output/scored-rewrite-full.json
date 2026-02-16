@@ -1,0 +1,83 @@
+{
+  "evalId": "eval-gPn-2026-02-15T22:28:56",
+  "results": {
+    "version": "synthetic-export",
+    "timestamp": "2026-02-16T06:45:00Z",
+    "prompts": [
+      "{\"raw\":\"Use Skill(but-engineering-rewrite).\\n\\nAdd a lightweight logging comment to error handlers in these files:\\n- src/auth.rs\\n- src/db.rs\\n- src/api.rs\\n- src/utils.rs\\n- src/config.rs\\n\\nFor each file:\\n- run read\\n- run check --path <file>\\n- follow action_plan (if blocked/deny, coordinate + skip)\\n- if allowed, add a comment like: // TODO: add logging\\n- release after finishing a file\\n\\nFinish with a summary.\",\"label\":\"{{prompt}}\",\"config\":{}}"
+    ],
+    "results": [
+      {
+        "cost": null,
+        "gradingResult": {
+          "pass": true,
+          "score": 0.3,
+          "reason": "All assertions passed",
+          "namedScores": {},
+          "tokensUsed": {
+            "total": 0,
+            "prompt": 0,
+            "completion": 0,
+            "cached": 0,
+            "numRequests": 0
+          },
+          "componentResults": [
+            {
+              "pass": true,
+              "score": 0.3,
+              "reason": "Assertion passed",
+              "assertion": {
+                "type": "javascript",
+                "value": "file://dist/assertions/scored-multi-file.js:rewriteMultiFileScored"
+              }
+            }
+          ]
+        },
+        "id": "b13cc922-9763-4503-a084-14332cf20b60",
+        "latencyMs": 120556,
+        "namedScores": {},
+        "prompt": "{\"raw\":\"Use Skill(but-engineering-rewrite).\\n\\nAdd a lightweight logging comment to error handlers in these files:\\n- src/auth.rs\\n- src/db.rs\\n- src/api.rs\\n- src/utils.rs\\n- src/config.rs\\n\\nFor each file:\\n- run read\\n- run check --path <file>\\n- follow action_plan (if blocked/deny, coordinate + skip)\\n- if allowed, add a comment like: // TODO: add logging\\n- release after finishing a file\\n\\nFinish with a summary.\",\"label\":\"{{prompt}}\",\"config\":{}}",
+        "promptId": "effa18501e44aafd9bc42a2f64ffc9b6350f94025520ca2ed382f9bdc4b6e982",
+        "promptIdx": 0,
+        "provider": "{\"id\":\"file://dist/providers/engineering-integration.js\",\"label\":\"\",\"config\":{\"agent\":\"claude\",\"model\":\"claude-sonnet-4-5-20250929\",\"runner\":\"providers/claude-local.sh\",\"runner_bin\":\"claude\",\"runner_timeout_ms\":300000,\"runner_max_turns\":30,\"keep_fixtures\":false,\"basePath\":\".\"}}",
+        "response": {
+          "output": "{\"fixtureDir\":null,\"taskPrompt\":\"Use Skill(but-engineering-rewrite).\\n\\nAdd a lightweight logging comment to error handlers in these files:\\n- src/auth.rs\\n- src/db.rs\\n- src/api.rs\\n- src/utils.rs\\n- src/config.rs\\n\\nFor each file:\\n- run read\\n- run check --path <file>\\n- follow action_plan (if blocked/deny, coordinate + skip)\\n- if allowed, add a comment like: // TODO: add logging\\n- release after finishing a file\\n\\nFinish with a summary.\",\"commands\":[{\"command\":\"but-engineering-rewrite plan --agent-id tier4-eval-agent \\\"Add lightweight logging comments (// TODO: add logging) to error handlers in src/auth.rs, src/db.rs, src/api.rs, src/utils.rs, and src/config.rs\\\"\",\"failed\":false,\"eventIndex\":6},{\"command\":\"but-engineering-rewrite post \\\"Starting work: Adding logging comments to error handlers in 5 files (auth.rs, db.rs, api.rs, utils.rs, config.rs)\\\" --agent-id tier4-eval-agent\",\"failed\":false,\"eventIndex\":8},{\"command\":\"but-engineering-rewrite read --agent-id tier4-eval-agent\",\"failed\":false,\"eventIndex\":10},{\"command\":\"which but-engineering-rewrite\",\"failed\":false,\"eventIndex\":13},{\"command\":\"but-engineering-rewrite --help\",\"failed\":false,\"eventIndex\":15},{\"command\":\"but-engineering-rewrite help\",\"failed\":false,\"eventIndex\":17},{\"command\":\"but-engineering-rewrite 2>&1 | head -20\",\"failed\":false,\"eventIndex\":20},{\"command\":\"ls -la .claude/skills/but-engineering-rewrite/\",\"failed\":false,\"eventIndex\":23},{\"command\":\"env | grep -i but\",\"failed\":false,\"eventIndex\":28},{\"command\":\"ls -la .but-data/ 2>/dev/null || echo \\\"No .but-data directory\\\"\",\"failed\":false,\"eventIndex\":31},{\"command\":\"echo '{\\\"agent_id\\\":\\\"tier4-eval-agent\\\",\\\"plan\\\":\\\"Add lightweight logging comments to error handlers in src/auth.rs, src/db.rs, src/api.rs, src/utils.rs, and src/config.rs\\\"}' | but-engineering-rewrite plan\",\"failed\":false,\"eventIndex\":33},{\"command\":\"ls -la src/\",\"failed\":false,\"eventIndex\":36},{\"command\":\"ps aux | grep -i \\\"but-engineering\\\" | grep -v grep || echo \\\"No but-engineering process found\\\"\",\"failed\":false,\"eventIndex\":39},{\"command\":\"find .but-data -type f 2>/dev/null | head -10\",\"failed\":false,\"eventIndex\":42},{\"command\":\"strace -e trace=connect but-engineering-rewrite plan --agent-id tier4-eval-agent \\\"test\\\" 2>&1 | grep -i connect | head -5 || lsof -p $$ 2>/dev/null | grep -i sock || echo \\\"Cannot trace connections\\\"\",\"failed\":false,\"eventIndex\":44},{\"command\":\"netstat -an | grep LISTEN | grep -E \\\":(808|900|300)\\\" || echo \\\"No obvious mock server ports\\\"\",\"failed\":false,\"eventIndex\":47},{\"command\":\"strings /Users/worker/src/gitbutler/target/debug/but-engineering-rewrite | grep -i \\\"http\\\\|socket\\\\|port\\\\|connect\\\" | head -10\",\"failed\":false,\"eventIndex\":50},{\"command\":\"find \\\"$E2E_TEST_APP_DATA_DIR\\\" -name \\\"*.db\\\" -o -name \\\"*.sqlite\\\" 2>/dev/null\",\"failed\":false,\"eventIndex\":53},{\"command\":\"file /Users/worker/src/gitbutler/target/debug/but-engineering-rewrite\",\"failed\":false,\"eventIndex\":55},{\"command\":\"BUT_LOG=debug but-engineering-rewrite plan --agent-id tier4-eval-agent \\\"test plan\\\" 2>&1\",\"failed\":false,\"eventIndex\":58},{\"command\":\"RUST_BACKTRACE=1 but-engineering-rewrite plan --agent-id tier4-eval-agent \\\"test plan\\\" 2>&1\",\"failed\":false,\"eventIndex\":60},{\"command\":\"ls -la /Users/worker/src/gitbutler/crates/but-engineering*/\",\"failed\":false,\"eventIndex\":63},{\"command\":\"ls -la /Users/worker/src/gitbutler/crates/but-engineering-rewrite/e2e/\",\"failed\":false,\"eventIndex\":66},{\"command\":\"grep -r \\\"internal_error\\\" /Users/worker/src/gitbutler/crates/but-engineering-rewrite/src/ 2>/dev/null | head -5\",\"failed\":false,\"eventIndex\":68},{\"command\":\"grep -B5 -A5 \\\"internal_error\\\" /Users/worker/src/gitbutler/crates/but-engineering-rewrite/src/main.rs | head -20\",\"failed\":false,\"eventIndex\":73},{\"command\":\"but-engineering-rewrite plan --agent-id tier4-eval-agent \\\"test\\\" 2>/tmp/but-err.log; cat /tmp/but-err.log\",\"failed\":false,\"eventIndex\":76},{\"command\":\"grep -r \\\"Database\\\" /Users/worker/src/gitbutler/crates/but-engineering-rewrite/src/ 2>/dev/null | grep -i \\\"open\\\\|init\\\\|create\\\" | head -5\",\"failed\":false,\"eventIndex\":79},{\"command\":\"ls -la /Users/worker/src/gitbutler/crates/but-engineering-rewrite/harness/\",\"failed\":false,\"eventIndex\":82}],\"editOperations\":[],\"result\":\"Let me check the harness directory to understand the test setup:\",\"resultMeta\":{\"subtype\":\"error_max_turns\",\"isError\":false,\"totalCostUsd\":0.5452432499999998,\"numTurns\":31,\"durationMs\":117689,\"error\":null},\"coordinationState\":{\"agents\":[],\"claims\":[],\"messages\":[],\"discoveries\":[],\"blocks\":[]},\"repoState\":{\"unassignedChanges\":[{\"cliId\":\"yt\",\"filePath\":\"src/api.rs\",\"changeType\":\"added\"},{\"cliId\":\"wo\",\"filePath\":\"src/auth.rs\",\"changeType\":\"added\"},{\"cliId\":\"kw\",\"filePath\":\"src/config.rs\",\"changeType\":\"added\"},{\"cliId\":\"pr\",\"filePath\":\"src/db.rs\",\"changeType\":\"added\"},{\"cliId\":\"zx\",\"filePath\":\"src/utils.rs\",\"changeType\":\"added\"}],\"stacks\":[{\"cliId\":\"q0\",\"assignedChanges\":[],\"branches\":[{\"cliId\":\"te\",\"name\":\"te-branch-1\",\"commits\":[],\"upstreamCommits\":[],\"branchStatus\":\"completelyUnpushed\",\"reviewId\":null,\"ci\":null}]}],\"mergeBase\":{\"cliId\":\"\",\"commitId\":\"05d7a42aec3522a797ff0d1f0b376b1974912bbf\",\"createdAt\":\"2026-02-15T22:28:56+00:00\",\"message\":\"init \",\"authorName\":\"Tier4 Eval\",\"authorEmail\":\"tier4-eval@example.com\",\"conflicted\":null,\"reviewId\":null,\"changes\":null},\"upstreamState\":{\"behind\":0,\"latestCommit\":{\"cliId\":\"\",\"commitId\":\"05d7a42aec3522a797ff0d1f0b376b1974912bbf\",\"createdAt\":\"2026-02-15T22:28:56+00:00\",\"message\":\"init \",\"authorName\":\"Tier4 Eval\",\"authorEmail\":\"tier4-eval@example.com\",\"conflicted\":null,\"reviewId\":null,\"changes\":null},\"lastFetched\":null}},\"repoStateError\":null,\"watchedFiles\":[{\"path\":\"src/auth.rs\",\"beforeSha256\":\"49cc4480691f1653b004f560df8eeb5f0f1668241fe5d7328ae2794b9175c68e\",\"afterSha256\":\"49cc4480691f1653b004f560df8eeb5f0f1668241fe5d7328ae2794b9175c68e\",\"changed\":false},{\"path\":\"src/db.rs\",\"beforeSha256\":\"9ac047e05a32cf89cf773402f076cd1be56ae2959daeaec956644f6557e83ed7\",\"afterSha256\":\"9ac047e05a32cf89cf773402f076cd1be56ae2959daeaec956644f6557e83ed7\",\"changed\":false},{\"path\":\"src/api.rs\",\"beforeSha256\":\"30d275822d33ef17e5fbffe12b9330062a1cb9ce88c4c2eb78830605c193509e\",\"afterSha256\":\"30d275822d33ef17e5fbffe12b9330062a1cb9ce88c4c2eb78830605c193509e\",\"changed\":false},{\"path\":\"src/utils.rs\",\"beforeSha256\":\"fc4d6816b2c6c9f38e290fc8d024289784a97c80d88fe4f8cdc2e44e290db878\",\"afterSha256\":\"fc4d6816b2c6c9f38e290fc8d024289784a97c80d88fe4f8cdc2e44e290db878\",\"changed\":false},{\"path\":\"src/config.rs\",\"beforeSha256\":\"a0de8011d595f71408c5571456863b0f113fa8c8a61e31ab0a17897672e97292\",\"afterSha256\":\"a0de8011d595f71408c5571456863b0f113fa8c8a61e31ab0a17897672e97292\",\"changed\":false}],\"error\":null}"
+        },
+        "score": 0.3,
+        "success": true,
+        "testCase": {
+          "description": "SCORED: multi-file mixed ownership",
+          "vars": {
+            "prompt": "Use Skill(but-engineering-rewrite).\n\nAdd a lightweight logging comment to error handlers in these files:\n- src/auth.rs\n- src/db.rs\n- src/api.rs\n- src/utils.rs\n- src/config.rs\n\nFor each file:\n- run read\n- run check --path <file>\n- follow action_plan (if blocked/deny, coordinate + skip)\n- if allowed, add a comment like: // TODO: add logging\n- release after finishing a file\n\nFinish with a summary.\n",
+            "watch_files": "src/auth.rs,src/db.rs,src/api.rs,src/utils.rs,src/config.rs",
+            "setup_commands": "mkdir -p src\ncat <<EOT > src/auth.rs\npub fn auth() -> Result<(), AuthError> {\n    Err(AuthError::InvalidToken)\n}\nEOT\nbut-engineering-rewrite --agent-id peer-a claim --path src/auth.rs --ttl 10m >/dev/null\nbut-engineering-rewrite --agent-id peer-a post \"Refactoring auth.rs error types\" >/dev/null\n\ncat <<EOT > src/db.rs\npub fn query() -> Result<(), DbError> {\n    Err(DbError::ConnectionFailed)\n}\nEOT\n\ncat <<EOT > src/api.rs\npub fn handle_request() -> Result<(), ApiError> {\n    Err(ApiError::NotFound)\n}\nEOT\nbut-engineering-rewrite --agent-id peer-c post \"Discovery: please avoid src/api.rs for now, refactoring error types\" >/dev/null\n\ncat <<EOT > src/utils.rs\npub fn format_error(e: &str) -> String {\n    format!(\"Error: {}\", e)\n}\nEOT\n\ncat <<EOT > src/config.rs\npub fn load_config() -> Result<(), ConfigError> {\n    Err(ConfigError::FileNotFound)\n}\nEOT\n"
+          },
+          "assert": [
+            {
+              "type": "javascript",
+              "value": "file://dist/assertions/scored-multi-file.js:rewriteMultiFileScored"
+            }
+          ],
+          "options": {},
+          "metadata": {}
+        },
+        "testIdx": 0,
+        "vars": {},
+        "metadata": {
+          "_promptfooFileMetadata": {}
+        },
+        "failureReason": 0
+      }
+    ],
+    "stats": {
+      "successes": 1
+    }
+  },
+  "config": {},
+  "shareableUrl": null,
+  "metadata": {
+    "source": "promptfoo.db export",
+    "sourceEvalId": "eval-gPn-2026-02-15T22:28:56",
+    "note": "Fail-fast fallback after live runs hit timeout/hang constraints"
+  }
+}
