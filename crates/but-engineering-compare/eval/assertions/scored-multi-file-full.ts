@@ -52,40 +52,87 @@ function extractMessageFromCommand(command: string): string | null {
     return null;
   }
 
-  // Extract from double-quoted strings
-  const doubleMatches = [...command.matchAll(/"([^"\\]*(?:\\.[^"\\]*)*)"/g)].map((m) => m[1]);
-  for (let i = doubleMatches.length - 1; i >= 0; i -= 1) {
-    const text = doubleMatches[i].trim();
-    if (!text) continue;
-    if (text.toLowerCase().includes("but-engineering")) continue;
-    return text;
+  // Find the position of " post " or " done " keyword
+  const postMatch = command.match(/\s(?:post|done)\s+/i);
+  if (!postMatch || postMatch.index === undefined) return null;
+
+  // Look at the string AFTER the keyword
+  const afterKeyword = command.substring(postMatch.index + postMatch[0].length);
+  const s = afterKeyword.trimStart();
+
+  // Handle shell-escaped double quotes: \"...\"
+  if (s.startsWith('\\"')) {
+    const end = s.indexOf('\\"', 2);
+    if (end > 1) {
+      const raw = s.slice(2, end);
+      const text = raw.replace(/\\"/g, '"').replace(/\\\\/g, '\\').trim();
+      if (text && !text.toLowerCase().includes("but-engineering")) {
+        return text;
+      }
+    }
   }
 
-  // Extract from single-quoted strings
-  const singleMatches = [...command.matchAll(/'([^'\\]*(?:\\.[^'\\]*)*)'/g)].map((m) => m[1]);
-  for (let i = singleMatches.length - 1; i >= 0; i -= 1) {
-    const text = singleMatches[i].trim();
-    if (!text) continue;
-    if (text.toLowerCase().includes("but-engineering")) continue;
-    return text;
+  // Handle unescaped double quotes: "..."
+  const dqMatch = s.match(/^"((?:[^"\\]|\\.)*)"/);
+  if (dqMatch && dqMatch[1]) {
+    const text = dqMatch[1].replace(/\\"/g, '"').replace(/\\\\/g, '\\').trim();
+    if (text && !text.toLowerCase().includes("but-engineering")) {
+      return text;
+    }
+  }
+
+  // Handle shell-escaped single quotes: \'...\'
+  if (s.startsWith("\\'")) {
+    const end = s.indexOf("\\'", 2);
+    if (end > 1) {
+      const raw = s.slice(2, end);
+      const text = raw.replace(/\\'/g, "'").replace(/\\\\/g, '\\').trim();
+      if (text && !text.toLowerCase().includes("but-engineering")) {
+        return text;
+      }
+    }
+  }
+
+  // Handle unescaped single quotes
+  const sqMatch = s.match(/^'((?:[^'\\]|\\.)*)'/);
+  if (sqMatch && sqMatch[1]) {
+    const text = sqMatch[1].replace(/\\'/g, "'").replace(/\\\\/g, '\\').trim();
+    if (text && !text.toLowerCase().includes("but-engineering")) {
+      return text;
+    }
   }
 
   return null;
 }
 
+function normalizeMessage(text: string): string {
+  return text.replace(/\s+/g, " ").trim();
+}
+
 function messages(o: ProviderOutput): string[] {
-  const msgs = (o.coordinationState?.messages ?? [])
-    .map((m) => asStr(m?.content))
-    .filter((s) => s.trim().length > 0);
+  const msgs: string[] = [];
+  const seen = new Set<string>();
 
-  if (msgs.length > 0) return msgs;
+  const push = (raw: string) => {
+    const normalized = normalizeMessage(raw);
+    if (!normalized) return;
+    const key = normalized.toLowerCase();
+    if (seen.has(key)) return;
+    seen.add(key);
+    msgs.push(normalized);
+  };
 
-  // Provider may omit coordinationState.messages; recover from executed post/done commands.
+  // Coordination messages from provider state.
+  for (const m of o.coordinationState?.messages ?? []) push(asStr(m?.content));
+  // Some providers store peer notices in discoveries instead of messages.
+  for (const d of o.coordinationState?.discoveries ?? []) push(asStr(d?.content));
+
+  // Recover coordinator updates from executed post/done commands.
   for (const c of o.commands ?? []) {
     const cmd = asStr(c?.command);
     if (!cmd || c?.failed === true) continue;
     const extracted = extractMessageFromCommand(cmd);
-    if (extracted) msgs.push(extracted);
+    if (extracted) push(extracted);
   }
 
   return msgs;
