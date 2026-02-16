@@ -41,6 +41,9 @@ tests:
         - if allowed, add a comment like: // TODO: add logging
         - release after finishing a file
 
+        After all releases, run a verification pass:
+        - for each successfully edited file: ls src/, cat file, grep TODO file (3 commands per file)
+
         Finish with a summary.
 
         Coordination message quality requirements:
