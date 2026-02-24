@@ -1,0 +1,1 @@
+{"claims":[{"agent_id":"A","expires_at_ms":1771174756999,"path":"src/drift2/claimed_by_A.txt"},{"agent_id":"B","expires_at_ms":1771174772776,"path":"src/drift2/option1.txt"}],"ok":true}

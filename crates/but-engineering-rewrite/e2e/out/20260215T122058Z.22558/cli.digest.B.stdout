@@ -1,0 +1,1 @@
+{"ok":true,"mode":"digest","kind":"discovery","discoveries":[{"title":"High-signal: src/app.txt coordination smoke","agent_id":"A"}],"next_steps":[{"kind":"run","cmd":"./but-engineering-rewrite --agent-id B post \"@A: ack: executed discovery next_step for src/app.txt\""}]}

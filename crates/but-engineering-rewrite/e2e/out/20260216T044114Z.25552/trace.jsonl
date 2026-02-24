@@ -1,0 +1,1 @@
+{"ts_ms":1771216875433,"invocation_id":1,"label":"cli.claim.A","cwd":"/var/folders/9q/w10vtyqs3jg11swrjr3l8g300000gp/T//but-erw-e2e.NnHZXs","cmd":"/var/folders/9q/w10vtyqs3jg11swrjr3l8g300000gp/T//but-erw-e2e.NnHZXs/but-engineering-rewrite","args":["--agent-id","A","claim","--path","src/app.txt","--ttl","15m"],"stdin_file":"","exit_code":0,"stdout":"{\"ok\":true}","stderr":""}

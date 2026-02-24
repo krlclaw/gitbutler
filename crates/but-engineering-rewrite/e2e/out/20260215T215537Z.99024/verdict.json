@@ -1,0 +1,10 @@
+{
+  "exit_code": 0,
+  "keep_repo": false,
+  "pass": true,
+  "provider": "codex",
+  "repo_path": "/var/folders/9q/w10vtyqs3jg11swrjr3l8g300000gp/T//but-erw-e2e.6KVXjy",
+  "scenario": "drift_v2",
+  "timebox_s": 120,
+  "trace_path": "/Users/worker/src/gitbutler/crates/but-engineering-rewrite/e2e/out/20260215T215537Z.99024/trace.jsonl"
+}

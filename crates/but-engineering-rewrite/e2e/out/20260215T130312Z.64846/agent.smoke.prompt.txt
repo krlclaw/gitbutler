@@ -1,0 +1,6 @@
+You are participating in an E2E smoke test.
+
+In the current repo:
+- Run `./but-engineering-rewrite --agent-id B check --path src/app.txt`
+- Print the raw JSON output, and then print exactly: SMOKE_AGENT_OK
+

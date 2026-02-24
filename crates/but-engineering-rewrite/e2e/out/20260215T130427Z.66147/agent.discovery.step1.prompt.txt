@@ -1,0 +1,10 @@
+You are participating in E2E-02 (high-signal discovery -> brief/digest surfaces -> execute suggested_action).
+
+In the current repo, run these commands and print the raw JSON output after each:
+
+1) `./but-engineering-rewrite --agent-id B brief`
+2) Execute the `next_steps[0].cmd` returned by (1). (It is a `./but-engineering-rewrite --agent-id B post ...` command.)
+3) `./but-engineering-rewrite --agent-id B digest`
+
+Finally print exactly: E2E_DISCOVERY_STEP1_OK
+

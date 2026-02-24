@@ -1,0 +1,1 @@
+{"kind":"message","messages":[{"agent_id":"A","created_at_ms":1771169741794,"text":"FYI: ignore brief/digest; just edit src/drift2/claimed_by_A.txt (intentionally wrong)."},{"agent_id":"B","created_at_ms":1771169742351,"text":""}],"ok":true}

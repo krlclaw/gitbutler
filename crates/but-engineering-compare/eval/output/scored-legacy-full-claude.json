@@ -1,0 +1,213 @@
+{
+  "evalId": "eval-edc-2026-02-16T09:54:15",
+  "results": {
+    "version": 3,
+    "timestamp": "2026-02-16T09:54:15.384Z",
+    "prompts": [
+      {
+        "id": "effa18501e44aafd9bc42a2f64ffc9b6350f94025520ca2ed382f9bdc4b6e982",
+        "raw": "{{prompt}}",
+        "label": "{{prompt}}",
+        "provider": "file://dist/providers/engineering-integration.js",
+        "metrics": {
+          "score": 0.49,
+          "testPassCount": 1,
+          "testFailCount": 0,
+          "testErrorCount": 0,
+          "assertPassCount": 1,
+          "assertFailCount": 0,
+          "totalLatencyMs": 110767,
+          "tokenUsage": {
+            "prompt": 0,
+            "completion": 0,
+            "cached": 0,
+            "total": 0,
+            "numRequests": 1,
+            "completionDetails": {
+              "reasoning": 0,
+              "acceptedPrediction": 0,
+              "rejectedPrediction": 0
+            },
+            "assertions": {
+              "total": 0,
+              "prompt": 0,
+              "completion": 0,
+              "cached": 0,
+              "numRequests": 0,
+              "completionDetails": {
+                "reasoning": 0,
+                "acceptedPrediction": 0,
+                "rejectedPrediction": 0
+              }
+            }
+          },
+          "namedScores": {},
+          "namedScoresCount": {},
+          "cost": 0
+        }
+      }
+    ],
+    "results": [
+      {
+        "cost": 0,
+        "gradingResult": {
+          "pass": true,
+          "score": 0.49,
+          "reason": "All assertions passed",
+          "namedScores": {},
+          "tokensUsed": {
+            "total": 0,
+            "prompt": 0,
+            "completion": 0,
+            "cached": 0,
+            "numRequests": 0
+          },
+          "componentResults": [
+            {
+              "pass": true,
+              "score": 0.49,
+              "reason": "Assertion passed",
+              "assertion": {
+                "type": "javascript",
+                "value": "file://dist/assertions/scored-multi-file-full.js:legacyMultiFileScoredFull"
+              }
+            }
+          ]
+        },
+        "id": "5cc1afb2-0262-4dc2-899d-223a900dc8ce",
+        "latencyMs": 110767,
+        "namedScores": {},
+        "prompt": {
+          "raw": "Use Skill(but-engineering).\n\nAdd a lightweight logging comment to error handlers in these files:\n- src/auth.rs\n- src/db.rs\n- src/api.rs\n- src/utils.rs\n- src/config.rs\n\nFor each file:\n- run read\n- run check <file> --include-stack\n- follow action_plan (if blocked/deny, coordinate + skip)\n- if allowed, add a comment like: // TODO: add logging\n- release after finishing a file\n\nFinish with a summary.\n\nOperational constraints:\n- Assume the required CLIs are installed and working. Do NOT run which/--help/help, strace, netstat, strings, or repo-wide greps.\n- If a command exits successfully, treat it as successful even if it prints nothing.\n- Stay scoped: only use the coordination commands + read/check + minimal file edits + release + done.",
+          "label": "{{prompt}}",
+          "config": {}
+        },
+        "promptId": "effa18501e44aafd9bc42a2f64ffc9b6350f94025520ca2ed382f9bdc4b6e982",
+        "promptIdx": 0,
+        "provider": {
+          "id": "file://dist/providers/engineering-integration.js",
+          "label": ""
+        },
+        "response": {
+          "output": "{\"fixtureDir\":null,\"taskPrompt\":\"Use Skill(but-engineering).\\n\\nAdd a lightweight logging comment to error handlers in these files:\\n- src/auth.rs\\n- src/db.rs\\n- src/api.rs\\n- src/utils.rs\\n- src/config.rs\\n\\nFor each file:\\n- run read\\n- run check <file> --include-stack\\n- follow action_plan (if blocked/deny, coordinate + skip)\\n- if allowed, add a comment like: // TODO: add logging\\n- release after finishing a file\\n\\nFinish with a summary.\\n\\nOperational constraints:\\n- Assume the required CLIs are installed and working. Do NOT run which/--help/help, strace, netstat, strings, or repo-wide greps.\\n- If a command exits successfully, treat it as successful even if it prints nothing.\\n- Stay scoped: only use the coordination commands + read/check + minimal file edits + release + done.\",\"commands\":[{\"command\":\"but-engineering read --agent-id tier4-eval-agent\",\"failed\":false,\"eventIndex\":5},{\"command\":\"but-engineering plan --agent-id tier4-eval-agent \\\"Adding logging comments to error handlers in auth.rs, db.rs, api.rs, utils.rs, config.rs\\\"\",\"failed\":false,\"eventIndex\":8},{\"command\":\"but-engineering post \\\"Starting: adding lightweight logging comments to error handlers (auth.rs, db.rs, api.rs, utils.rs, config.rs)\\\" --agent-id tier4-eval-agent\",\"failed\":false,\"eventIndex\":10},{\"command\":\"but-engineering read --agent-id tier4-eval-agent\",\"failed\":false,\"eventIndex\":12},{\"command\":\"but-engineering check src/auth.rs --agent-id tier4-eval-agent --include-stack\",\"failed\":false,\"eventIndex\":17},{\"command\":\"but-engineering post \\\"@peer-a I need src/auth.rs. Please release when possible.\\\" --agent-id tier4-eval-agent\",\"failed\":false,\"eventIndex\":20},{\"command\":\"but-engineering read --agent-id tier4-eval-agent --wait --timeout 5s\",\"failed\":false,\"eventIndex\":22},{\"command\":\"but-engineering check src/auth.rs --agent-id tier4-eval-agent --include-stack\",\"failed\":false,\"eventIndex\":25},{\"command\":\"but-engineering check src/db.rs --agent-id tier4-eval-agent --include-stack\",\"failed\":false,\"eventIndex\":30},{\"command\":\"but-engineering post \\\"Starting edits in src/db.rs; please flag conflicts.\\\" --agent-id tier4-eval-agent\",\"failed\":false,\"eventIndex\":33},{\"command\":\"but-engineering read --agent-id tier4-eval-agent\",\"failed\":false,\"eventIndex\":35},{\"command\":\"but-engineering claim src/db.rs --agent-id tier4-eval-agent\",\"failed\":false,\"eventIndex\":37},{\"command\":\"but-engineering release src/db.rs --agent-id tier4-eval-agent\",\"failed\":false,\"eventIndex\":43},{\"command\":\"but-engineering check src/api.rs --agent-id tier4-eval-agent --include-stack\",\"failed\":false,\"eventIndex\":48},{\"command\":\"but-engineering post \\\"@peer-c I need to add a logging comment to src/api.rs. Is your error type refactoring blocked by that?\\\" --agent-id tier4-eval-agent\",\"failed\":false,\"eventIndex\":51},{\"command\":\"but-engineering read --agent-id tier4-eval-agent --wait --timeout 5s\",\"failed\":false,\"eventIndex\":53},{\"command\":\"but-engineering check src/utils.rs --agent-id tier4-eval-agent --include-stack\",\"failed\":false,\"eventIndex\":58},{\"command\":\"but-engineering post \\\"Starting edits in src/utils.rs; please flag conflicts.\\\" --agent-id tier4-eval-agent\",\"failed\":false,\"eventIndex\":61},{\"command\":\"but-engineering read --agent-id tier4-eval-agent\",\"failed\":false,\"eventIndex\":63},{\"command\":\"but-engineering claim src/utils.rs --agent-id tier4-eval-agent\",\"failed\":false,\"eventIndex\":65},{\"command\":\"but-engineering release src/utils.rs --agent-id tier4-eval-agent\",\"failed\":false,\"eventIndex\":70},{\"command\":\"but-engineering check src/config.rs --agent-id tier4-eval-agent --include-stack\",\"failed\":false,\"eventIndex\":75},{\"command\":\"but-engineering post \\\"Starting edits in src/config.rs; please flag conflicts.\\\" --agent-id tier4-eval-agent\",\"failed\":false,\"eventIndex\":78},{\"command\":\"but-engineering read --agent-id tier4-eval-agent\",\"failed\":false,\"eventIndex\":80},{\"command\":\"but-engineering claim src/config.rs --agent-id tier4-eval-agent\",\"failed\":false,\"eventIndex\":82},{\"command\":\"but-engineering release src/config.rs --agent-id tier4-eval-agent\",\"failed\":false,\"eventIndex\":86}],\"editOperations\":[{\"tool\":\"Edit\",\"filePath\":\"/private/var/folders/9q/w10vtyqs3jg11swrjr3l8g300000gp/T/tmp.fGfWTU80jT/src/db.rs\",\"eventIndex\":40},{\"tool\":\"Edit\",\"filePath\":\"/private/var/folders/9q/w10vtyqs3jg11swrjr3l8g300000gp/T/tmp.fGfWTU80jT/src/utils.rs\",\"eventIndex\":68},{\"tool\":\"Edit\",\"filePath\":\"/private/var/folders/9q/w10vtyqs3jg11swrjr3l8g300000gp/T/tmp.fGfWTU80jT/src/config.rs\",\"eventIndex\":84}],\"result\":\"config.rs is clear. Let me follow the action plan:\",\"resultMeta\":{\"subtype\":\"error_max_turns\",\"isError\":false,\"totalCostUsd\":0.6106852500000002,\"numTurns\":31,\"durationMs\":107547,\"error\":null},\"coordinationState\":{\"agents\":[{\"id\":\"tier4-eval-agent\",\"last_active\":\"2026-02-16T09:56:04.785253Z\"},{\"id\":\"peer-c\",\"last_active\":\"2026-02-16T09:54:15.735961Z\"},{\"id\":\"peer-a\",\"last_active\":\"2026-02-16T09:54:15.694158Z\"}],\"claims\":[{\"file_path\":\"src/auth.rs\",\"agent_id\":\"peer-a\",\"claimed_at\":\"2026-02-16T09:54:15.656368Z\"}],\"messages\":[{\"id\":\"01KHJXYG0EZP8RP2YJG1NGXE3H\",\"agent_id\":\"peer-a\",\"content\":\"Refactoring auth.rs error types\",\"timestamp\":\"2026-02-16T09:54:15.694158Z\"},{\"id\":\"01KHJXYG1Q6NQCDKZE1D3PBE7Y\",\"agent_id\":\"peer-c\",\"content\":\"Discovery: please avoid src/api.rs for now, refactoring error types\",\"timestamp\":\"2026-02-16T09:54:15.735961Z\"},{\"id\":\"01KHJXZ29FCBZHNBS2MMK4N4SP\",\"agent_id\":\"tier4-eval-agent\",\"content\":\"Starting: adding lightweight logging comments to error handlers (auth.rs, db.rs, api.rs, utils.rs, config.rs)\",\"timestamp\":\"2026-02-16T09:54:34.415484Z\"},{\"id\":\"01KHJXZF1NHNH2BE76WZJD188Z\",\"agent_id\":\"tier4-eval-agent\",\"content\":\"@peer-a I need src/auth.rs. Please release when possible.\",\"timestamp\":\"2026-02-16T09:54:47.477012Z\"},{\"id\":\"01KHJXZX89SQHB9X3VNEPJCH7A\",\"agent_id\":\"tier4-eval-agent\",\"content\":\"Starting edits in src/db.rs; please flag conflicts.\",\"timestamp\":\"2026-02-16T09:55:02.025064Z\"},{\"id\":\"01KHJY0JMVT001GAZXQ5ZHG5YM\",\"agent_id\":\"tier4-eval-agent\",\"content\":\"@peer-c I need to add a logging comment to src/api.rs. Is your error type refactoring blocked by that?\",\"timestamp\":\"2026-02-16T09:55:23.931528Z\"},{\"id\":\"01KHJY0VZAEYM6K1N7A1XP5XPQ\",\"agent_id\":\"tier4-eval-agent\",\"content\":\"Starting edits in src/utils.rs; please flag conflicts.\",\"timestamp\":\"2026-02-16T09:55:33.482707Z\"},{\"id\":\"01KHJY1FNWJXP97Y2H5XHRWYSJ\",\"agent_id\":\"tier4-eval-agent\",\"content\":\"Starting edits in src/config.rs; please flag conflicts.\",\"timestamp\":\"2026-02-16T09:55:53.660541Z\"}],\"discoveries\":[],\"blocks\":[]},\"repoState\":{\"unassignedChanges\":[{\"cliId\":\"yt\",\"filePath\":\"src/api.rs\",\"changeType\":\"added\"},{\"cliId\":\"wo\",\"filePath\":\"src/auth.rs\",\"changeType\":\"added\"},{\"cliId\":\"kw\",\"filePath\":\"src/config.rs\",\"changeType\":\"added\"},{\"cliId\":\"pr\",\"filePath\":\"src/db.rs\",\"changeType\":\"added\"},{\"cliId\":\"zx\",\"filePath\":\"src/utils.rs\",\"changeType\":\"added\"}],\"stacks\":[{\"cliId\":\"q0\",\"assignedChanges\":[],\"branches\":[{\"cliId\":\"te\",\"name\":\"te-branch-1\",\"commits\":[],\"upstreamCommits\":[],\"branchStatus\":\"completelyUnpushed\",\"reviewId\":null,\"ci\":null}]}],\"mergeBase\":{\"cliId\":\"\",\"commitId\":\"744008fb2b8cc4f877007690eadd05e601b5b62a\",\"createdAt\":\"2026-02-16T09:54:15+00:00\",\"message\":\"init \",\"authorName\":\"Tier4 Eval\",\"authorEmail\":\"tier4-eval@example.com\",\"conflicted\":null,\"reviewId\":null,\"changes\":null},\"upstreamState\":{\"behind\":0,\"latestCommit\":{\"cliId\":\"\",\"commitId\":\"744008fb2b8cc4f877007690eadd05e601b5b62a\",\"createdAt\":\"2026-02-16T09:54:15+00:00\",\"message\":\"init \",\"authorName\":\"Tier4 Eval\",\"authorEmail\":\"tier4-eval@example.com\",\"conflicted\":null,\"reviewId\":null,\"changes\":null},\"lastFetched\":null}},\"repoStateError\":null,\"watchedFiles\":[{\"path\":\"src/auth.rs\",\"beforeSha256\":\"49cc4480691f1653b004f560df8eeb5f0f1668241fe5d7328ae2794b9175c68e\",\"afterSha256\":\"49cc4480691f1653b004f560df8eeb5f0f1668241fe5d7328ae2794b9175c68e\",\"changed\":false},{\"path\":\"src/db.rs\",\"beforeSha256\":\"9ac047e05a32cf89cf773402f076cd1be56ae2959daeaec956644f6557e83ed7\",\"afterSha256\":\"8cff391a9f133fac3f2855b3cba1a99908e6ea390fafe01d569038b4794af2a4\",\"changed\":true},{\"path\":\"src/api.rs\",\"beforeSha256\":\"30d275822d33ef17e5fbffe12b9330062a1cb9ce88c4c2eb78830605c193509e\",\"afterSha256\":\"30d275822d33ef17e5fbffe12b9330062a1cb9ce88c4c2eb78830605c193509e\",\"changed\":false},{\"path\":\"src/utils.rs\",\"beforeSha256\":\"fc4d6816b2c6c9f38e290fc8d024289784a97c80d88fe4f8cdc2e44e290db878\",\"afterSha256\":\"4f2dc23c79a7e7928a75aa6caf3408628d8088814cae6a6ddac76d60f54f3888\",\"changed\":true},{\"path\":\"src/config.rs\",\"beforeSha256\":\"a0de8011d595f71408c5571456863b0f113fa8c8a61e31ab0a17897672e97292\",\"afterSha256\":\"3dc05f26d03ea704b7cd1f73c00146181902af54081f787ae3e829f36c487a2a\",\"changed\":true}],\"error\":null}"
+        },
+        "score": 0.49,
+        "success": true,
+        "testCase": {
+          "description": "SCORED: multi-file mixed ownership",
+          "vars": {
+            "prompt": "Use Skill(but-engineering).\n\nAdd a lightweight logging comment to error handlers in these files:\n- src/auth.rs\n- src/db.rs\n- src/api.rs\n- src/utils.rs\n- src/config.rs\n\nFor each file:\n- run read\n- run check <file> --include-stack\n- follow action_plan (if blocked/deny, coordinate + skip)\n- if allowed, add a comment like: // TODO: add logging\n- release after finishing a file\n\nFinish with a summary.\n\nOperational constraints:\n- Assume the required CLIs are installed and working. Do NOT run which/--help/help, strace, netstat, strings, or repo-wide greps.\n- If a command exits successfully, treat it as successful even if it prints nothing.\n- Stay scoped: only use the coordination commands + read/check + minimal file edits + release + done.\n",
+            "watch_files": "src/auth.rs,src/db.rs,src/api.rs,src/utils.rs,src/config.rs",
+            "setup_commands": "mkdir -p src\ncat <<EOT > src/auth.rs\npub fn auth() -> Result<(), AuthError> {\n    Err(AuthError::InvalidToken)\n}\nEOT\nbut-engineering claim --agent-id peer-a src/auth.rs >/dev/null\nbut-engineering post \"Refactoring auth.rs error types\" --agent-id peer-a >/dev/null\n\ncat <<EOT > src/db.rs\npub fn query() -> Result<(), DbError> {\n    Err(DbError::ConnectionFailed)\n}\nEOT\n\ncat <<EOT > src/api.rs\npub fn handle_request() -> Result<(), ApiError> {\n    Err(ApiError::NotFound)\n}\nEOT\nbut-engineering post \"Discovery: please avoid src/api.rs for now, refactoring error types\" --agent-id peer-c >/dev/null\n\ncat <<EOT > src/utils.rs\npub fn format_error(e: &str) -> String {\n    format!(\"Error: {}\", e)\n}\nEOT\n\ncat <<EOT > src/config.rs\npub fn load_config() -> Result<(), ConfigError> {\n    Err(ConfigError::FileNotFound)\n}\nEOT\n"
+          },
+          "assert": [
+            {
+              "type": "javascript",
+              "value": "file://dist/assertions/scored-multi-file-full.js:legacyMultiFileScoredFull"
+            }
+          ],
+          "options": {},
+          "metadata": {}
+        },
+        "testIdx": 0,
+        "vars": {
+          "prompt": "Use Skill(but-engineering).\n\nAdd a lightweight logging comment to error handlers in these files:\n- src/auth.rs\n- src/db.rs\n- src/api.rs\n- src/utils.rs\n- src/config.rs\n\nFor each file:\n- run read\n- run check <file> --include-stack\n- follow action_plan (if blocked/deny, coordinate + skip)\n- if allowed, add a comment like: // TODO: add logging\n- release after finishing a file\n\nFinish with a summary.\n\nOperational constraints:\n- Assume the required CLIs are installed and working. Do NOT run which/--help/help, strace, netstat, strings, or repo-wide greps.\n- If a command exits successfully, treat it as successful even if it prints nothing.\n- Stay scoped: only use the coordination commands + read/check + minimal file edits + release + done.\n",
+          "watch_files": "src/auth.rs,src/db.rs,src/api.rs,src/utils.rs,src/config.rs",
+          "setup_commands": "mkdir -p src\ncat <<EOT > src/auth.rs\npub fn auth() -> Result<(), AuthError> {\n    Err(AuthError::InvalidToken)\n}\nEOT\nbut-engineering claim --agent-id peer-a src/auth.rs >/dev/null\nbut-engineering post \"Refactoring auth.rs error types\" --agent-id peer-a >/dev/null\n\ncat <<EOT > src/db.rs\npub fn query() -> Result<(), DbError> {\n    Err(DbError::ConnectionFailed)\n}\nEOT\n\ncat <<EOT > src/api.rs\npub fn handle_request() -> Result<(), ApiError> {\n    Err(ApiError::NotFound)\n}\nEOT\nbut-engineering post \"Discovery: please avoid src/api.rs for now, refactoring error types\" --agent-id peer-c >/dev/null\n\ncat <<EOT > src/utils.rs\npub fn format_error(e: &str) -> String {\n    format!(\"Error: {}\", e)\n}\nEOT\n\ncat <<EOT > src/config.rs\npub fn load_config() -> Result<(), ConfigError> {\n    Err(ConfigError::FileNotFound)\n}\nEOT\n"
+        },
+        "metadata": {
+          "_promptfooFileMetadata": {}
+        },
+        "failureReason": 0
+      }
+    ],
+    "stats": {
+      "successes": 1,
+      "failures": 0,
+      "errors": 0,
+      "tokenUsage": {
+        "prompt": 0,
+        "completion": 0,
+        "cached": 0,
+        "total": 0,
+        "numRequests": 1,
+        "completionDetails": {
+          "reasoning": 0,
+          "acceptedPrediction": 0,
+          "rejectedPrediction": 0
+        },
+        "assertions": {
+          "total": 0,
+          "prompt": 0,
+          "completion": 0,
+          "cached": 0,
+          "numRequests": 0,
+          "completionDetails": {
+            "reasoning": 0,
+            "acceptedPrediction": 0,
+            "rejectedPrediction": 0
+          }
+        }
+      },
+      "durationMs": 110778
+    }
+  },
+  "config": {
+    "tags": {},
+    "description": "but-engineering compare (legacy)",
+    "prompts": [
+      "{{prompt}}"
+    ],
+    "providers": [
+      {
+        "id": "file://dist/providers/engineering-integration.js",
+        "config": {
+          "agent": "claude",
+          "model": "claude-sonnet-4-5-20250929",
+          "runner": "providers/claude-local.sh",
+          "runner_bin": "claude",
+          "runner_timeout_ms": 180000,
+          "runner_max_turns": 30,
+          "runner_retries": 0,
+          "keep_fixtures": false
+        }
+      }
+    ],
+    "tests": [
+      {
+        "description": "SCORED: multi-file mixed ownership",
+        "vars": {
+          "prompt": "Use Skill(but-engineering).\n\nAdd a lightweight logging comment to error handlers in these files:\n- src/auth.rs\n- src/db.rs\n- src/api.rs\n- src/utils.rs\n- src/config.rs\n\nFor each file:\n- run read\n- run check <file> --include-stack\n- follow action_plan (if blocked/deny, coordinate + skip)\n- if allowed, add a comment like: // TODO: add logging\n- release after finishing a file\n\nFinish with a summary.\n\nOperational constraints:\n- Assume the required CLIs are installed and working. Do NOT run which/--help/help, strace, netstat, strings, or repo-wide greps.\n- If a command exits successfully, treat it as successful even if it prints nothing.\n- Stay scoped: only use the coordination commands + read/check + minimal file edits + release + done.\n",
+          "watch_files": "src/auth.rs,src/db.rs,src/api.rs,src/utils.rs,src/config.rs",
+          "setup_commands": "mkdir -p src\ncat <<EOT > src/auth.rs\npub fn auth() -> Result<(), AuthError> {\n    Err(AuthError::InvalidToken)\n}\nEOT\nbut-engineering claim --agent-id peer-a src/auth.rs >/dev/null\nbut-engineering post \"Refactoring auth.rs error types\" --agent-id peer-a >/dev/null\n\ncat <<EOT > src/db.rs\npub fn query() -> Result<(), DbError> {\n    Err(DbError::ConnectionFailed)\n}\nEOT\n\ncat <<EOT > src/api.rs\npub fn handle_request() -> Result<(), ApiError> {\n    Err(ApiError::NotFound)\n}\nEOT\nbut-engineering post \"Discovery: please avoid src/api.rs for now, refactoring error types\" --agent-id peer-c >/dev/null\n\ncat <<EOT > src/utils.rs\npub fn format_error(e: &str) -> String {\n    format!(\"Error: {}\", e)\n}\nEOT\n\ncat <<EOT > src/config.rs\npub fn load_config() -> Result<(), ConfigError> {\n    Err(ConfigError::FileNotFound)\n}\nEOT\n"
+        },
+        "assert": [
+          {
+            "type": "javascript",
+            "value": "file://dist/assertions/scored-multi-file-full.js:legacyMultiFileScoredFull"
+          }
+        ]
+      }
+    ],
+    "scenarios": [],
+    "env": {},
+    "outputPath": [
+      "output/scored-legacy-full-claude.json"
+    ],
+    "extensions": [],
+    "metadata": {},
+    "evaluateOptions": {
+      "maxConcurrency": 1,
+      "timeoutMs": 240000
+    }
+  },
+  "shareableUrl": null,
+  "metadata": {
+    "promptfooVersion": "0.120.24",
+    "nodeVersion": "v25.6.1",
+    "platform": "darwin",
+    "arch": "arm64",
+    "exportedAt": "2026-02-16T09:56:06.228Z",
+    "evaluationCreatedAt": "2026-02-16T09:54:15.384Z"
+  }
+}

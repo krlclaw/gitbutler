@@ -1,0 +1,7 @@
+{
+  "exit_code": 0,
+  "pass": true,
+  "provider": "codex",
+  "scenario": "smoke",
+  "timebox_s": 240
+}

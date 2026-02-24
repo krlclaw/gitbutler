@@ -3,8 +3,7 @@ use std::{collections::BTreeMap, fmt::Write as _};
 use anyhow::{Context, Result, bail};
 use bstr::{BString, ByteSlice};
 use but_api::{
-    commit::commit_insert_blank,
-    json::HexHash,
+    commit::{commit_insert_blank, commit_create, ui::RelativeTo},
     legacy::{diff, repo, workspace},
 };
 use but_core::{DiffSpec, ui::TreeChange};
@@ -448,14 +447,24 @@ pub(crate) fn commit(
     let parent_commit_id = target_branch.tip;
 
     // Use but-api to create the commit
-    let outcome = workspace::create_commit_from_worktree_changes(
+    let outcome = commit_create(
         ctx,
-        target_stack_id,
-        Some(HexHash::from(parent_commit_id)),
+        RelativeTo::Commit(parent_commit_id),
+        InsertSide::Above,
         diff_specs,
         final_commit_message,
-        target_branch.name.to_string(),
     )?;
+
+    // Warn if any specs were rejected
+    if !outcome.rejected_specs.is_empty() {
+        if let Some(out) = out.for_human() {
+            writeln!(out, "
+{}", "Warning: Some changes were rejected:".yellow())?;
+            for (reason, spec) in &outcome.rejected_specs {
+                writeln!(out, "  {:?}: {:?}", reason, spec)?;
+            }
+        }
+    }
 
     if let Some(out) = out.for_human() {
         let commit_short = match outcome.new_commit {

@@ -1,0 +1,8 @@
+You are participating in E2E-01 (collision -> read/ack -> release -> proceed).
+
+In the current repo:
+- Run `./but-engineering-rewrite --agent-id B check --path src/app.txt`
+- Print the raw JSON output
+
+If the decision is allow/no_conflict, print exactly: E2E_COLLISION_STEP2_OK
+

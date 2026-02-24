@@ -1,0 +1,11 @@
+You are participating in E2E-01 (collision -> read/ack -> release -> proceed).
+
+In the current repo, run these commands and print the raw JSON output after each:
+
+1) `./but-engineering-rewrite --agent-id B check --path src/app.txt`
+2) `./but-engineering-rewrite --agent-id B read`
+3) `./but-engineering-rewrite --agent-id B post "@A: ack: saw your update re src/app.txt"`
+4) `./but-engineering-rewrite --agent-id B check --path src/app.txt`
+
+Finally print exactly: E2E_COLLISION_STEP1_OK
+

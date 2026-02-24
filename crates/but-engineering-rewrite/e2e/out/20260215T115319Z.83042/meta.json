@@ -1,0 +1,21 @@
+{
+  "allow_stub": true,
+  "bin": "/Users/worker/src/gitbutler/target/debug/but-engineering-rewrite",
+  "e2e_dir": "/Users/worker/src/gitbutler/crates/but-engineering-rewrite/e2e",
+  "git_dirty": true,
+  "git_head": "daa5a84971d72f83d66c9c4d037e36ee6df4a458",
+  "keep_repo": true,
+  "no_agents": true,
+  "provider": "codex",
+  "root": "/Users/worker/src/gitbutler",
+  "scenario": "discovery",
+  "stub_bin": "/Users/worker/src/gitbutler/crates/but-engineering-rewrite/harness/bin/but-engineering-rewrite",
+  "timebox_s": 240,
+  "versions": {
+    "cargo": null,
+    "claude": null,
+    "codex": null,
+    "git": "git version 2.50.1 (Apple Git-155)",
+    "python3": "Python 3.9.6"
+  }
+}

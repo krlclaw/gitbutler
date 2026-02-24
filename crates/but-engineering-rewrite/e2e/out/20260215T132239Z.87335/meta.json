@@ -1,0 +1,28 @@
+{
+  "allow_stub": true,
+  "bin": "/Users/worker/src/gitbutler/target/debug/but-engineering-rewrite",
+  "bin_built": false,
+  "bin_default": "/Users/worker/src/gitbutler/target/debug/but-engineering-rewrite",
+  "bin_sha256": "f0b447a1fa9a6f019937a8b0d09d4e1187c53c0fce599d52906223ab8c07887f",
+  "bin_using_stub": false,
+  "e2e_dir": "/Users/worker/src/gitbutler/crates/but-engineering-rewrite/e2e",
+  "git_dirty": true,
+  "git_head": "aacb81f8d3405740fcd3673f2cb4b8585c581cff",
+  "keep_repo": false,
+  "no_agents": true,
+  "out_dir": "/Users/worker/src/gitbutler/crates/but-engineering-rewrite/e2e/out/20260215T132239Z.87335",
+  "provider": "codex",
+  "repo_path": "/var/folders/9q/w10vtyqs3jg11swrjr3l8g300000gp/T//but-erw-e2e.HsuP0n",
+  "root": "/Users/worker/src/gitbutler",
+  "scenario": "drift",
+  "stub_bin": "/Users/worker/src/gitbutler/crates/but-engineering-rewrite/harness/bin/but-engineering-rewrite",
+  "timebox_s": 240,
+  "trace_path": "/Users/worker/src/gitbutler/crates/but-engineering-rewrite/e2e/out/20260215T132239Z.87335/trace.jsonl",
+  "versions": {
+    "cargo": "cargo 1.93.1 (083ac5135 2025-12-15)",
+    "claude": "2.1.42 (Claude Code)",
+    "codex": "codex-cli 0.101.0",
+    "git": "git version 2.50.1 (Apple Git-155)",
+    "python3": "Python 3.9.6"
+  }
+}

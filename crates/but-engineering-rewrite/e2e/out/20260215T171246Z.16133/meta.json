@@ -1,0 +1,24 @@
+{
+  "allow_stub": false,
+  "bin": "/Users/worker/src/gitbutler/target/debug/but-engineering-rewrite",
+  "e2e_dir": "/Users/worker/src/gitbutler/crates/but-engineering-rewrite/e2e",
+  "git_dirty": true,
+  "git_head": "8207e586e550fc1d7f26e9033a30b88983bff6c7",
+  "keep_repo": false,
+  "no_agents": true,
+  "out_dir": "/Users/worker/src/gitbutler/crates/but-engineering-rewrite/e2e/out/20260215T171246Z.16133",
+  "provider": "codex",
+  "repo_path": "/var/folders/9q/w10vtyqs3jg11swrjr3l8g300000gp/T//but-erw-e2e.QkF251",
+  "root": "/Users/worker/src/gitbutler",
+  "scenario": "smoke",
+  "stub_bin": "/Users/worker/src/gitbutler/crates/but-engineering-rewrite/harness/bin/but-engineering-rewrite",
+  "timebox_s": 60,
+  "trace_path": "/Users/worker/src/gitbutler/crates/but-engineering-rewrite/e2e/out/20260215T171246Z.16133/trace.jsonl",
+  "versions": {
+    "cargo": "cargo 1.93.1 (083ac5135 2025-12-15)",
+    "claude": "2.1.42 (Claude Code)",
+    "codex": "codex-cli 0.101.0",
+    "git": "git version 2.50.1 (Apple Git-155)",
+    "python3": "Python 3.9.6"
+  }
+}
