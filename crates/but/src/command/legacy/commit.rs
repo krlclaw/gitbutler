@@ -3,8 +3,7 @@ use std::{collections::BTreeMap, fmt::Write as _};
 use anyhow::{Context, Result, bail};
 use bstr::{BString, ByteSlice};
 use but_api::{
-    commit::commit_insert_blank,
-    json::HexHash,
+    commit::{commit_create, commit_insert_blank},
     legacy::{diff, repo, workspace},
 };
 use but_core::{DiffSpec, ui::TreeChange};
@@ -447,15 +446,28 @@ pub(crate) fn commit(
     // Get the HEAD commit of the target branch to use as parent (preserves stacking)
     let parent_commit_id = target_branch.tip;
 
-    // Use but-api to create the commit
-    let outcome = workspace::create_commit_from_worktree_changes(
+    // Use the commit API to create the commit above the target branch tip.
+    let outcome = commit_create(
         ctx,
-        target_stack_id,
-        Some(HexHash::from(parent_commit_id)),
+        but_api::commit::ui::RelativeTo::Commit(parent_commit_id),
+        InsertSide::Above,
         diff_specs,
         final_commit_message,
-        target_branch.name.to_string(),
     )?;
+
+    if !outcome.rejected_specs.is_empty() {
+        tracing::warn!(
+            ?outcome.rejected_specs,
+            "Failed to commit at least one selected change"
+        );
+        if let Some(out) = out.for_human() {
+            writeln!(
+                out,
+                "{}",
+                "Warning: Some selected changes could not be committed.".yellow()
+            )?;
+        }
+    }
 
     if let Some(out) = out.for_human() {
         let commit_short = match outcome.new_commit {
