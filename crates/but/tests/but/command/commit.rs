@@ -1,6 +1,6 @@
 use snapbox::str;
 
-use crate::utils::Sandbox;
+use crate::utils::{CommandExt as _, Sandbox};
 
 #[test]
 fn commit_with_message_from_file() -> anyhow::Result<()> {
@@ -1146,4 +1146,361 @@ fn commit_single_hunk_leaves_other_hunks_uncommitted() -> anyhow::Result<()> {
     }
 
     Ok(())
+}
+
+/// Helper to build an isolated `std::process::Command` for `but` with the same
+/// environment as the Sandbox test harness.
+fn but_std_cmd(env: &Sandbox, args: &str) -> std::process::Command {
+    let mut cmd = std::process::Command::new(snapbox::cmd::cargo_bin!("but"));
+    cmd.args(shell_words::split(args).unwrap());
+    cmd.current_dir(env.projects_root());
+    cmd.env("E2E_TEST_APP_DATA_DIR", env.app_data_dir());
+    cmd.env("GITBUTLER_CHANGE_ID", "42");
+    cmd.env("BUT_OUTPUT_FORMAT", "human");
+    cmd.env("NOPAGER", "1");
+    but_testsupport::isolate_env_std_cmd(&mut cmd);
+    cmd
+}
+
+/// Helper: get JSON status.
+fn status_json(env: &Sandbox) -> serde_json::Value {
+    let output = env.but("--json status").allow_json().output().unwrap();
+    serde_json::from_slice(&output.stdout).unwrap()
+}
+
+/// Helper: find CLI IDs for unassigned files matching a path pattern.
+fn find_unassigned_cli_id(status: &serde_json::Value, path_contains: &str) -> Option<String> {
+    status["unassignedChanges"]
+        .as_array()?
+        .iter()
+        .find(|c| {
+            c["filePath"]
+                .as_str()
+                .map(|p| p.contains(path_contains))
+                .unwrap_or(false)
+        })
+        .and_then(|c| c["cliId"].as_str().map(|s| s.to_string()))
+}
+
+/// Helper: parse `--json status` and find a branch by name, returning its commit messages.
+fn branch_commit_messages(env: &Sandbox, branch_name: &str) -> Vec<String> {
+    let status = status_json(env);
+    let stacks = status["stacks"].as_array().unwrap();
+    for stack in stacks {
+        for branch in stack["branches"].as_array().unwrap() {
+            if branch["name"].as_str() == Some(branch_name) {
+                return branch["commits"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .filter_map(|c| c["message"].as_str().map(|s| s.to_string()))
+                    .collect();
+            }
+        }
+    }
+    vec![]
+}
+
+/// Helper: count unassigned (uncommitted) changes in `--json status`.
+fn unassigned_file_count(env: &Sandbox) -> usize {
+    status_json(env)["unassignedChanges"]
+        .as_array()
+        .map(|a| a.len())
+        .unwrap_or(0)
+}
+
+mod concurrent_commits {
+    use super::*;
+
+    /// Concurrent commits to independent (parallel) branches should all succeed.
+    ///
+    /// This test creates three independent branches, adds a file to each, then
+    /// fires three `but commit` processes simultaneously. All three should
+    /// succeed without errors or lost data.
+    ///
+    /// Currently fails with: "Specified HEAD <sha> didn't match actual HEAD^{tree} <sha>"
+    /// — the workspace commit is updated by one process while another is mid-commit.
+    #[test]
+    #[ignore = "concurrent commit race condition — workspace HEAD contention"]
+    fn concurrent_commits_to_independent_branches() -> anyhow::Result<()> {
+        let env = Sandbox::init_scenario_with_target_and_default_settings("one-stack")?;
+        env.setup_metadata(&["A"])?;
+
+        // Create two more independent branches
+        env.but("branch new branchB").assert().success();
+        env.but("branch new branchC").assert().success();
+
+        // Add files for each branch
+        env.file("src/a/new.ts", "export const a = true;");
+        env.file("src/b/new.ts", "export const b = true;");
+        env.file("src/c/new.ts", "export const c = true;");
+
+        // Get file CLI IDs from status
+        let status = status_json(&env);
+        let id_a =
+            find_unassigned_cli_id(&status, "a/new").expect("should find CLI ID for src/a/new.ts");
+        let id_b =
+            find_unassigned_cli_id(&status, "b/new").expect("should find CLI ID for src/b/new.ts");
+        let id_c =
+            find_unassigned_cli_id(&status, "c/new").expect("should find CLI ID for src/c/new.ts");
+
+        // Fire three concurrent commits
+        let child_a = but_std_cmd(&env, &format!("commit A -m commit-a --changes {id_a}")).spawn()?;
+        let child_b =
+            but_std_cmd(&env, &format!("commit branchB -m commit-b --changes {id_b}")).spawn()?;
+        let child_c =
+            but_std_cmd(&env, &format!("commit branchC -m commit-c --changes {id_c}")).spawn()?;
+
+        let out_a = child_a.wait_with_output()?;
+        let out_b = child_b.wait_with_output()?;
+        let out_c = child_c.wait_with_output()?;
+
+        // All should succeed
+        assert!(
+            out_a.status.success(),
+            "commit to A failed: {}",
+            String::from_utf8_lossy(&out_a.stderr)
+        );
+        assert!(
+            out_b.status.success(),
+            "commit to branchB failed: {}",
+            String::from_utf8_lossy(&out_b.stderr)
+        );
+        assert!(
+            out_c.status.success(),
+            "commit to branchC failed: {}",
+            String::from_utf8_lossy(&out_c.stderr)
+        );
+
+        // All files should be committed (not left unassigned)
+        let remaining = unassigned_file_count(&env);
+        assert_eq!(
+            remaining, 0,
+            "all files should be committed, but {remaining} are still unassigned"
+        );
+
+        // Each branch should have the new commit
+        let a_msgs = branch_commit_messages(&env, "A");
+        let b_msgs = branch_commit_messages(&env, "branchB");
+        let c_msgs = branch_commit_messages(&env, "branchC");
+
+        assert!(
+            a_msgs.iter().any(|m| m.contains("commit-a")),
+            "branch A should have commit-a, got: {a_msgs:?}"
+        );
+        assert!(
+            b_msgs.iter().any(|m| m.contains("commit-b")),
+            "branch branchB should have commit-b, got: {b_msgs:?}"
+        );
+        assert!(
+            c_msgs.iter().any(|m| m.contains("commit-c")),
+            "branch branchC should have commit-c, got: {c_msgs:?}"
+        );
+
+        Ok(())
+    }
+
+    /// Concurrent commits to branches in the same stack (stacked topology).
+    ///
+    /// This is the most failure-prone scenario: when branches are stacked
+    /// (child → base), committing to the base branch triggers a rebase of
+    /// all children. A concurrent commit to a child branch can be silently
+    /// dropped if the base-branch commit rebases using stale state.
+    ///
+    /// Known failure modes:
+    /// 1. LOST COMMIT: Child commit exits 0 ("Created commit X") but data is
+    ///    silently dropped when base-branch commit rebases with stale state.
+    /// 2. REF CONTENTION: "The reference refs/heads/<branch> should have
+    ///    content <old>, actual content was <new>"
+    /// 3. INDEX LOCK: "the index is locked; concurrent or crashed process"
+    #[test]
+    #[ignore = "concurrent commit race condition — stale ref / lost commits in stacked branches"]
+    fn concurrent_commits_to_stacked_branches() -> anyhow::Result<()> {
+        let env = Sandbox::init_scenario_with_target_and_default_settings("one-stack")?;
+        env.setup_metadata(&["A"])?;
+
+        // Create a stacked topology: auth → shared (base), api → shared (base)
+        env.but("branch new shared").assert().success();
+        env.but("branch new auth").assert().success();
+        env.but("branch new api").assert().success();
+
+        // Commit initial files to each branch
+        env.file("src/shared/errors.ts", "export class HttpError {}");
+        env.but("commit shared -m 'shared: add errors'")
+            .assert()
+            .success();
+
+        env.file("src/auth/verify.ts", "export function verify() {}");
+        env.but("commit auth -m 'auth: add verify'")
+            .assert()
+            .success();
+
+        env.file("src/api/teams.ts", "export const teams = [];");
+        env.but("commit api -m 'api: add teams'")
+            .assert()
+            .success();
+
+        // Stack auth and api on top of shared
+        env.but("branch move auth shared").assert().success();
+        env.but("branch move api shared").assert().success();
+
+        // Add new files for concurrent commits
+        env.file("src/auth/session.ts", "export function createSession() {}");
+        env.file("src/api/pagination.ts", "export function paginate() {}");
+        env.file("src/shared/logger.ts", "export class Logger {}");
+
+        // Get file CLI IDs
+        let status = status_json(&env);
+        let id_session =
+            find_unassigned_cli_id(&status, "session").expect("should find session file CLI ID");
+        let id_pagination = find_unassigned_cli_id(&status, "pagination")
+            .expect("should find pagination file CLI ID");
+        let id_logger =
+            find_unassigned_cli_id(&status, "logger").expect("should find logger file CLI ID");
+
+        // Fire three concurrent commits to branches in the same stack
+        let child_auth = but_std_cmd(
+            &env,
+            &format!("commit auth -m 'auth: add session' --changes {id_session}"),
+        )
+        .spawn()?;
+        let child_api = but_std_cmd(
+            &env,
+            &format!("commit api -m 'api: add pagination' --changes {id_pagination}"),
+        )
+        .spawn()?;
+        let child_shared = but_std_cmd(
+            &env,
+            &format!("commit shared -m 'shared: add logger' --changes {id_logger}"),
+        )
+        .spawn()?;
+
+        let out_auth = child_auth.wait_with_output()?;
+        let out_api = child_api.wait_with_output()?;
+        let out_shared = child_shared.wait_with_output()?;
+
+        // Check for errors
+        let auth_ok = out_auth.status.success();
+        let api_ok = out_api.status.success();
+        let shared_ok = out_shared.status.success();
+
+        let auth_err = String::from_utf8_lossy(&out_auth.stderr);
+        let api_err = String::from_utf8_lossy(&out_api.stderr);
+        let shared_err = String::from_utf8_lossy(&out_shared.stderr);
+
+        // All three should succeed without errors
+        assert!(
+            auth_ok && api_ok && shared_ok,
+            "concurrent commits should all succeed.\n\
+             auth (ok={auth_ok}): {auth_err}\n\
+             api (ok={api_ok}): {api_err}\n\
+             shared (ok={shared_ok}): {shared_err}"
+        );
+
+        // All files should be committed, none left unassigned
+        let remaining = unassigned_file_count(&env);
+        assert_eq!(
+            remaining, 0,
+            "all files should be committed after concurrent commits, but {remaining} are still unassigned"
+        );
+
+        // Verify each branch has the expected commits (data not silently lost)
+        let auth_msgs = branch_commit_messages(&env, "auth");
+        let api_msgs = branch_commit_messages(&env, "api");
+        let shared_msgs = branch_commit_messages(&env, "shared");
+
+        assert!(
+            auth_msgs.iter().any(|m| m.contains("session")),
+            "auth branch should have session commit — LOST COMMIT detected.\n\
+             auth commits: {auth_msgs:?}"
+        );
+        assert!(
+            api_msgs.iter().any(|m| m.contains("pagination")),
+            "api branch should have pagination commit — LOST COMMIT detected.\n\
+             api commits: {api_msgs:?}"
+        );
+        assert!(
+            shared_msgs.iter().any(|m| m.contains("logger")),
+            "shared branch should have logger commit — LOST COMMIT detected.\n\
+             shared commits: {shared_msgs:?}"
+        );
+
+        Ok(())
+    }
+
+    /// Sequential commits to the same stack should always work.
+    /// This is the control test — proves the stack topology itself is valid.
+    #[test]
+    fn sequential_commits_to_stacked_branches() -> anyhow::Result<()> {
+        let env = Sandbox::init_scenario_with_target_and_default_settings("one-stack")?;
+        env.setup_metadata(&["A"])?;
+
+        // Same setup as concurrent test
+        env.but("branch new shared").assert().success();
+        env.but("branch new auth").assert().success();
+        env.but("branch new api").assert().success();
+
+        env.file("src/shared/errors.ts", "export class HttpError {}");
+        env.but("commit shared -m 'shared: add errors'")
+            .assert()
+            .success();
+
+        env.file("src/auth/verify.ts", "export function verify() {}");
+        env.but("commit auth -m 'auth: add verify'")
+            .assert()
+            .success();
+
+        env.file("src/api/teams.ts", "export const teams = [];");
+        env.but("commit api -m 'api: add teams'")
+            .assert()
+            .success();
+
+        env.but("branch move auth shared").assert().success();
+        env.but("branch move api shared").assert().success();
+
+        // Add new files
+        env.file("src/auth/session.ts", "export function createSession() {}");
+        env.file("src/api/pagination.ts", "export function paginate() {}");
+        env.file("src/shared/logger.ts", "export class Logger {}");
+
+        // Get file CLI IDs for sequential commits
+        let status = status_json(&env);
+        let id_session =
+            find_unassigned_cli_id(&status, "session").expect("should find session CLI ID");
+        let id_pagination =
+            find_unassigned_cli_id(&status, "pagination").expect("should find pagination CLI ID");
+        let id_logger =
+            find_unassigned_cli_id(&status, "logger").expect("should find logger CLI ID");
+
+        // Commit sequentially — this should always work
+        env.but(format!(
+            "commit auth -m 'auth: add session' --changes {id_session}"
+        ))
+        .assert()
+        .success();
+        env.but(format!(
+            "commit api -m 'api: add pagination' --changes {id_pagination}"
+        ))
+        .assert()
+        .success();
+        env.but(format!(
+            "commit shared -m 'shared: add logger' --changes {id_logger}"
+        ))
+        .assert()
+        .success();
+
+        // Verify all committed
+        let remaining = unassigned_file_count(&env);
+        assert_eq!(remaining, 0, "all files should be committed sequentially");
+
+        let auth_msgs = branch_commit_messages(&env, "auth");
+        let api_msgs = branch_commit_messages(&env, "api");
+        let shared_msgs = branch_commit_messages(&env, "shared");
+
+        assert!(auth_msgs.iter().any(|m| m.contains("session")));
+        assert!(api_msgs.iter().any(|m| m.contains("pagination")));
+        assert!(shared_msgs.iter().any(|m| m.contains("logger")));
+
+        Ok(())
+    }
 }
