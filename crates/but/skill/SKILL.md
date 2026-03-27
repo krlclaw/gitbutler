@@ -133,12 +133,59 @@ If `but move` causes conflicts (conflicted commits in status):
 | `git rebase --onto` | `but branch move <branch> <new-base>` |
 | `git cherry-pick` | `but pick` |
 
+## Cross-Branch Dependency Detection
+
+When committing a file that **imports from a path belonging to another branch**, recognize this as a cross-branch dependency and proactively suggest stacking.
+
+**Pattern:** If `src/auth/verify.ts` imports from `../shared/errors` and the `shared/` directory is committed on a branch named `shared`, then `auth` depends on `shared`.
+
+**What to do:**
+1. After committing the updated file, note the cross-branch import.
+2. Suggest stacking: *"This file now imports from the shared branch. I'll stack auth on top of shared so the dependency is reflected in the branch topology."*
+3. Run: `but branch move <dependent-branch> <dependency-branch>`
+
+**Example:**
+```bash
+# File src/auth/verify.ts imports from '../shared/errors'
+# → auth depends on shared
+but commit auth -m "Use shared errors" --changes <id> --status-after
+# Then stack:
+but branch move auth shared
+```
+
+**Key signals for dependency:**
+- `import ... from '../<other-dir>/...'` or `require('../<other-dir>/...')`
+- A file in one branch's directory referencing code in another branch's directory
+- Any cross-module reference that crosses branch boundaries
+
+## Using `--status-after` Effectively
+
+`--status-after` appends a **full workspace status** (including file IDs and branch topology) to the command output. This is equivalent to running `but status -fv` immediately after.
+
+**Do NOT run `but status -fv` after a successful `--status-after` command.** The status is already in the output — read it directly.
+
+**When you DO need a fresh status:**
+- After a command that did NOT use `--status-after`
+- After an error (the status may not have been appended)
+- If significant time has passed or another session may have modified state
+
+**Before/after example:**
+```bash
+# ❌ Wasteful — redundant status call
+but commit auth -m "msg" --changes a1 --status-after
+but status -fv   # ← unnecessary, data already in output above
+
+# ✅ Efficient — use IDs from --status-after output directly
+but commit auth -m "msg" --changes a1 --status-after
+# Read file/branch IDs from the status output above
+but commit auth -m "next change" --changes b2 --status-after
+```
+
 ## Notes
 
 - Prefer explicit IDs over file paths for mutations.
 - `--changes` accepts comma-separated values (`--changes a1,b2`) or repeated flags (`--changes a1 --changes b2`), not space-separated.
 - Read-only git inspection (`git log`, `git blame`, `git show --stat`) is allowed.
-- After a successful `--status-after`, don't run a redundant `but status -fv` unless you need new IDs.
 - Use `but show <branch-id>` to see commit details for a branch, including per-commit file changes and line counts.
 - **Per-commit file counts**: `but status` does NOT include per-commit file counts. Use `but show <branch-id>` or `git show --stat <commit-hash>` to get them.
 - Avoid `--help` probes; use this skill and `references/reference.md` first. Only use `--help` after a failed attempt.
